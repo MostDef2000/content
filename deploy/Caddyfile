@@ -1,0 +1,24 @@
+# Caddyfile for the Valery Model Manager UI
+# Deployed on the VPS (root@77.105.142.206).
+# Reverse-proxies to the GPU server over the ZeroTier private network.
+#
+# Generate a basicauth hash:
+#   caddy hash-password 'your-strong-password'
+# Then paste the bcrypt hash below.
+
+ui.example.com {
+    # Replace the hash with `caddy hash-password` output.
+    basicauth {
+        admin "$2a$14$REPLACE_WITH_BCRYPT_HASH"
+    }
+
+    # GPU server manager (FastAPI) reachable via ZeroTier.
+    reverse_proxy http://10.123.239.102:8000
+
+    # Optional hardening:
+    # encode zstd
+    # header {
+    #     Strict-Transport-Security "max-age=31536000;"
+    #     -Server
+    # }
+}

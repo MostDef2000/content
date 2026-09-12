@@ -1,0 +1,134 @@
+{
+  "6": {
+    "inputs": {
+      "text": "same fictional adult woman, identical face and identity, new outfit and pose, natural studio lighting, photorealistic, 4:5 portrait, realistic skin texture, no text, no logo, no other person",
+      "clip": ["11", 0]
+    },
+    "class_type": "CLIPTextEncode"
+  },
+  "8": {
+    "inputs": {
+      "samples": ["13", 0],
+      "vae": ["10", 0]
+    },
+    "class_type": "VAEDecode"
+  },
+  "9": {
+    "inputs": {
+      "filename_prefix": "dataset/valery",
+      "images": ["8", 0]
+    },
+    "class_type": "SaveImage"
+  },
+  "10": {
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    },
+    "class_type": "VAELoader"
+  },
+  "11": {
+    "inputs": {
+      "clip_name1": "t5xxl_fp8_e4m3fn_scaled.safetensors",
+      "clip_name2": "clip_l.safetensors",
+      "type": "flux",
+      "device": "default"
+    },
+    "class_type": "DualCLIPLoader"
+  },
+  "12": {
+    "inputs": {
+      "unet_name": "flux1-dev-kontext_fp8_scaled.safetensors",
+      "weight_dtype": "fp8_e4m3fn"
+    },
+    "class_type": "UNETLoader"
+  },
+  "13": {
+    "inputs": {
+      "noise": ["25", 0],
+      "guider": ["22", 0],
+      "sampler": ["16", 0],
+      "sigmas": ["17", 0],
+      "latent_image": ["27", 0]
+    },
+    "class_type": "SamplerCustomAdvanced"
+  },
+  "16": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect"
+  },
+  "17": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 20,
+      "denoise": 1.0,
+      "model": ["30", 0]
+    },
+    "class_type": "BasicScheduler"
+  },
+  "22": {
+    "inputs": {
+      "model": ["30", 0],
+      "conditioning": ["42", 0]
+    },
+    "class_type": "BasicGuider"
+  },
+  "25": {
+    "inputs": {
+      "noise_seed": 38447
+    },
+    "class_type": "RandomNoise"
+  },
+  "26": {
+    "inputs": {
+      "guidance": 2.5,
+      "conditioning": ["6", 0]
+    },
+    "class_type": "FluxGuidance"
+  },
+  "27": {
+    "inputs": {
+      "width": 1024,
+      "height": 1280,
+      "batch_size": 1
+    },
+    "class_type": "EmptySD3LatentImage"
+  },
+  "30": {
+    "inputs": {
+      "max_shift": 1.15,
+      "base_shift": 0.5,
+      "width": 1024,
+      "height": 1280,
+      "model": ["12", 0]
+    },
+    "class_type": "ModelSamplingFlux"
+  },
+  "39": {
+    "inputs": {
+      "pixels": ["40", 0],
+      "vae": ["10", 0]
+    },
+    "class_type": "VAEEncode"
+  },
+  "40": {
+    "inputs": {
+      "image": ["41", 0]
+    },
+    "class_type": "FluxKontextImageScale"
+  },
+  "41": {
+    "inputs": {
+      "image": "reference_selected.jpg"
+    },
+    "class_type": "LoadImage"
+  },
+  "42": {
+    "inputs": {
+      "conditioning": ["26", 0],
+      "latent": ["39", 0]
+    },
+    "class_type": "ReferenceLatent"
+  }
+}

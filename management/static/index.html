@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Valery Model Manager</title>
+  <style>
+    :root { --bg:#0f1115; --card:#1a1d24; --accent:#7c5cff; --ok:#3ecf8e; --warn:#ffb454; --err:#ff6b6b; --text:#e6e8ee; --muted:#9aa0ad; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); }
+    header { padding:16px 20px; border-bottom:1px solid #262a33; display:flex; align-items:center; gap:12px; }
+    header h1 { font-size:18px; margin:0; }
+    .wrap { max-width:960px; margin:0 auto; padding:20px; display:grid; gap:16px; }
+    .card { background:var(--card); border:1px solid #262a33; border-radius:12px; padding:16px; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:9px 14px; font-size:14px; cursor:pointer; }
+    button.ghost { background:#2a2f3a; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    input, textarea, select { background:#0f1115; color:var(--text); border:1px solid #2c313c; border-radius:8px; padding:8px; font-size:14px; width:100%; }
+    label { font-size:12px; color:var(--muted); display:block; margin:8px 0 4px; }
+    .badge { padding:3px 9px; border-radius:999px; font-size:12px; font-weight:600; }
+    .badge.up { background:rgba(62,207,142,.15); color:var(--ok); }
+    .badge.down { background:rgba(255,107,107,.15); color:var(--err); }
+    .badge.busy { background:rgba(255,180,84,.15); color:var(--warn); }
+    pre { background:#0b0d11; border:1px solid #23272f; border-radius:8px; padding:10px; max-height:240px; overflow:auto; font-size:12px; white-space:pre-wrap; }
+    .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    @media (max-width:720px){ .grid2{ grid-template-columns:1fr; } }
+    h2 { font-size:15px; margin:0 0 4px; }
+    .muted { color:var(--muted); font-size:12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Valery Model Manager</h1>
+    <span id="comfy" class="badge down">comfy: ?</span>
+    <span id="gpu" class="badge busy">gpu: ?</span>
+    <span id="disk" class="muted"></span>
+  </header>
+
+  <div class="wrap">
+    <div class="card">
+      <div class="row">
+        <button id="start">Старт ComfyUI</button>
+        <button id="stop" class="ghost">Стоп ComfyUI</button>
+        <button id="restart" class="ghost">Рестарт</button>
+        <button id="refresh" class="ghost">Обновить</button>
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="card">
+        <h2>1. Кандидаты лица</h2>
+        <p class="muted">Генерирует эталонные портреты (последовательно).</p>
+        <label>Количество</label>
+        <input id="candCount" type="number" value="8" min="1" max="20" />
+        <label>Seed</label>
+        <input id="candSeed" type="number" value="17023" />
+        <div class="row" style="margin-top:10px">
+          <button data-job="candidates">Сгенерировать</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>2. Датасет из эталона</h2>
+        <p class="muted">Один выбранный портрет → вариации через Kontext.</p>
+        <label>Эталон</label>
+        <select id="refSelect"></select>
+        <label>Количество</label>
+        <input id="expCount" type="number" value="8" min="1" max="20" />
+        <div class="row" style="margin-top:10px">
+          <button data-job="expand">Расширить датасет</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>3. Обучить LoRA</h2>
+      <p class="muted">Запускает ai-toolkit (12 ГБ, долго). Только когда GPU свободен.</p>
+      <div class="row">
+        <button data-job="train">Обучить LoRA</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>4. Сгенерировать пост</h2>
+      <label>Prompt</label>
+      <textarea id="postPrompt" rows="3" placeholder="valery23 в ... , photorealistic, natural skin, no text"></textarea>
+      <label>Caption (для Instagram)</label>
+      <textarea id="postCaption" rows="2" placeholder="Текст поста #fitness"></textarea>
+      <div class="grid2">
+        <div>
+          <label>Имя папки (необязательно)</label>
+          <input id="postName" placeholder="2026-09-12-gym" />
+        </div>
+        <div>
+          <label>Seed</label>
+          <input id="postSeed" type="number" value="27191" />
+        </div>
+      </div>
+      <label>LoRA strength</label>
+      <input id="postStrength" type="number" step="0.05" value="0.8" min="0" max="1.5" />
+      <div class="row" style="margin-top:10px">
+        <button data-job="post">Сгенерировать пост</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Задачи и лог</h2>
+      <pre id="log">—</pre>
+    </div>
+
+    <div class="card">
+      <h2>Готовые посты</h2>
+      <div id="posts" class="muted">—</div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const api = async (method, path, body) => {
+      const res = await fetch(path, {
+        method,
+        headers: body ? { "Content-Type": "application/json" } : {},
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(`${res.status}: ${t}`);
+      }
+      return res.json();
+    };
+
+    async function refresh() {
+      try {
+        const s = await api("GET", "/api/status");
+        $("comfy").textContent = "comfy: " + (s.comfy_up ? "up" : "down");
+        $("comfy").className = "badge " + (s.comfy_up ? "up" : "down");
+        $("gpu").textContent = "gpu: " + (s.gpu_busy ? "busy" : "free");
+        $("gpu").className = "badge " + (s.gpu_busy ? "busy" : "up");
+        $("disk").textContent = "свободно " + s.disk_free_gb + " ГБ";
+        document.querySelectorAll("button[data-job]").forEach(b => b.disabled = s.gpu_busy);
+      } catch (e) { /* ignore */ }
+
+      try {
+        const r = await api("GET", "/api/references");
+        const sel = $("refSelect");
+        sel.innerHTML = r.references.map(n => `<option>${n}</option>`).join("");
+      } catch (e) {}
+
+      try {
+        const j = await api("GET", "/api/jobs");
+        const last = j.jobs[0];
+        $("log").textContent = last ? (last.log_tail || []).join("\n") : "—";
+      } catch (e) {}
+
+      try {
+        const p = await api("GET", "/api/posts");
+        $("posts").innerHTML = p.posts.length
+          ? p.posts.map(x => `<div style="margin:6px 0">📁 <b>${x.name}</b>${x.photo ? " · " + x.photo : ""}${x.caption ? "<br><span class='muted'>" + x.caption + "</span>" : ""}</div>`).join("")
+          : "—";
+      } catch (e) {}
+    }
+
+    $("start").onclick = () => api("POST", "/api/comfy/start").then(refresh);
+    $("stop").onclick = () => api("POST", "/api/comfy/stop").then(refresh);
+    $("restart").onclick = () => api("POST", "/api/comfy/restart").then(refresh);
+    $("refresh").onclick = refresh;
+
+    document.querySelectorAll("button[data-job]").forEach(btn => {
+      btn.onclick = async () => {
+        const job = btn.dataset.job;
+        try {
+          let body = {};
+          if (job === "candidates") body = { count: +$("candCount").value, seed: +$("candSeed").value };
+          if (job === "expand") body = { reference: $("refSelect").value, count: +$("expCount").value };
+          if (job === "post") body = {
+            prompt: $("postPrompt").value, caption: $("postCaption").value,
+            name: $("postName").value || undefined, seed: +$("postSeed").value,
+            lora_strength: +$("postStrength").value,
+          };
+          await api("POST", "/api/jobs/" + job, body);
+          refresh();
+        } catch (e) { alert("Ошибка: " + e.message); }
+      };
+    });
+
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

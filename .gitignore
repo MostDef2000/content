@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+runtime/
+ai-toolkit/
+dataset/images/
+lora/output/
+reference/candidates/
+reference/selected.*
+posts/
+management/__pycache__/

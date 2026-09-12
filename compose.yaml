@@ -1,0 +1,35 @@
+services:
+  comfyui:
+    build:
+      context: .
+      args:
+        CUDA_IMAGE: ${CUDA_IMAGE:-nvidia/cuda:13.0.1-cudnn-runtime-ubuntu24.04}
+        COMFYUI_REF: ${COMFYUI_REF:-master}
+    gpus: all
+    ports:
+      - "127.0.0.1:${COMFYUI_PORT:-8188}:8188"
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      PYTORCH_CUDA_ALLOC_CONF: backend:cudaMallocAsync
+    volumes:
+      - ./runtime/models:/opt/ComfyUI/models
+      - ./runtime/input:/opt/ComfyUI/input
+      - ./runtime/output:/opt/ComfyUI/output
+      - ./runtime/user:/opt/ComfyUI/user
+      - ./comfy:/workspace/workflows:ro
+    shm_size: "8gb"
+    restart: unless-stopped
+
+  manager:
+    build:
+      context: .
+      dockerfile: management/Dockerfile
+    ports:
+      - "${MANAGER_PORT:-8000}:8000"
+    environment:
+      COMFY_URL: http://comfyui:8188
+      WORKSPACE: /workspace
+    volumes:
+      - .:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
