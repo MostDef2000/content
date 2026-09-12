@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Sysadmin deployment handoff
+    url: https://github.com/MostDef2000/content/issues/1
+    about: Основной чек-лист развёртывания GPU + VPS для сисадмин-агента
+  - name: Documentation / question
+    url: https://github.com/MostDef2000/content/issues/new?template=research_question.md
+    about: Вопросы по архитектуре и документации
