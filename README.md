@@ -9,7 +9,7 @@
 ## Архитектура
 
 ```
-[Браузер] ──HTTPS+basicauth──> [VPS 77.105.142.206: Caddy] ──ZeroTier──> [GPU 10.123.239.102: manager :8000]
+[Браузер] ──HTTPS+basicauth──> [РУ 82.146.37.153: Caddy (3d.mostdef.ru)] ──ZeroTier──> [GPU 10.123.239.102: manager :8000]
                                                                                   │ docker.sock / compose
                                                                                   ▼
                                                                           ComfyUI :8188 (flux1-dev-fp8, kontext)
@@ -17,14 +17,14 @@
 ```
 
 - **GPU-сервер** (RTX 5070 12 ГБ, драйвер 595.91, CUDA 13.2, ZeroTier 10.123.239.102): ComfyUI + `manager` (FastAPI) + ai-toolkit.
-- **VPS** (root@77.105.142.206): только Caddy с `basicauth`+HTTPS, reverse-proxy на `10.123.239.102:8000`.
-- Публично торчит только Caddy. `8188` и `8000` закрыты фаерволом (8000 разрешён только с VPS).
+- **РУ-хост** (82.146.37.153, ZeroTier 10.123.239.101): только Caddy с `basicauth`+HTTPS, reverse-proxy на `10.123.239.102:8000`.
+- Публично торчит только Caddy. `8188` и `8000` закрыты фаерволом (8000 разрешён только с РУ-хоста по ZeroTier).
 
 ## Требования
 
 - GPU-сервер: Docker + Compose v2, `nvidia-container-toolkit`, ZeroTier-доступен VPS.
-- VPS: Caddy, домен (например `ui.example.com`) с A-записью на 77.105.142.206.
-- ~40 ГБ диска (есть 69 ГБ свободно).
+- РУ-хост: Caddy, домен `3d.mostdef.ru` с A-записью на 82.146.37.153.
+- ~40 ГБ диска под веса+venv (data-том `/opt/sea-speed-worker`, 623 ГБ свободно).
 - Принять лицензию https://huggingface.co/black-forest-labs/FLUX.1-dev и токен https://huggingface.co/settings/tokens.
 
 ## Быстрый старт (GPU-сервер)
@@ -43,7 +43,7 @@ bash scripts/download_models.sh      # flux1-dev-fp8, kontext fp8, энкоде�
 docker compose up -d                 # поднимает comfyui + manager
 ```
 
-Открой UI через домен (Caddy на VPS): `https://ui.example.com` (логин/пароль из `basicauth`).
+Открой UI: `https://3d.mostdef.ru` (логин/пароль из `basicauth`).
 
 ### Поток в UI
 1. **Кандидаты** — сгенерировать 8 эталонных лиц (`reference/candidates/`).
@@ -71,7 +71,7 @@ python scripts/queue_workflow.py post --prompt "..." --caption "..." --name 2026
 - `lora/output/` — чекпоинты LoRA
 - `runtime/models/`, `runtime/input`, `runtime/output` — монтируются в ComfyUI
 - `posts/` — готовые папки для ручной выкладки
-- `deploy/Caddyfile` — пример конфига Caddy для VPS
+- `deploy/Caddyfile` — конфиг Caddy для РУ-хоста
 
 ## Безопасность
 
@@ -86,7 +86,7 @@ python scripts/queue_workflow.py post --prompt "..." --caption "..." --name 2026
 ```bash
 curl localhost:8188/system_stats     # ComfyUI
 curl localhost:8000/api/status        # manager
-# с VPS: curl -u user:pass https://ui.example.com/api/status
+# с РУ-хоста: curl -u user:pass https://3d.mostdef.ru/api/status
 # прямой http://GPU_IP:8000 и :8188 из интернета — должны быть закрыты
 ```
 

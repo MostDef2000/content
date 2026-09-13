@@ -1,15 +1,15 @@
 # Caddyfile for the Valery Model Manager UI
-# Deployed on the VPS (root@77.105.142.206).
+# Deployed on the RU host (82.146.37.153) — ZeroTier member (10.123.239.101),
+# has a route to the GPU server. NL host is NOT used (not in ZeroTier).
 # Reverse-proxies to the GPU server over the ZeroTier private network.
 #
-# ВАЖНО: `ui.example.com` — ПЛЕЙСХОЛДЕР. Замените на реальный домен перед деплоем
-# и убедитесь, что его A-запись указывает на 77.105.142.206.
+# Домен: 3d.mostdef.ru — A-запись должна указывать на 82.146.37.153.
 #
 # Generate a basicauth hash:
 #   caddy hash-password 'your-strong-password'
 # Then paste the bcrypt hash below.
 
-ui.example.com {
+3d.mostdef.ru {
     # Replace the hash with `caddy hash-password` output.
     basicauth {
         admin "$2a$14$REPLACE_WITH_BCRYPT_HASH"

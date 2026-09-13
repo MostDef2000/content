@@ -1,6 +1,6 @@
 # Audit: GPU-сервер для локальной генерации AI-модели (Valery)
 
-**Назначение:** сервер крутит генерацию фото (FLUX.1-dev FP8 + LoRA персонажа) и обучение LoRA. Управление — через веб-UI, опубликованный на VPS. GPU-сервер сам по себе **не публикуется**.
+**Назначение:** сервер крутит генерацию фото (FLUX.1-dev FP8 + LoRA персонажа) и обучение LoRA. Управление — через веб-UI, опубликованный на РУ-хосте (Caddy). GPU-сервер сам по себе **не публикуется**.
 
 > Этот стек — **дополнительная опция** поверх базового YOLO-воркера. Он делит GPU; тяжёлые задачи сериализуются busy-локом в `manager`. Во время обучения/тяжёлой генерации YOLO желательно приостановить.
 
@@ -11,7 +11,7 @@
 - `nvidia-container-toolkit` **1.20.0** + `/etc/docker/daemon.json` с nvidia runtime (виден в `docker info`).
 - Docker **29.8.0** + Compose **v5.5.1**.
 - Диски: системный `/` **68.3 ГБ** свободно (97.9 ГБ всего); **data-том** `/opt/sea-speed-worker` **623.9 ГБ** свободно (737 ГБ, LVM `ubuntu--vg-sea--speed--worker`, ext4). `sda1` NTFS «Новый том» — не смонтирован, не используется (Windows-раздел).
-- Сеть: **ZeroTier 10.123.239.102**, доступен VPS, публичного входа нет.
+- Сеть: **ZeroTier 10.123.239.102**, доступен РУ-хост (10.123.239.101), публичного входа нет.
 - GPU уже используется YOLO-воркером (~1.6 ГБ/12 ГБ) — подтверждает необходимость busy-лока.
 
 ## 2. Что запущено (на GPU-сервере)
@@ -25,13 +25,13 @@
 
 ## 3. Сетевая модель
 ```
-Браузер ──HTTPS+basicauth──> VPS 77.105.142.206:Caddy (ui.example.com)
+Браузер ──HTTPS+basicauth──> РУ 82.146.37.153:Caddy (3d.mostdef.ru)
                                  │ reverse_proxy
                                  ▼ (ZeroTier)
                             GPU 10.123.239.102:manager :8000 ──docker.sock/compose──> comfyui :8188
 ```
-- Публично торчит только Caddy на VPS.
-- GPU-сервер: `8188` и `8000` закрыты извне фаерволом; `8000` разрешён только с IP VPS (ZeroTier).
+- Публично торчит только Caddy на РУ-хосте.
+- GPU-сервер: `8188` и `8000` закрыты извне фаерволом; `8000` разрешён только с РУ-хоста (ZeroTier).
 - Никаких токенов/паролей Instagram в сети не ходит (публикация ручная).
 
 ## 4. Секреты
@@ -48,8 +48,8 @@
 - [ ] Проверить: `curl localhost:8188/system_stats` и `curl localhost:8000/api/status`.
 - [ ] SSH: отключить пароль-логин, fail2ban.
 
-**VPS (77.105.142.206):**
-- [ ] Caddy с `basicauth` (bcrypt) + авто-HTTPS на `ui.example.com`; `reverse_proxy http://10.123.239.102:8000`.
+**РУ-хост (82.146.37.153):**
+- [ ] Caddy с `basicauth` (bcrypt) + авто-HTTPS на `3d.mostdef.ru`; `reverse_proxy http://10.123.239.102:8000`.
 - [ ] Прямой доступ на `GPU:8000`/`:8188` из интернета запрещён.
 - [ ] (Опц.) rate-limit / fail2ban на Caddy.
 
@@ -67,14 +67,16 @@
 2. `docker compose config` валиден; `docker compose up -d` поднимает `comfyui`+`manager`.
 3. `curl localhost:8188/system_stats` → JSON.
 4. `curl localhost:8000/api/status` → `{comfy_up, gpu_busy, disk_free_gb, ...}`.
-5. С VPS: `curl -u user:pass https://ui.example.com/api/status` работает; прямой `http://GPU_IP:8000` и `:8188` — отказ.
+5. С РУ-хоста: `curl -u user:pass https://3d.mostdef.ru/api/status` работает; прямой `http://GPU_IP:8000` и `:8188` — отказ.
 
 ## 8. Фактические замеры (ответ сисадмин-агента, 12.09)
 - GPU: 12227 MiB total / 1607 MiB used (YOLO ~1.6 ГБ). nvidia runtime активен (`io.containerd.runc.v2, nvidia, runc`). CUDA 13.2, драйвер 595.91.07.
 - `/var/lib/docker` — 4.1 ГБ на системном диске (только образы/кэш контейнера).
 - Data-том `/opt/sea-speed-worker`: 737.2 ГБ, свободно 623.9 ГБ; занято `releases` 49 ГБ, `runtimes` 5.3 ГБ, `shared` ~0.
 - **Решение по диску:** проект и `runtime/` (веса ~35 ГБ, dataset, posts, lora/output) разворачиваются на data-томе (`/opt/sea-speed-worker/valery/`). Системный диск не трогать.
-- VPS `77.105.142.206`: **не замерен** — хост не в `SYSADMIN_REMOTE_HOSTS` (разрешены 82.146.37.153, 10.123.239.102). Обход через NL: порт 22 открыт, ключа нет (`Permission denied`), 8443/2222 закрыты. Нужно добавить хост в белый список MCP или прислать вывод 4 команд (см. unresolved).
+- Фронт (Caddy) — **РУ-хост `82.146.37.153`**, а не NL `77.105.142.206`: РУ состоит в ZeroTier (`10.123.239.101/24`) и имеет маршрут до GPU-сервера; NL в ZeroTier не состоит, до `10.123.239.102:8000` недоступен (ping 100% loss, tcp closed), caddy там не установлен. Новая инфраструктура не создаётся (см. issue #1, комментарий 13.09).
+- Публикация портов на GPU-сервере не нужна вовсе: он за NAT без публичного IP; `8188` — только localhost/compose-net, `8000` — только ZeroTier.
+- Домен `3d.mostdef.ru` — A-запись должна указывать на `82.146.37.153` (проверить `getent hosts 3d.mostdef.ru` на сервере; из песочницы DNS не резолвится).
 
 ## 9. Откат (записано агентом в JOURNAL.md)
 - daemon.json — `rm /etc/docker/daemon.json`.
