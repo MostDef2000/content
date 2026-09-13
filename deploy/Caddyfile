@@ -2,6 +2,9 @@
 # Deployed on the VPS (root@77.105.142.206).
 # Reverse-proxies to the GPU server over the ZeroTier private network.
 #
+# ВАЖНО: `ui.example.com` — ПЛЕЙСХОЛДЕР. Замените на реальный домен перед деплоем
+# и убедитесь, что его A-запись указывает на 77.105.142.206.
+#
 # Generate a basicauth hash:
 #   caddy hash-password 'your-strong-password'
 # Then paste the bcrypt hash below.

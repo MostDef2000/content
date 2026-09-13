@@ -29,8 +29,12 @@
 
 ## Быстрый старт (GPU-сервер)
 
+> ⚠️ Проект разворачивать на **data-диске** `/opt/sea-speed-worker` (623 ГБ свободно), а не на системном (68 ГБ). Иначе веса ~35 ГБ + датасет + чекпоинты LoRA быстро заполнят системный диск. `sda1` (NTFS) не используется.
+
 ```bash
-cd instagram-model
+# если ещё не клонирован:
+git clone git@github.com:MostDef2000/content.git /opt/sea-speed-worker/valery
+cd /opt/sea-speed-worker/valery
 cp .env.example .env
 # впиши HF_TOKEN=hf_xxx в .env (нужен только для скачивания gated весов)
 

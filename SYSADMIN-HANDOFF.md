@@ -53,7 +53,7 @@ VPS (`77.105.142.206`):
 ## proposed_changes (план, без исполнения)
 - Если на GPU есть второй data-диск: смонтировать его (например, `/data`), и направить
   `runtime/` туда — либо bind-mount в compose (`/data/valery/runtime:/opt/ComfyUI/...`),
-  либо symlink `instagram-model/runtime -> /data/valery/runtime`. Это бережёт системный
+  либо symlink `content/runtime -> /opt/sea-speed-worker/valery/runtime`. Это бережёт системный
   диск (69 ГБ) и даёт место под датасет, посты и чекпоинты LoRA.
 - Если второго диска нет: подтвердить, что 69 ГБ хватает с запасом под модели + venv + датасет
   (несколько LoRA-версий и кэш латентов могут быстро съесть место — нужен бэкап/ротация).

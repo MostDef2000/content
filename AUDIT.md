@@ -10,7 +10,7 @@
 - ОС: Ubuntu 26.04 (отмечено как «совместимая»).
 - `nvidia-container-toolkit` **1.20.0** + `/etc/docker/daemon.json` с nvidia runtime (виден в `docker info`).
 - Docker **29.8.0** + Compose **v5.5.1**.
-- Диск: **69 ГБ** свободно.
+- Диски: системный `/` **68.3 ГБ** свободно (97.9 ГБ всего); **data-том** `/opt/sea-speed-worker` **623.9 ГБ** свободно (737 ГБ, LVM `ubuntu--vg-sea--speed--worker`, ext4). `sda1` NTFS «Новый том» — не смонтирован, не используется (Windows-раздел).
 - Сеть: **ZeroTier 10.123.239.102**, доступен VPS, публичного входа нет.
 - GPU уже используется YOLO-воркером (~1.6 ГБ/12 ГБ) — подтверждает необходимость busy-лока.
 
@@ -69,7 +69,14 @@
 4. `curl localhost:8000/api/status` → `{comfy_up, gpu_busy, disk_free_gb, ...}`.
 5. С VPS: `curl -u user:pass https://ui.example.com/api/status` работает; прямой `http://GPU_IP:8000` и `:8188` — отказ.
 
-## 8. Откат (записано агентом в JOURNAL.md)
+## 8. Фактические замеры (ответ сисадмин-агента, 12.09)
+- GPU: 12227 MiB total / 1607 MiB used (YOLO ~1.6 ГБ). nvidia runtime активен (`io.containerd.runc.v2, nvidia, runc`). CUDA 13.2, драйвер 595.91.07.
+- `/var/lib/docker` — 4.1 ГБ на системном диске (только образы/кэш контейнера).
+- Data-том `/opt/sea-speed-worker`: 737.2 ГБ, свободно 623.9 ГБ; занято `releases` 49 ГБ, `runtimes` 5.3 ГБ, `shared` ~0.
+- **Решение по диску:** проект и `runtime/` (веса ~35 ГБ, dataset, posts, lora/output) разворачиваются на data-томе (`/opt/sea-speed-worker/valery/`). Системный диск не трогать.
+- VPS `77.105.142.206`: **не замерен** — хост не в `SYSADMIN_REMOTE_HOSTS` (разрешены 82.146.37.153, 10.123.239.102). Обход через NL: порт 22 открыт, ключа нет (`Permission denied`), 8443/2222 закрыты. Нужно добавить хост в белый список MCP или прислать вывод 4 команд (см. unresolved).
+
+## 9. Откат (записано агентом в JOURNAL.md)
 - daemon.json — `rm /etc/docker/daemon.json`.
 - repo — `rm /etc/apt/sources.list.d/nvidia-container-toolkit.list /usr/share/keyrings/nvidia-container-toolkit-keyring.asc`.
 - toolkit — `apt-get remove nvidia-container-toolkit`.
