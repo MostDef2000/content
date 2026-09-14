@@ -49,12 +49,12 @@
 - [ ] SSH: отключить пароль-логин, fail2ban.
 
 **РУ-хост (82.146.37.153):**
-- [ ] Caddy с `basicauth` (bcrypt) + авто-HTTPS на `3d.mostdef.ru`; `reverse_proxy http://10.123.239.102:8000`.
+- [x] nginx vhost с TLS (Let's Encrypt) + `basicauth` на `3d.mostdef.ru`; `proxy_pass http://10.123.239.102:8000` (Caddy отключён из-за конфликта 80/443 — см. §10).
 - [ ] Прямой доступ на `GPU:8000`/`:8188` из интернета запрещён.
 - [ ] (Опц.) rate-limit / fail2ban на Caddy.
 
 ## 6. Харденинг
-- Только Caddy с `basicauth`+HTTPS снаружи.
+- Только nginx с `basicauth`+HTTPS снаружи (на РУ).
 - `manager` монтирует `/var/run/docker.sock` — выделенный пользователь, ограничить права.
 - Фаервол блокирует всё, кроме SSH и прокси-порта с VPS.
 - Логи `manager` в `runtime/jobs/*.log`.
@@ -82,3 +82,14 @@
 - daemon.json — `rm /etc/docker/daemon.json`.
 - repo — `rm /etc/apt/sources.list.d/nvidia-container-toolkit.list /usr/share/keyrings/nvidia-container-toolkit-keyring.asc`.
 - toolkit — `apt-get remove nvidia-container-toolkit`.
+
+## 10. Деплой выполнен (13–14.09, хэндоф №2, сисадмин-агент)
+- **Шаги 1–2:** 19 файлов + `.env` (600) на `/opt/sea-speed-worker/valery` (sha256 tar сверен); образ `valery-comfyui` (CUDA 13.0.1 + PyTorch cu130 + ComfyUI master, ~13 ГБ, системный диск); 5 весов ~34.6 ГБ на 1 ТБ-томе, побайтово сверены с HF API. 5 файлов, восстанавливавшихся после усечения MCP, дополнительно сверены побайтово с эталоном `17b55a8` — совпадение.
+- **Шаг 3:** `comfyui` 127.0.0.1:8188 + `manager` :8000; локальные smoke 200 (`comfy_up:true`, GPU свободна, диск 587.5 ГБ).
+- **Шаг 4 — отклонение от плана:** живой фронт — **nginx** vhost `3d.mostdef.ru` (TLS Let's Encrypt + basicauth), `nginx -t` ok; Caddy установлен, но отключён (конфликт 80/443 с существующим nginx на РУ — там есть другие сайты). `deploy/Caddyfile` в репо — референс. DNS проверен; LE-сертификат на 89 дней с автообновлением; authentik-интерфейс перенесён на `auth.mostdef.ru` (200, владелец подтвердил); `/etc/nginx/.htpasswd_3d` (640, www-data); бэкап прежнего конфига `/etc/caddy/Caddyfile.bak.*`.
+- **Шаг 5:** smoke с NL: без пароля 401, с паролем 200 + JSON; прямой `10.123.239.102:8000` с NL недоступен (NAT) — как задумано.
+- **Грабли весов (устранены агентом):** 404 на kontext в репо HF — файл лежит в `split_files/`; недосозданный каталог `vae/`.
+- **Доступ к РУ:** через релей Воркер→РУ (ZeroTier :2222, ключ `id_ed25519_valery_relay` на Воркере, pubkey добавлен в authorized_keys root РУ владельцем); SSH с NL фильтруется на пути (предположительно провайдер — тикет VDSina опционален).
+- Мониторинг не задет: netdata, gpu-statsd, auth-стек — healthy.
+- **Решения владельца:** ротации HF_TOKEN и SYSADMIN_TOKEN отложены (токены остаются); засвет пароля basicauth и HF_TOKEN в чате агента принят владельцем.
+- **Рекомендации оркестратора (исполнение — через сисадмин-агента):** пакет caddy на РУ удалить при следующем заходе (отключён, пользы нет, референс в git); перенос docker data-root на 1 ТБ-том — согласован и готов, требуется окно простоя ~10–15 мин (вкл. YOLO) по выбору владельца.

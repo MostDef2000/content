@@ -6,7 +6,8 @@ Status: Active
 ComfyUI + FLUX.1-dev FP8 + LoRA + веб-пульт (`manager`).
 GitHub: `MostDef2000/content` (private). Инфраструктура: GPU-сервер (ZeroTier
 `10.123.239.102`, за NAT) + РУ-хост (`82.146.37.153`, ZeroTier 10.123.239.101,
-Caddy + домен `3d.mostdef.ru`). NL-хост не используется. Серверные действия — только
+nginx-фронт + домен `3d.mostdef.ru`; Caddy установлен, но отключён). NL-хост не
+используется. Серверные действия — только
 через сисадмин-агента (`SYSADMIN-HANDOFF v1`).
 
 ## Canonical entry points

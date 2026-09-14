@@ -9,7 +9,7 @@
 ## Архитектура
 
 ```
-[Браузер] ──HTTPS+basicauth──> [РУ 82.146.37.153: Caddy (3d.mostdef.ru)] ──ZeroTier──> [GPU 10.123.239.102: manager :8000]
+[Браузер] ──HTTPS+basicauth──> [РУ 82.146.37.153: nginx (3d.mostdef.ru)] ──ZeroTier──> [GPU 10.123.239.102: manager :8000]
                                                                                   │ docker.sock / compose
                                                                                   ▼
                                                                           ComfyUI :8188 (flux1-dev-fp8, kontext)
@@ -17,13 +17,13 @@
 ```
 
 - **GPU-сервер** (RTX 5070 12 ГБ, драйвер 595.91, CUDA 13.2, ZeroTier 10.123.239.102): ComfyUI + `manager` (FastAPI) + ai-toolkit.
-- **РУ-хост** (82.146.37.153, ZeroTier 10.123.239.101): только Caddy с `basicauth`+HTTPS, reverse-proxy на `10.123.239.102:8000`.
-- Публично торчит только Caddy. `8188` и `8000` закрыты фаерволом (8000 разрешён только с РУ-хоста по ZeroTier).
+- **РУ-хост** (82.146.37.153, ZeroTier 10.123.239.101): nginx vhost с TLS (Let's Encrypt) + `basicauth`, reverse-proxy на `10.123.239.102:8000`. Caddy установлен, но отключён (конфликт 80/443 с nginx) — `deploy/Caddyfile` хранится как референс.
+- Публично торчит только nginx. `8188` и `8000` закрыты фаерволом (8000 разрешён только с РУ-хоста по ZeroTier).
 
 ## Требования
 
 - GPU-сервер: Docker + Compose v2, `nvidia-container-toolkit`, ZeroTier-доступен VPS.
-- РУ-хост: Caddy, домен `3d.mostdef.ru` с A-записью на 82.146.37.153.
+- РУ-хост: nginx (TLS + basicauth), домен `3d.mostdef.ru` с A-записью на 82.146.37.153.
 - ~40 ГБ диска под веса+venv (data-том `/opt/sea-speed-worker`, 623 ГБ свободно).
 - Принять лицензию https://huggingface.co/black-forest-labs/FLUX.1-dev и токен https://huggingface.co/settings/tokens.
 
@@ -71,7 +71,7 @@ python scripts/queue_workflow.py post --prompt "..." --caption "..." --name 2026
 - `lora/output/` — чекпоинты LoRA
 - `runtime/models/`, `runtime/input`, `runtime/output` — монтируются в ComfyUI
 - `posts/` — готовые папки для ручной выкладки
-- `deploy/Caddyfile` — конфиг Caddy для РУ-хоста
+- `deploy/Caddyfile` — референс конфига (живой фронт на РУ — nginx, см. AUDIT.md §10)
 
 ## Безопасность
 
