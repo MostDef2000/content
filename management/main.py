@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace")).resolve()
 COMFY_URL = os.environ.get("COMFY_URL", "http://comfyui:8188").rstrip("/")
 JOBS_DIR = WORKSPACE / "runtime" / "jobs"
+CHARACTER_PROMPT_PATH = WORKSPACE / "runtime" / "character_prompt.txt"
 JOBS_DIR = WORKSPACE / "runtime" / "jobs"
 
 app = FastAPI(title="Valery Model Manager")
@@ -67,12 +68,14 @@ async def _stream_job(job_id: str, cmd: list[str]) -> None:
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
     log_path = JOBS_DIR / f"{job_id}.log"
     jobs[job_id].update(status="running", log_path=str(log_path))
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}  # stream prints instead of buffering
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(WORKSPACE),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=env,
         )
         with log_path.open("wb") as log_file:
             assert proc.stdout is not None
@@ -89,6 +92,17 @@ async def _stream_job(job_id: str, cmd: list[str]) -> None:
         jobs[job_id].update(status="error", error=str(exc), finished_at=time.time())
     finally:
         jobs[job_id]["gpu_busy"] = False
+
+
+def _default_character_prompt() -> str:
+    try:
+        wf = json.loads((WORKSPACE / "comfy" / "workflow_bootstrap.json").read_text(encoding="utf-8"))
+        for node in wf.values():
+            if node.get("class_type") == "CLIPTextEncode" and node.get("inputs", {}).get("text"):
+                return str(node["inputs"]["text"])
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
 
 
 def _comfy_up() -> bool:
@@ -219,14 +233,31 @@ async def _serial_job(job_id: str, cmd: list[str]) -> None:
         await _stream_job(job_id, cmd)
 
 
+@app.get("/api/character")
+async def get_character() -> dict[str, Any]:
+    """Saved character prompt (custom) or the workflow default."""
+    if CHARACTER_PROMPT_PATH.exists():
+        return {"prompt": CHARACTER_PROMPT_PATH.read_text(encoding="utf-8").strip(), "custom": True}
+    return {"prompt": _default_character_prompt(), "custom": False}
+
+
 @app.post("/api/jobs/candidates")
 async def job_candidates(payload: dict[str, Any]) -> dict[str, Any]:
     count = int(payload.get("count", 8))
     seed = int(payload.get("seed", 17023))
-    return await _launch(
-        "candidates",
-        ["python", "scripts/queue_workflow.py", "candidates", "--count", str(count), "--seed", str(seed)],
-    )
+    prompt = str(payload.get("prompt", "")).strip()
+    if prompt:
+        CHARACTER_PROMPT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CHARACTER_PROMPT_PATH.write_text(prompt + "\n", encoding="utf-8")
+    elif CHARACTER_PROMPT_PATH.exists():
+        CHARACTER_PROMPT_PATH.unlink()  # cleared in UI -> back to workflow default
+    cmd = [
+        "python", "scripts/queue_workflow.py", "candidates",
+        "--count", str(count), "--seed", str(seed),
+    ]
+    if prompt:
+        cmd += ["--prompt", prompt]
+    return await _launch("candidates", cmd)
 
 
 @app.post("/api/jobs/expand")

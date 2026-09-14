@@ -31,7 +31,10 @@
     .thumbs img { width:88px; height:88px; object-fit:cover; border-radius:8px; border:2px solid #262a33; cursor:pointer; }
     .thumbs img.selected { border-color:var(--accent); }
     .thumbs .empty { color:var(--muted); font-size:12px; }
-    .postcard img { width:140px; height:140px; object-fit:cover; border-radius:8px; display:block; margin-bottom:6px; }
+    .postcard img { width:140px; height:140px; object-fit:cover; border-radius:8px; display:block; margin-bottom:6px; cursor:zoom-in; }
+    .lightbox { position:fixed; inset:0; background:rgba(5,6,10,.9); display:flex; align-items:center; justify-content:center; z-index:100; cursor:zoom-out; }
+    .lightbox img { max-width:92vw; max-height:92vh; border-radius:10px; box-shadow:0 10px 40px rgba(0,0,0,.6); }
+    .lightbox[hidden] { display:none; }
   </style>
 </head>
 <body>
@@ -61,6 +64,9 @@
         <input id="candCount" type="number" value="8" min="1" max="20" />
         <label>Seed</label>
         <input id="candSeed" type="number" value="17023" />
+        <label>Промт персонажа (общий для всех кандидатов)</label>
+        <textarea id="candPrompt" rows="5"></textarea>
+        <p class="muted">Меняешь промт — получаешь новый «кастинг» лиц. Правка сохраняется на сервере; очистишь — вернётся исходный.</p>
         <div class="row" style="margin-top:10px">
           <button data-job="candidates">Сгенерировать</button>
         </div>
@@ -123,6 +129,8 @@
     </div>
   </div>
 
+  <div id="lightbox" class="lightbox" hidden><img id="lightboxImg" alt="preview"></div>
+
   <script>
     const $ = (id) => document.getElementById(id);
 
@@ -136,12 +144,26 @@
         img.onerror = () => img.remove();
         if (it.selected) img.classList.add("selected");
         img.onclick = () => {
+          openLightbox(it.url);
           if (onPick) onPick(it);
           [...el.querySelectorAll("img")].forEach(i => i.classList.toggle("selected", i.dataset.name === it.name));
         };
         el.appendChild(img);
       });
     }
+
+    function openLightbox(url) {
+      $("lightboxImg").src = url;
+      $("lightbox").hidden = false;
+    }
+    function closeLightbox() {
+      $("lightbox").hidden = true;
+      $("lightboxImg").src = "";
+    }
+    $("lightbox").onclick = closeLightbox;
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !$("lightbox").hidden) closeLightbox();
+    });
 
     const api = async (method, path, body) => {
       const res = await fetch(path, {
@@ -186,13 +208,14 @@
       try {
         const j = await api("GET", "/api/jobs");
         const last = j.jobs[0];
-        $("log").textContent = last ? (last.log_tail || []).join("\n") : "—";
+        const tail = last ? (last.log_tail || []).join("\n") : "";
+        $("log").textContent = last ? (tail || "лог пока пуст — задача идёт, ждите превью…") : "—";
       } catch (e) {}
 
       try {
         const p = await api("GET", "/api/posts");
         $("posts").innerHTML = p.posts.length
-          ? p.posts.map(x => `<div class="postcard" style="margin:6px 0">${x.photo ? `<img src="/files/posts/${x.name}/${x.photo}" alt="${x.name}" loading="lazy" onerror="this.remove()">` : ""}📁 <b>${x.name}</b>${x.caption ? "<br><span class='muted'>" + x.caption + "</span>" : ""}</div>`).join("")
+          ? p.posts.map(x => `<div class="postcard" style="margin:6px 0">${x.photo ? `<img src="/files/posts/${x.name}/${x.photo}" alt="${x.name}" loading="lazy" onclick="openLightbox(this.src)" onerror="this.remove()">` : ""}📁 <b>${x.name}</b>${x.caption ? "<br><span class='muted'>" + x.caption + "</span>" : ""}</div>`).join("")
           : "—";
       } catch (e) {}
     }
@@ -223,7 +246,7 @@
         const job = btn.dataset.job;
         try {
           let body = {};
-          if (job === "candidates") body = { count: +$("candCount").value, seed: +$("candSeed").value };
+          if (job === "candidates") body = { count: +$("candCount").value, seed: +$("candSeed").value, prompt: $("candPrompt").value.trim() };
           if (job === "expand") body = { reference: $("refSelect").value, count: +$("expCount").value };
           if (job === "post") body = {
             prompt: $("postPrompt").value, caption: $("postCaption").value,
@@ -238,6 +261,10 @@
 
     refresh();
     setInterval(refresh, 5000);
+
+    api("GET", "/api/character")
+      .then((c) => { $("candPrompt").value = c.prompt; })
+      .catch(() => {});
   </script>
 </body>
 </html>

@@ -75,6 +75,12 @@ def generate_candidates(args: argparse.Namespace) -> None:
     destination = ROOT / "reference" / "candidates"
     destination.mkdir(parents=True, exist_ok=True)
     template = load_workflow("bootstrap")
+    if args.prompt:
+        # Override the positive character prompt (the non-empty CLIPTextEncode).
+        for node in template.values():
+            if node.get("class_type") == "CLIPTextEncode" and node.get("inputs", {}).get("text"):
+                node["inputs"]["text"] = args.prompt.strip()
+                break
 
     for index in range(1, args.count + 1):
         workflow = copy.deepcopy(template)
@@ -167,6 +173,7 @@ def parser() -> argparse.ArgumentParser:
     candidates = commands.add_parser("candidates", help="Generate reference faces")
     candidates.add_argument("--count", type=int, choices=range(1, 21), default=8)
     candidates.add_argument("--seed", type=int, default=17023)
+    candidates.add_argument("--prompt", default="", help="Override the character prompt")
     candidates.set_defaults(handler=generate_candidates)
 
     expand = commands.add_parser("expand", help="Expand single reference into dataset via Kontext (sequential)")
