@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace")).resolve()
 COMFY_URL = os.environ.get("COMFY_URL", "http://comfyui:8188").rstrip("/")
-COMPOSE_FILE = WORKSPACE / "compose.yaml"
+JOBS_DIR = WORKSPACE / "runtime" / "jobs"
 JOBS_DIR = WORKSPACE / "runtime" / "jobs"
 
 app = FastAPI(title="Valery Model Manager")
@@ -39,13 +39,14 @@ def _safe_name(value: str, *, allow_slash: bool = False) -> str:
     return cleaned
 
 
-async def _run_compose(*args: str) -> dict[str, Any]:
-    if not COMPOSE_FILE.exists():
-        raise HTTPException(status_code=500, detail="compose.yaml not found")
-    return await _await_subprocess(
-        ["docker", "compose", "-f", str(COMPOSE_FILE), *args],
-        cwd=WORKSPACE,
-    )
+async def _docker(*args: str) -> dict[str, Any]:
+    return await _await_subprocess(["docker", *args], cwd=WORKSPACE)
+
+
+async def _comfy_container() -> str | None:
+    result = await _docker("ps", "-a", "--filter", "name=comfyui", "--format", "{{.Names}}")
+    names = [n.strip() for n in result["output"].splitlines() if n.strip()]
+    return names[0] if names else None
 
 
 async def _await_subprocess(cmd: list[str], cwd: Path) -> dict[str, Any]:
@@ -157,30 +158,55 @@ async def status() -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # ComfyUI lifecycle
 # --------------------------------------------------------------------------- #
+async def _comfy_lifecycle(action: str) -> dict[str, Any]:
+    name = await _comfy_container()
+    if not name:
+        raise HTTPException(status_code=500, detail="ComfyUI container not found (run compose up on the worker)")
+    result = await _docker(action, name)
+    return {"ok": result["returncode"] == 0, "output": result["output"]}
+
+
 @app.post("/api/comfy/start")
 async def comfy_start() -> dict[str, Any]:
-    result = await _run_compose("start", "comfyui")
-    return {"ok": result["returncode"] == 0, "output": result["output"]}
+    return await _comfy_lifecycle("start")
 
 
 @app.post("/api/comfy/stop")
 async def comfy_stop() -> dict[str, Any]:
-    result = await _run_compose("stop", "comfyui")
-    return {"ok": result["returncode"] == 0, "output": result["output"]}
+    return await _comfy_lifecycle("stop")
 
 
 @app.post("/api/comfy/restart")
 async def comfy_restart() -> dict[str, Any]:
-    result = await _run_compose("restart", "comfyui")
-    return {"ok": result["returncode"] == 0, "output": result["output"]}
+    return await _comfy_lifecycle("restart")
 
 
 # --------------------------------------------------------------------------- #
 # Generation / training jobs (serialized via job_lock)
 # --------------------------------------------------------------------------- #
+async def _ensure_comfy() -> str | None:
+    """Start ComfyUI if down. Returns error message or None."""
+    if _comfy_up():
+        return None
+    name = await _comfy_container()
+    if not name:
+        return "ComfyUI container not found (run compose up on the worker)"
+    result = await _docker("start", name)
+    if result["returncode"] != 0:
+        return f"docker start failed: {result['output']}"
+    for _ in range(15):  # up to ~30s for the API to come up
+        await asyncio.sleep(2)
+        if _comfy_up():
+            return None
+    return "ComfyUI started but its API is not responding after 30s"
+
+
 async def _launch(kind: str, cmd: list[str]) -> dict[str, Any]:
     if any(j.get("status") == "running" for j in jobs.values()):
         raise HTTPException(status_code=409, detail="GPU is busy with another job")
+    err = await _ensure_comfy()
+    if err:
+        raise HTTPException(status_code=503, detail=err)
     job_id = f"{kind}-{int(time.time())}"
     jobs[job_id] = {"id": job_id, "kind": kind, "status": "queued", "cmd": cmd}
     asyncio.create_task(_serial_job(job_id, cmd))

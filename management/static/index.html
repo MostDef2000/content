@@ -197,9 +197,20 @@
       } catch (e) {}
     }
 
-    $("start").onclick = () => api("POST", "/api/comfy/start").then(refresh);
-    $("stop").onclick = () => api("POST", "/api/comfy/stop").then(refresh);
-    $("restart").onclick = () => api("POST", "/api/comfy/restart").then(refresh);
+    async function callLifecycle(path) {
+      try {
+        const res = await fetch(path, { method: "POST" });
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok || j.ok === false) {
+          alert("Ошибка: " + (j.detail || j.output || res.status));
+          return;
+        }
+      } catch (e) { alert("Ошибка: " + e.message); return; }
+      refresh();
+    }
+    $("start").onclick = () => callLifecycle("/api/comfy/start");
+    $("stop").onclick = () => callLifecycle("/api/comfy/stop");
+    $("restart").onclick = () => callLifecycle("/api/comfy/restart");
     $("refresh").onclick = refresh;
     $("logout").onclick = () => {
       // Basic auth не имеет серверного logout: форсим повторный запрос логина.
