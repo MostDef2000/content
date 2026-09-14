@@ -35,6 +35,7 @@
     <span id="comfy" class="badge down">comfy: ?</span>
     <span id="gpu" class="badge busy">gpu: ?</span>
     <span id="disk" class="muted"></span>
+    <button id="logout" class="ghost" style="margin-left:auto">Выйти</button>
   </header>
 
   <div class="wrap">
@@ -165,6 +166,11 @@
     $("stop").onclick = () => api("POST", "/api/comfy/stop").then(refresh);
     $("restart").onclick = () => api("POST", "/api/comfy/restart").then(refresh);
     $("refresh").onclick = refresh;
+    $("logout").onclick = () => {
+      // Basic auth не имеет серверного logout: форсим повторный запрос логина.
+      // nginx на /logout всегда отвечает 401 → браузер снова покажет форму входа.
+      fetch("/logout", { cache: "no-store" }).finally(() => location.reload());
+    };
 
     document.querySelectorAll("button[data-job]").forEach(btn => {
       btn.onclick = async () => {

@@ -10,7 +10,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -109,6 +109,12 @@ def _disk_free_gb() -> float:
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(WORKSPACE / "management" / "static" / "index.html")
+
+
+@app.get("/logout")
+async def logout() -> Response:
+    """Force HTTP Basic auth re-prompt (works behind nginx too: /logout returns 401 there)."""
+    return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="Valery Manager"'})
 
 
 app.mount(

@@ -1,60 +1,64 @@
 # SYSADMIN-HANDOFF v1
 
-Хэндоф №2 — **развёртывание** стека. Предыдущий (инвентаризация дисков,
-read-only) выполнен, результаты в `AUDIT.md` §8. Это handoff режима
-`prepare-changes`: агент готовит и **исполняет план только после явного
-подтверждения пользователя в своей сессии**.
+Хэндоф №3 — **сервисный техперерыв + обновление UI**. Хэндоф №2 (деплой)
+выполнен, результаты в `AUDIT.md` §10 и issue #1. Владелец разрешил окно
+простоя «сейчас». Режим `prepare-changes`: исполнение по шагам с
+подтверждением владельца; тяжёлый шаг (перенос data-root) — владелец говорит
+«начинай», агент объявляет старт простоя.
 
 ## objective
-Развёртывание стека генерации: ComfyUI + `manager` на GPU-сервере,
-Caddy + HTTPS на РУ-хосте, домен `3d.mostdef.ru`. Без публикации портов
-GPU-сервера наружу.
+1. Обновить UI на Воркере (кнопка «Выйти» + серверный `/logout`).
+2. Добавить `location = /logout` в nginx на РУ.
+3. Перенести docker data-root на 1 ТБ-том (`/var/lib/docker` → `/opt/sea-speed-worker/docker-data`).
+4. Удалить отключённый пакет caddy на РУ (решение оркестратора, issue #1).
 
 ## hosts
-- GPU: `10.123.239.102` (ZeroTier; RTX 5070 12 ГБ, драйвер 595.91, CUDA 13.2,
-  Docker 29.8 + Compose v5.5.1, nvidia runtime активен). За NAT, публичного IP нет.
-- РУ: `82.146.37.153` (ZeroTier 10.123.239.101; Caddy + домен `3d.mostdef.ru`).
-  NL `77.105.142.206` **не используется** (не в ZeroTier, caddy не установлен).
-- Алиасы из `~/.ssh/config` у оркестратора недоступны — подставьте свои.
+- Воркер: `10.123.239.102` (ZeroTier). Стек: контейнеры `valery-comfyui-1`,
+  `valery-manager-1`; образ `valery-comfyui` на системном диске.
+- РУ: `82.146.37.153` через релей Воркер→РУ:2222 (ключ `id_ed25519_valery_relay`).
+- NL: не используется.
 
 ## mode
-prepare-changes (исполнение — после подтверждения пользователя в сессии агента)
+prepare-changes (исполнение — после подтверждения владельца в сессии агента)
 
 ## forbidden
-- Не публиковать порты `8188`/`8000` в интернет; не менять фаервол наружу GPU.
-- Не выводить и не пересылать `HF_TOKEN`, пароли, приватные ключи, bcrypt-хэш basicauth.
-- Не трогать базовый YOLO-воркер без согласования (делит GPU); тяжёлые задачи — после его остановки.
-- На GPU-хосте работает мониторинг: контейнеры `netdata` и `gpu-statsd`
-  (127.0.0.1:8125, 19999) — **не останавливать и не удалять**; compose-проект
-  valery с ними не пересекается.
-- Не коммитить `.env`, `runtime/`, датасет, веса в репозиторий.
+- Не удалять `/var/lib/docker.old` (или как назван старый каталог) до верификации — это откат.
+- Не трогать контейнеры `netdata`/`gpu-statsd` и YOLO-воркер (кроме вынужденной
+  остановки на время переноса data-root — вернуть сразу после).
+- Не выводить пароли/HF_TOKEN; `.htpasswd_3d` не трогать.
+- В daemon.json только ДОБАВИТЬ `"data-root"` — не затирать nvidia runtime конфиг.
 
-## context
-- Репозиторий: `MostDef2000/content` (private); чек-лист — issue #1; аудит — `AUDIT.md`.
-- Целевой каталог проекта: `/opt/sea-speed-worker/valery` (data-том 737 ГБ,
-  свободно ~624 ГБ; системный диск 97.9 ГБ — не трогать).
-- Секреты: `HF_TOKEN` в `.env` (chmod 600) — только на этап скачивания весов.
-  Токен пользователь передаёт агенту напрямую, не через хэндоф.
-  Пароль basicauth агент получает от пользователя напрямую (не в чатах/репо),
-  превращает его в bcrypt-хэш для Caddy и использует для финальной проверки.
-
-## план (исполнять по шагам, подтверждение пользователя между шагами)
-1. **GPU — подготовка:** клонировать репо в `/opt/sea-speed-worker/valery`;
-   `cp .env.example .env`, вписать `HF_TOKEN` (от пользователя), `chmod 600 .env`;
-   `bash scripts/prepare_server.sh`.
-2. **GPU — веса:** `bash scripts/download_models.sh` (~35 ГБ → data-том).
-3. **GPU — старт:** `docker compose up -d`; проверить
-   `curl localhost:8188/system_stats` и `curl localhost:8000/api/status`.
-4. **РУ — Caddy:** установить/проверить caddy; `caddy hash-password '<пароль от
-   пользователя>'`; взять `deploy/Caddyfile` из репо, вписать bcrypt-хэш;
-   проверить DNS `getent hosts 3d.mostdef.ru` → `82.146.37.153`
-   (если A-записи нет — сообщить, ждём пользователя); `caddy validate`; reload.
-5. **Проверка сквозняком:** с РУ `curl -u user:pass https://3d.mostdef.ru/api/status`
-   → JSON; прямой `http://10.123.239.102:8000` извне — отказ.
-6. **Фидбек:** вернуть `status`, `commands_run`, `evidence`, `risks`, `unresolved`,
-   `kb_updated`; оркестратор запишет результаты в `AUDIT.md` и issue #1.
-
-## откат
-- GPU: `docker compose down`; `rm -rf /opt/sea-speed-worker/valery` (осторожно —
-  только каталог valery, не трогать releases/runtimes и контейнеры `netdata`/`gpu-statsd`).
-- РУ: удалить сайт-блок Caddy, reload.
+## порядок (по шагам, подтверждение между шагами)
+1. **UI-файлы на Воркер:** скачать из репо (HEAD main) `management/main.py` и
+   `management/static/index.html` через MCP; сверить sha256 с эталонами
+   оркестратора (передаст владелец); положить в
+   `/opt/sea-speed-worker/valery/management/…`; `docker restart valery-manager-1`.
+   Smoke: `curl -s localhost:8000/ | grep -o Выйти` → есть;
+   `curl -s -o /dev/null -w '%{http_code}' localhost:8000/logout` → 401.
+2. **nginx /logout на РУ:** в vhost `3d.mostdef.ru` добавить
+   `location = /logout { return 401; }` (return в rewrite-фазе — всегда 401);
+   `nginx -t` → reload. Проверка с РУ или NL:
+   `curl -u admin:'<пароль>' -o /dev/null -w '%{http_code}' https://3d.mostdef.ru/logout` → 401.
+3. **Перенос data-root** (простой ~10–15 мин, YOLO ляжет):
+   - подготовка: `df -h /` и `du -sh /var/lib/docker`; убедиться, что на
+     `/opt/sea-speed-worker` ≥ 2× размер /var/lib/docker;
+   - `docker compose down` в `/opt/sea-speed-worker/valery`; остановить прочие
+     контейнеры (вкл. YOLO);
+   - `systemctl stop docker docker.socket`;
+   - `rsync -aHAX /var/lib/docker/ /opt/sea-speed-worker/docker-data/`
+     (сверить `du -sh` обеих сторон);
+   - `/etc/docker/daemon.json`: добавить `"data-root": "/opt/sea-speed-worker/docker-data"`
+     (merge, nvidia runtime сохранить; backup daemon.json.bak.dataroot);
+   - `mv /var/lib/docker /var/lib/docker.old`;
+   - `systemctl start docker`; `docker ps` — все контейнеры на месте
+     (`restart: unless-stopped` поднимет valery-стек; YOLO — вернуть владельцу);
+   - smoke: 8188/system_stats 200, 8000/api/status 200; YOLO-воркер — работоспособен;
+   - rollback при проблемах: stop docker → вернуть daemon.json → `rm -rf
+     /opt/sea-speed-worker/docker-data` → `mv /var/lib/docker.old /var/lib/docker`
+     → start docker.
+4. **Caddy на РУ:** `apt-get remove --purge caddy`; конфиг-бэкапы
+   `/etc/caddy/Caddyfile.bak.*` можно оставить (референс в git: `deploy/Caddyfile`).
+5. **Финальный smoke + отчёт:** внешний smoke `https://3d.mostdef.ru/api/status`
+   (401 без пароля / 200 с паролем); вернуть `status`, `commands_run`, `evidence`,
+   `risks`, `unresolved`, `kb_updated`. `/var/lib/docker.old` НЕ удалять — решение
+   об удалении после суток аптайма, отдельно.
