@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import shutil
 import time
 import urllib.error
@@ -159,7 +160,8 @@ def generate_post(args: argparse.Namespace) -> None:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Queue sequential FLUX jobs in ComfyUI")
-    root.add_argument("--url", default="http://127.0.0.1:8188")
+    # Manager container reaches ComfyUI by compose service name; respect COMFY_URL.
+    root.add_argument("--url", default=os.environ.get("COMFY_URL", "http://comfyui:8188"))
     commands = root.add_subparsers(dest="command", required=True)
 
     candidates = commands.add_parser("candidates", help="Generate reference faces")
