@@ -27,6 +27,11 @@
     @media (max-width:720px){ .grid2{ grid-template-columns:1fr; } }
     h2 { font-size:15px; margin:0 0 4px; }
     .muted { color:var(--muted); font-size:12px; }
+    .thumbs { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+    .thumbs img { width:88px; height:88px; object-fit:cover; border-radius:8px; border:2px solid #262a33; cursor:pointer; }
+    .thumbs img.selected { border-color:var(--accent); }
+    .thumbs .empty { color:var(--muted); font-size:12px; }
+    .postcard img { width:140px; height:140px; object-fit:cover; border-radius:8px; display:block; margin-bottom:6px; }
   </style>
 </head>
 <body>
@@ -66,8 +71,10 @@
         <p class="muted">Один выбранный портрет → вариации через Kontext.</p>
         <label>Эталон</label>
         <select id="refSelect"></select>
+        <div id="refThumbs" class="thumbs"><span class="empty">— пока нет кандидатов</span></div>
         <label>Количество</label>
         <input id="expCount" type="number" value="8" min="1" max="20" />
+        <div id="dsThumbs" class="thumbs"><span class="empty">— датасет пуст</span></div>
         <div class="row" style="margin-top:10px">
           <button data-job="expand">Расширить датасет</button>
         </div>
@@ -118,6 +125,24 @@
 
   <script>
     const $ = (id) => document.getElementById(id);
+
+    function renderThumbs(el, items, onPick) {
+      if (!items.length) { el.innerHTML = '<span class="empty">— пусто</span>'; return; }
+      el.innerHTML = "";
+      items.forEach((it) => {
+        const img = document.createElement("img");
+        img.src = it.url; img.title = it.name; img.dataset.name = it.name;
+        img.loading = "lazy";
+        img.onerror = () => img.remove();
+        if (it.selected) img.classList.add("selected");
+        img.onclick = () => {
+          if (onPick) onPick(it);
+          [...el.querySelectorAll("img")].forEach(i => i.classList.toggle("selected", i.dataset.name === it.name));
+        };
+        el.appendChild(img);
+      });
+    }
+
     const api = async (method, path, body) => {
       const res = await fetch(path, {
         method,
@@ -146,6 +171,16 @@
         const r = await api("GET", "/api/references");
         const sel = $("refSelect");
         sel.innerHTML = r.references.map(n => `<option>${n}</option>`).join("");
+        renderThumbs(
+          $("refThumbs"),
+          r.references.map(n => ({ name: n, url: "/files/reference/candidates/" + n, selected: n === sel.value })),
+          (it) => { sel.value = it.name; }
+        );
+      } catch (e) {}
+
+      try {
+        const d = await api("GET", "/api/dataset");
+        renderThumbs($("dsThumbs"), d.images.map(n => ({ name: n, url: "/files/dataset/images/" + n })), null);
       } catch (e) {}
 
       try {
@@ -157,7 +192,7 @@
       try {
         const p = await api("GET", "/api/posts");
         $("posts").innerHTML = p.posts.length
-          ? p.posts.map(x => `<div style="margin:6px 0">📁 <b>${x.name}</b>${x.photo ? " · " + x.photo : ""}${x.caption ? "<br><span class='muted'>" + x.caption + "</span>" : ""}</div>`).join("")
+          ? p.posts.map(x => `<div class="postcard" style="margin:6px 0">${x.photo ? `<img src="/files/posts/${x.name}/${x.photo}" alt="${x.name}" loading="lazy" onerror="this.remove()">` : ""}📁 <b>${x.name}</b>${x.caption ? "<br><span class='muted'>" + x.caption + "</span>" : ""}</div>`).join("")
           : "—";
       } catch (e) {}
     }

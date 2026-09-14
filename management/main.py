@@ -123,6 +123,21 @@ app.mount(
     name="static",
 )
 
+# Generated-artifact previews (candidates / dataset / posts)
+for _d in ("reference/candidates", "dataset/images", "posts"):
+    (WORKSPACE / _d).mkdir(parents=True, exist_ok=True)
+app.mount(
+    "/files/reference",
+    StaticFiles(directory=str(WORKSPACE / "reference")),
+    name="files-reference",
+)
+app.mount(
+    "/files/dataset",
+    StaticFiles(directory=str(WORKSPACE / "dataset")),
+    name="files-dataset",
+)
+app.mount("/files/posts", StaticFiles(directory=str(WORKSPACE / "posts")), name="files-posts")
+
 
 # --------------------------------------------------------------------------- #
 # Status
@@ -252,6 +267,15 @@ async def list_references() -> dict[str, Any]:
         return {"references": []}
     files = sorted(p.name for p in folder.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
     return {"references": files}
+
+
+@app.get("/api/dataset")
+async def list_dataset() -> dict[str, Any]:
+    folder = WORKSPACE / "dataset" / "images"
+    if not folder.exists():
+        return {"images": []}
+    files = sorted(p.name for p in folder.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
+    return {"images": files}
 
 
 @app.get("/api/posts")
