@@ -18,7 +18,6 @@ WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace")).resolve()
 COMFY_URL = os.environ.get("COMFY_URL", "http://comfyui:8188").rstrip("/")
 JOBS_DIR = WORKSPACE / "runtime" / "jobs"
 CHARACTER_PROMPT_PATH = WORKSPACE / "runtime" / "character_prompt.txt"
-JOBS_DIR = WORKSPACE / "runtime" / "jobs"
 
 app = FastAPI(title="Valery Model Manager")
 
@@ -118,6 +117,31 @@ def _disk_free_gb() -> float:
     return round(free / (1024**3), 1)
 
 
+def _cpu_percent() -> float:
+    def snapshot() -> tuple[int, int]:
+        with open("/proc/stat") as f:
+            vals = list(map(int, f.readline().split()[1:]))
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        return idle, sum(vals)
+
+    idle0, total0 = snapshot()
+    time.sleep(0.2)
+    idle1, total1 = snapshot()
+    dt = total1 - total0
+    return round((1 - (idle1 - idle0) / dt) * 100, 1) if dt > 0 else 0.0
+
+
+def _ram_percent() -> float:
+    info: dict[str, int] = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            key, val = line.split(":", 1)
+            info[key] = int(val.strip().split()[0])
+    total = info.get("MemTotal", 0)
+    avail = info.get("MemAvailable", 0)
+    return round((total - avail) / total * 100, 1) if total else 0.0
+
+
 # --------------------------------------------------------------------------- #
 # UI
 # --------------------------------------------------------------------------- #
@@ -160,11 +184,14 @@ app.mount("/files/posts", StaticFiles(directory=str(WORKSPACE / "posts")), name=
 @app.get("/api/status")
 async def status() -> dict[str, Any]:
     busy = any(j.get("status") == "running" for j in jobs.values())
+    cpu = await asyncio.to_thread(_cpu_percent)
     return {
         "comfy_up": _comfy_up(),
         "comfy_url": COMFY_URL,
         "gpu_busy": busy,
         "disk_free_gb": _disk_free_gb(),
+        "cpu_percent": cpu,
+        "ram_percent": _ram_percent(),
         "active_jobs": [j for j in jobs.values() if j.get("status") == "running"],
     }
 

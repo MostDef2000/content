@@ -42,6 +42,8 @@
     <h1>Valery Model Manager</h1>
     <span id="comfy" class="badge down">comfy: ?</span>
     <span id="gpu" class="badge busy">gpu: ?</span>
+    <span id="cpu" class="badge up">cpu: ?</span>
+    <span id="ram" class="badge up">ram: ?</span>
     <span id="disk" class="muted"></span>
     <button id="logout" class="ghost" style="margin-left:auto">Выйти</button>
   </header>
@@ -185,6 +187,10 @@
         $("comfy").className = "badge " + (s.comfy_up ? "up" : "down");
         $("gpu").textContent = "gpu: " + (s.gpu_busy ? "busy" : "free");
         $("gpu").className = "badge " + (s.gpu_busy ? "busy" : "up");
+        $("cpu").textContent = "cpu: " + (s.cpu_percent ?? "?") + "%";
+        $("cpu").className = "badge " + (s.cpu_percent > 85 ? "down" : s.cpu_percent > 60 ? "busy" : "up");
+        $("ram").textContent = "ram: " + (s.ram_percent ?? "?") + "%";
+        $("ram").className = "badge " + (s.ram_percent > 85 ? "down" : s.ram_percent > 60 ? "busy" : "up");
         $("disk").textContent = "свободно " + s.disk_free_gb + " ГБ";
         document.querySelectorAll("button[data-job]").forEach(b => b.disabled = s.gpu_busy);
       } catch (e) { /* ignore */ }
