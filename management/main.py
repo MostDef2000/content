@@ -11,9 +11,9 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, List
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -30,6 +30,7 @@ TRASH_DIR = WORKSPACE / "runtime" / "trash"  # soft-delete bin, never auto-clean
 
 MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+MAX_UPLOAD_MB = 20  # per-file cap for dataset uploads
 
 # /files serving whitelist — "posts-private" is never served.
 _FILE_KIND_DIRS = {
@@ -37,6 +38,7 @@ _FILE_KIND_DIRS = {
     "dataset": "dataset/images",
     "posts": "posts",
 }
+DATASET_TRASH = TRASH_DIR / "dataset"  # soft-delete bin for dataset image pairs
 
 app = FastAPI(title="Model Manager")
 
@@ -44,6 +46,8 @@ app = FastAPI(title="Model Manager")
 job_lock = asyncio.Lock()
 # Serialize registry writes (single-user app: last-write-wins is acceptable).
 _registry_lock = asyncio.Lock()
+# Serialize dataset manifest reads/writes and the caption.py subprocess.
+_manifest_lock = asyncio.Lock()
 jobs: dict[str, dict[str, Any]] = {}
 
 
@@ -720,6 +724,224 @@ async def update_library(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Dataset manifest API (Phase 2, feature 004 explicit-dataset)
+# --------------------------------------------------------------------------- #
+def _dataset_manifest_path(model_id: str) -> Path:
+    """Per-model dataset manifest — same file and schema as lora/caption.py."""
+    return _model_dir(model_id) / "dataset" / "manifest.json"
+
+
+def _dataset_image_dir(model_id: str) -> Path:
+    return _model_dir(model_id) / "dataset" / "images"
+
+
+def _load_manifest(model_id: str) -> dict[str, Any]:
+    """Read the dataset manifest and reconcile it with the files on disk.
+
+    Mirrors lora/caption.py load_manifest: files without an entry get
+    {"tag": "tasteful", "caption": None, "created": <mtime ISO UTC>};
+    entries without a file are dropped; version > 1 is an error.
+    """
+    path = _dataset_manifest_path(model_id)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {"version": 1, "images": []}
+    else:
+        data = {"version": 1, "images": []}
+    if not isinstance(data, dict) or not isinstance(data.get("images"), list):
+        data = {"version": 1, "images": []}
+    version = int(data.get("version", 1))
+    if version > 1:
+        raise RuntimeError(f"Unsupported dataset manifest version {version} in {path} (expected 1)")
+    by_name = {
+        str(entry.get("filename")): entry
+        for entry in data["images"]
+        if isinstance(entry, dict) and entry.get("filename")
+    }
+    image_dir = _dataset_image_dir(model_id)
+    reconciled: list[dict[str, Any]] = []
+    if image_dir.is_dir():
+        for image in sorted(p for p in image_dir.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES):
+            entry = by_name.pop(image.name, None)
+            if entry is None:
+                entry = {
+                    "filename": image.name,
+                    "tag": "tasteful",
+                    "caption": None,
+                    "created": datetime.fromtimestamp(
+                        image.stat().st_mtime, tz=timezone.utc
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+            reconciled.append(entry)
+    return {"version": 1, "images": reconciled}
+
+
+def _save_manifest(model_id: str, data: dict[str, Any]) -> None:
+    """Atomically persist the dataset manifest (tempfile in the same dir + os.replace)."""
+    _atomic_write_json(_dataset_manifest_path(model_id), data)
+
+
+@app.get("/api/models/{model_id}/dataset")
+async def get_model_dataset(model_id: str) -> dict[str, Any]:
+    _model_or_404(model_id)
+    manifest = _load_manifest(model_id)
+    images = manifest["images"]
+    return {
+        "model_id": model_id,
+        "version": manifest["version"],
+        "images": images,
+        "stats": {
+            "total": len(images),
+            "tasteful": sum(1 for e in images if e.get("tag") == "tasteful"),
+            "explicit": sum(1 for e in images if e.get("tag") == "explicit"),
+            "captioned": sum(1 for e in images if e.get("caption")),
+        },
+    }
+
+
+@app.put("/api/models/{model_id}/dataset")
+async def retag_model_dataset(model_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Partial merge-retag by filename: only `tag` is updated (caption/created kept)."""
+    _model_or_404(model_id)
+    updates_raw = payload.get("images")
+    if not isinstance(updates_raw, list) or not updates_raw:
+        raise HTTPException(status_code=422, detail="images must be a non-empty list")
+
+    image_dir = _dataset_image_dir(model_id)
+    updates: dict[str, str] = {}
+    for index, item in enumerate(updates_raw):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=422, detail=f"images[{index}] must be an object")
+        filename = _safe_name(str(item.get("filename", "")))
+        if Path(filename).suffix.lower() not in IMAGE_SUFFIXES:
+            raise HTTPException(status_code=422, detail=f"images[{index}].filename must be jpg/jpeg/png")
+        tag = str(item.get("tag", "")).strip()
+        if tag not in ("tasteful", "explicit"):
+            raise HTTPException(status_code=422, detail=f"images[{index}].tag must be tasteful or explicit")
+        if filename in updates:
+            raise HTTPException(status_code=422, detail=f"duplicate filename in payload: {filename}")
+        if not (image_dir / filename).is_file():
+            raise HTTPException(status_code=404, detail=f"dataset image not found: {filename}")
+        updates[filename] = tag
+
+    async with _manifest_lock:
+        manifest = _load_manifest(model_id)
+        for entry in manifest["images"]:
+            if entry["filename"] in updates:
+                entry["tag"] = updates[entry["filename"]]
+        _save_manifest(model_id, manifest)
+    return {"ok": True, "manifest": {"version": manifest["version"], "images": manifest["images"]}}
+
+
+@app.post("/api/models/{model_id}/dataset/upload")
+async def upload_model_dataset(
+    model_id: str,
+    files: List[UploadFile] = File(...),
+    tag: str = Form("tasteful"),
+) -> dict[str, Any]:
+    """Multipart dataset upload; every file is validated before the first byte
+    is written (all-or-nothing)."""
+    _model_or_404(model_id)
+    if tag not in ("tasteful", "explicit"):
+        raise HTTPException(status_code=422, detail="tag must be tasteful or explicit")
+    if not files:
+        raise HTTPException(status_code=422, detail="at least one file required")
+
+    image_dir = _dataset_image_dir(model_id)
+    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    validated: list[tuple[str, bytes]] = []
+    seen: set[str] = set()
+    for index, upload in enumerate(files):
+        filename = _safe_name(str(upload.filename or ""))
+        suffix = Path(filename).suffix.lower()
+        if suffix not in IMAGE_SUFFIXES:
+            raise HTTPException(status_code=415, detail=f"files[{index}]: only jpg/jpeg/png are allowed")
+        data = await upload.read()
+        if len(data) > max_bytes:
+            raise HTTPException(
+                status_code=413, detail=f"files[{index}] ({filename}): exceeds {MAX_UPLOAD_MB} MB limit"
+            )
+        magic_ok = data.startswith(b"\x89PNG") if suffix == ".png" else data.startswith(b"\xff\xd8\xff")
+        if not magic_ok:
+            raise HTTPException(
+                status_code=415, detail=f"files[{index}] ({filename}): content does not match the image type"
+            )
+        if filename in seen or (image_dir / filename).exists():
+            raise HTTPException(status_code=409, detail=f"files[{index}]: name collision: {filename}")
+        seen.add(filename)
+        validated.append((filename, data))
+
+    async with _manifest_lock:
+        manifest = _load_manifest(model_id)
+        image_dir.mkdir(parents=True, exist_ok=True)
+        added: list[dict[str, Any]] = []
+        for filename, data in validated:
+            target = image_dir / filename
+            tmp = target.with_name(f".{filename}.upload.tmp")
+            try:
+                tmp.write_bytes(data)
+                os.replace(tmp, target)  # atomic same-filesystem move
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
+            entry = {"filename": filename, "tag": tag, "caption": None, "created": _now_iso()}
+            manifest["images"].append(entry)
+            added.append(entry)
+        _save_manifest(model_id, manifest)
+    return {"ok": True, "added": added, "manifest": {"version": manifest["version"], "images": manifest["images"]}}
+
+
+@app.delete("/api/models/{model_id}/dataset/{filename}")
+async def delete_model_dataset_image(model_id: str, filename: str) -> dict[str, Any]:
+    """Soft-delete one dataset image and its <filename>.txt pair into
+    runtime/trash/dataset/ (keeps image_count == caption_count in images/)."""
+    _model_or_404(model_id)
+    filename = _safe_name(filename)
+    if Path(filename).suffix.lower() not in IMAGE_SUFFIXES:
+        raise HTTPException(status_code=422, detail="filename must be jpg/jpeg/png")
+    image_path = _dataset_image_dir(model_id) / filename
+    caption_path = image_path.with_suffix(".txt")
+    if not image_path.is_file():
+        raise HTTPException(status_code=404, detail="dataset image not found")
+
+    async with _manifest_lock:
+        trash_dir = DATASET_TRASH / f"{model_id}-{int(time.time())}"
+        trash_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(image_path, trash_dir / filename)
+            if caption_path.is_file():
+                os.replace(caption_path, trash_dir / caption_path.name)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"could not move image to trash: {exc}")
+        manifest = _load_manifest(model_id)
+        manifest["images"] = [e for e in manifest["images"] if e.get("filename") != filename]
+        _save_manifest(model_id, manifest)
+    return {"ok": True, "manifest": {"version": manifest["version"], "images": manifest["images"]}}
+
+
+@app.post("/api/models/{model_id}/dataset/caption")
+async def caption_model_dataset(model_id: str) -> dict[str, Any]:
+    """Run lora/caption.py --force for this model (CPU task, not a GPU job)."""
+    _model_or_404(model_id)
+    if any(
+        j.get("kind") == "train"
+        and j.get("model_id") == model_id
+        and j.get("status") in ("queued", "running")
+        for j in jobs.values()
+    ):
+        raise HTTPException(status_code=409, detail="training is active for this model")
+    async with _manifest_lock:
+        result = await _await_subprocess(
+            ["python", "lora/caption.py", "--model", model_id, "--force"],
+            cwd=WORKSPACE,
+        )
+    output_tail = [line for line in result["output"].splitlines() if line.strip()][-20:]
+    return {"ok": result["returncode"] == 0, "returncode": result["returncode"], "output_tail": output_tail}
+
+
+# --------------------------------------------------------------------------- #
 # Generated-artifact previews (candidates / dataset / posts) — one whitelisted
 # endpoint; "posts-private" is never served.
 # --------------------------------------------------------------------------- #
@@ -881,6 +1103,11 @@ async def job_post(payload: dict[str, Any]) -> dict[str, Any]:
     caption = str(payload.get("caption", "")).strip()
     if not caption:
         raise HTTPException(status_code=400, detail="caption required")
+    # Dual-mode (feature 005): public → posts/, private → posts-private/.
+    # Guardrail validation applies to both modes.
+    mode = str(payload.get("mode") or "public").strip()
+    if mode not in ("public", "private"):
+        raise HTTPException(status_code=422, detail="mode must be public or private")
     scene_id = str(payload.get("scene_id") or payload.get("scene") or "").strip()
     scene_text = _resolve_scene_text(model_id, scene_id) if scene_id else ""
 
@@ -905,6 +1132,7 @@ async def job_post(payload: dict[str, Any]) -> dict[str, Any]:
         "--seed", str(seed), "--lora-strength", str(strength),
         "--model", model_id,
         "--negative", str(profile.get("negative", "")),
+        "--mode", mode,
     ]
     if name:
         cmd += ["--name", name]
@@ -978,6 +1206,30 @@ async def list_posts() -> dict[str, Any]:
                 "name": post.name,
                 "photo": photo.name if photo else None,
                 "caption": caption.read_text(encoding="utf-8").strip() if caption.exists() else None,
+            }
+        )
+    return {"posts": posts}
+
+
+@app.get("/api/posts-private")
+async def list_posts_private() -> dict[str, Any]:
+    """Private (explicit-mode) posts of the active model — metadata only, never
+    any image-path fields ("posts-private" is not served by /files either)."""
+    folder = _active_model_dir("posts-private")
+    if folder is None or not folder.exists():
+        return {"posts": []}
+    posts = []
+    for post in sorted(folder.iterdir()):
+        if not post.is_dir():
+            continue
+        caption = post / "caption.txt"
+        prompt = post / "prompt.txt"
+        posts.append(
+            {
+                "name": post.name,
+                "caption": caption.read_text(encoding="utf-8").strip() if caption.exists() else None,
+                "prompt": prompt.read_text(encoding="utf-8").strip() if prompt.exists() else None,
+                "created": datetime.fromtimestamp(post.stat().st_mtime, tz=timezone.utc).isoformat(),
             }
         )
     return {"posts": posts}

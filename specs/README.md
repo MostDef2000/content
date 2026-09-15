@@ -39,3 +39,8 @@ Issue + видимая область работ
 - `003-prompt-profile-and-library` — `prompts.py` (сборка positive/negative с
   guardrail), per-model `prompt_profile.json`, библиотека сцен
   `models/library.json`.
+- `004-explicit-dataset` — manifest-aware `lora/caption.py`: per-model
+  `models/<id>/dataset/manifest.json` (теги tasteful/explicit), age-floor и
+  trigger-word фикс базовой каптион-строки, guardrail-проверка до записи.
+- `005-dual-mode` — флаг `--mode public|private` в `queue_workflow.py post`:
+  папки назначения `models/<id>/posts/` и `models/<id>/posts-private/`.

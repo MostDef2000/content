@@ -43,6 +43,20 @@
     .lib-item { border:1px solid #2c313c; border-radius:10px; padding:10px; margin-bottom:8px; }
     .dirty-tag { color:var(--warn); font-size:12px; display:none; margin-left:8px; }
     .dirty .dirty-tag { display:inline; }
+    .seg { display:inline-flex; gap:6px; flex-wrap:wrap; align-items:center; }
+    button.segbtn { background:#2a2f3a; padding:6px 10px; font-size:13px; }
+    button.segbtn.active { background:var(--accent); color:#fff; }
+    button.tagbtn { padding:4px 8px; font-size:12px; }
+    .ds-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px,1fr)); gap:12px; margin-top:10px; }
+    .ds-card { border:1px solid #2c313c; border-radius:10px; padding:8px; display:grid; gap:6px; align-content:start; }
+    .ds-card img { width:100%; height:140px; object-fit:cover; border-radius:8px; cursor:zoom-in; }
+    .ds-name { font-size:11px; color:var(--muted); word-break:break-all; }
+    .card.warn-border { border-color:var(--warn); }
+    .mode-note { display:none; color:var(--warn); font-size:12px; margin:4px 0 0; }
+    .card.warn-border .mode-note { display:block; }
+    .warn-note { color:var(--warn); font-size:12px; }
+    .ok-text { color:var(--ok); font-size:12px; }
+    .privacy-note { background:rgba(255,180,84,.12); color:var(--warn); border:1px solid rgba(255,180,84,.35); border-radius:8px; padding:8px 10px; font-size:12px; margin-bottom:8px; }
     .lightbox { position:fixed; inset:0; background:rgba(5,6,10,.9); display:flex; align-items:center; justify-content:center; z-index:100; cursor:zoom-out; }
     .lightbox img { max-width:92vw; max-height:92vh; border-radius:10px; box-shadow:0 10px 40px rgba(0,0,0,.6); }
     .lightbox[hidden] { display:none; }
@@ -63,6 +77,7 @@
 
   <nav class="tabs">
     <button class="tab active" data-tab="pipeline">Пайплайн</button>
+    <button class="tab" data-tab="dataset">Датасет</button>
     <button class="tab" data-tab="models">Модели</button>
     <button class="tab" data-tab="profile">Промт-профиль</button>
     <button class="tab" data-tab="library">Библиотека сцен</button>
@@ -120,8 +135,14 @@
         </div>
       </div>
 
-      <div class="card">
+      <div class="card" id="cardPost">
         <h2>4. Сгенерировать пост</h2>
+        <label>Режим поста</label>
+        <div class="seg" id="postModeSeg">
+          <button type="button" class="segbtn active" data-postmode="public">Публичный (IG)</button>
+          <button type="button" class="segbtn" data-postmode="private">Приватный</button>
+        </div>
+        <p class="mode-note">папка posts-private, без превью в UI</p>
         <label>Сцена (из пресетов/библиотеки, режим «post»)</label>
         <select id="postScene"></select>
         <label>Prompt (необязательно — иначе соберётся из профиля и сцены)</label>
@@ -152,7 +173,51 @@
 
       <div class="card">
         <h2>Готовые посты</h2>
+        <div class="seg" id="postsGallerySeg" style="margin:6px 0">
+          <button type="button" class="segbtn active" data-gallery="public">Public</button>
+          <button type="button" class="segbtn" data-gallery="private">Private</button>
+        </div>
         <div id="posts" class="muted">—</div>
+        <div id="postsPrivate" hidden></div>
+      </div>
+    </section>
+
+    <!-- ======================= ДАТАСЕТ ======================= -->
+    <section data-tab="dataset" hidden style="display:grid; gap:16px">
+      <div class="card">
+        <h2>Загрузить изображения</h2>
+        <p class="muted">JPG/PNG до 20 МБ каждое. Тег пишется в манифест датасета (tasteful | explicit) и влияет на каптионы.</p>
+        <div class="row">
+          <input id="dsFiles" type="file" accept=".jpg,.jpeg,.png" multiple style="width:auto; min-width:260px" />
+          <select id="dsTag" style="width:auto">
+            <option value="tasteful" selected>tasteful</option>
+            <option value="explicit">explicit</option>
+          </select>
+          <button id="dsUpload">Загрузить</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Каптионы и обучение</h2>
+        <div class="row">
+          <button id="dsCaptionAll">Caption all</button>
+          <button id="dsTrain">Обучить LoRA</button>
+          <span id="dsTrainWarn" class="muted">—</span>
+        </div>
+        <p class="muted">Обучение требует ≥15 картинок и captioned == total (у каждого кадра должен быть каптион).</p>
+      </div>
+
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h2>Изображения датасета</h2>
+          <div class="seg" id="dsFilterSeg">
+            <button type="button" class="segbtn active" data-dsfilter="all">all</button>
+            <button type="button" class="segbtn" data-dsfilter="tasteful">tasteful</button>
+            <button type="button" class="segbtn" data-dsfilter="explicit">explicit</button>
+          </div>
+        </div>
+        <p class="muted">Клик по картинке — превью. Тоггл меняет тег записи манифеста, ✕ удаляет файл из датасета.</p>
+        <div id="dsGrid" class="ds-grid"><span class="muted">— загрузка…</span></div>
       </div>
     </section>
 
@@ -269,6 +334,12 @@
       presets: [],           // пресеты сцен из /api/prompt-profile
       library: [],           // сцены из /api/library
       profileScenes: {},     // рабочая копия сцен профиля (id → text)
+      postMode: "public",    // режим нового поста: public | private (Фаза 2)
+      dataset: [],           // записи GET /api/models/<id>/dataset: [{filename, tag}]
+      datasetStats: null,    // {total, captioned} из ответа dataset-эндпоинта
+      datasetFilter: "all",  // клиентский фильтр грида: all | tasteful | explicit
+      postsPrivate: [],      // метаданные GET /api/posts-private (без превью)
+      galleryTab: "public",  // подвкладка галереи: public | private
     };
 
     const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
@@ -640,6 +711,168 @@
       fillSceneSelect($("postScene"), "post");
     }
 
+    // ------------------------- датасет (Фаза 2: manifest tasteful|explicit) -------------------------
+    function renderDatasetWarn() {
+      const el = $("dsTrainWarn");
+      const s = state.datasetStats;
+      if (!s) { el.textContent = "статистика датасета недоступна"; el.className = "warn-note"; return; }
+      const total = s.total ?? (state.dataset || []).length;
+      const cap = s.captioned ?? 0;
+      const ok = total >= 15 && cap === total;
+      el.textContent = ok
+        ? `OK: ${total} картинок, ${cap}/${total} с каптионами`
+        : `не готово: ${total} картинок (нужно ≥15), ${cap}/${total} с каптионами`;
+      el.className = ok ? "ok-text" : "warn-note";
+    }
+
+    function renderDatasetGrid() {
+      const box = $("dsGrid");
+      if (!box) return;
+      const recs = state.dataset || [];
+      const f = state.datasetFilter;
+      const shown = f === "all" ? recs : recs.filter((r) => r.tag === f);
+      if (!shown.length) {
+        box.innerHTML = `<span class="muted">— ${f === "all" ? "датасет пуст" : "нет картинок с тегом " + esc(f)}</span>`;
+        return;
+      }
+      box.innerHTML = "";
+      shown.forEach((rec) => {
+        const url = fileUrl("dataset", rec.filename);
+        const card = document.createElement("div");
+        card.className = "ds-card";
+        const img = document.createElement("img");
+        img.src = url; img.alt = rec.filename; img.title = rec.filename; img.loading = "lazy";
+        img.onclick = () => openLightbox(url);
+        const name = document.createElement("div");
+        name.className = "ds-name";
+        name.textContent = rec.filename;
+        const row = document.createElement("div");
+        row.className = "row";
+        ["tasteful", "explicit"].forEach((t) => {
+          const b = document.createElement("button");
+          b.type = "button";
+          b.className = "segbtn tagbtn" + (rec.tag === t ? " active" : "");
+          b.textContent = t;
+          b.onclick = () => setDatasetTag(rec, t);
+          row.appendChild(b);
+        });
+        const del = document.createElement("button");
+        del.className = "ghost tagbtn";
+        del.textContent = "✕";
+        del.title = "Удалить из датасета";
+        del.onclick = () => deleteDatasetImage(rec);
+        row.appendChild(del);
+        card.append(img, name, row);
+        box.appendChild(card);
+      });
+    }
+
+    async function setDatasetTag(rec, tag) {
+      if (!state.activeId || rec.tag === tag) return;
+      const images = (state.dataset || []).map((r) => ({
+        filename: r.filename,
+        tag: r.filename === rec.filename ? tag : r.tag,
+      }));
+      try {
+        await api("PUT", `/api/models/${encodeURIComponent(state.activeId)}/dataset`, { images });
+      } catch (e) { alert("Ошибка смены тега: " + e.message); return; }
+      rec.tag = tag;
+      renderDatasetGrid();
+    }
+
+    async function deleteDatasetImage(rec) {
+      if (!state.activeId) return;
+      if (!confirm(`Удалить «${rec.filename}» из датасета?`)) return;
+      try {
+        await api("DELETE", `/api/models/${encodeURIComponent(state.activeId)}/dataset/${encodeURIComponent(rec.filename)}`);
+      } catch (e) { alert("Ошибка удаления: " + e.message); return; }
+      state.dataset = (state.dataset || []).filter((r) => r.filename !== rec.filename);
+      renderDatasetGrid();
+      renderDatasetWarn();
+      refresh();
+    }
+
+    // Загрузка НЕ через api(): multipart без ручного Content-Type (браузер ставит boundary).
+    $("dsUpload").onclick = async () => {
+      const input = $("dsFiles");
+      if (!state.activeId) { alert("Нет активной модели."); return; }
+      if (!input.files || !input.files.length) { alert("Выберите файлы (jpg/png)."); return; }
+      const MAX = 20 * 1024 * 1024; // 20 МБ на файл, проверка до отправки
+      for (const f of input.files) {
+        if (f.size > MAX) { alert(`Файл «${f.name}» больше 20 МБ — загрузка отменена.`); return; }
+      }
+      const fd = new FormData();
+      for (const f of input.files) fd.append("files", f);
+      fd.append("tag", $("dsTag").value);
+      $("dsUpload").disabled = true;
+      try {
+        const res = await fetch(`/api/models/${encodeURIComponent(state.activeId)}/dataset/upload`, {
+          method: "POST", body: fd,
+        });
+        if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+        input.value = "";
+        refresh();
+      } catch (e) { alert("Ошибка загрузки: " + e.message); }
+      $("dsUpload").disabled = false;
+    };
+
+    $("dsCaptionAll").onclick = async () => {
+      if (!state.activeId) { alert("Нет активной модели."); return; }
+      try {
+        await api("POST", `/api/models/${encodeURIComponent(state.activeId)}/dataset/caption`, { force: true });
+        refresh();
+      } catch (e) { alert("Ошибка каптионирования: " + e.message); }
+    };
+
+    $("dsTrain").onclick = async () => {
+      try { await api("POST", "/api/train/start"); refresh(); }
+      catch (e) { alert("Ошибка запуска обучения: " + e.message); }
+    };
+
+    document.querySelectorAll("#dsFilterSeg .segbtn").forEach((b) => {
+      b.onclick = () => {
+        state.datasetFilter = b.dataset.dsfilter;
+        document.querySelectorAll("#dsFilterSeg .segbtn").forEach((x) => x.classList.toggle("active", x === b));
+        renderDatasetGrid();
+      };
+    });
+
+    // ------------------------- режим поста и приватная галерея (Фаза 2) -------------------------
+    document.querySelectorAll("#postModeSeg .segbtn").forEach((b) => {
+      b.onclick = () => {
+        state.postMode = b.dataset.postmode;
+        document.querySelectorAll("#postModeSeg .segbtn").forEach((x) => x.classList.toggle("active", x === b));
+        $("cardPost").classList.toggle("warn-border", state.postMode === "private");
+      };
+    });
+
+    document.querySelectorAll("#postsGallerySeg .segbtn").forEach((b) => {
+      b.onclick = () => {
+        state.galleryTab = b.dataset.gallery;
+        document.querySelectorAll("#postsGallerySeg .segbtn").forEach((x) => x.classList.toggle("active", x === b));
+        $("posts").hidden = state.galleryTab !== "public";
+        $("postsPrivate").hidden = state.galleryTab !== "private";
+      };
+    });
+
+    // Приватные посты: превью недоступно по дизайну приватности — рендер
+    // только метаданных, БЕЗ img / fileUrl / openLightbox.
+    function renderPostsPrivate() {
+      const box = $("postsPrivate");
+      if (!box) return;
+      const items = state.postsPrivate || [];
+      const cards = items.length
+        ? items.map((x) => `
+            <div class="postcard" style="margin:6px 0">
+              📁 <b>${esc(x.name)}</b>
+              ${x.caption ? `<div class="muted" style="margin-top:4px">caption: ${esc(truncate(x.caption, 200))}</div>` : ""}
+              ${x.prompt ? `<div class="muted" style="margin-top:2px">prompt: ${esc(truncate(x.prompt, 200))}</div>` : ""}
+              ${x.created ? `<div class="muted" style="margin-top:2px">created: ${esc(x.created)}</div>` : ""}
+            </div>`).join("")
+        : '<span class="muted">— приватных постов нет</span>';
+      box.innerHTML = '<div class="privacy-note">🔒 Превью недоступно по дизайну приватности</div>' + cards;
+    }
+
     // ------------------------- превью (активная модель) -------------------------
     async function refresh() {
       await loadStatus();
@@ -675,6 +908,32 @@
           ? p.posts.map(x => `<div class="postcard" style="margin:6px 0">${x.photo ? `<img src="${fileUrl("posts", x.name, x.photo)}" alt="${esc(x.name)}" loading="lazy" onclick="openLightbox(this.src)" onerror="this.remove()">` : ""}📁 <b>${esc(x.name)}</b>${x.caption ? "<br><span class='muted'>" + esc(x.caption) + "</span>" : ""}</div>`).join("")
           : "—";
       } catch (e) {}
+
+      // Датасет активной модели (Фаза 2): manifest-записи {filename, tag} + stats
+      if (state.activeId) {
+        try {
+          const d = await api("GET", `/api/models/${encodeURIComponent(state.activeId)}/dataset`);
+          state.dataset = (d.images || []).map((it) => typeof it === "string"
+            ? { filename: it, tag: "tasteful" }
+            : { filename: String(it.filename), tag: it.tag === "explicit" ? "explicit" : "tasteful" });
+          state.datasetStats = d.stats || {
+            total: state.dataset.length,
+            captioned: state.dataset.filter((r) => r.caption).length,
+          };
+        } catch (e) { state.dataset = []; state.datasetStats = null; }
+      } else {
+        state.dataset = [];
+        state.datasetStats = null;
+      }
+      renderDatasetGrid();
+      renderDatasetWarn();
+
+      // Приватные посты: только метаданные (name/caption/prompt/created)
+      try {
+        const pp = await api("GET", "/api/posts-private");
+        state.postsPrivate = pp.posts || [];
+      } catch (e) { state.postsPrivate = []; }
+      renderPostsPrivate();
     }
 
     async function callLifecycle(path) {
@@ -725,6 +984,7 @@
             };
             if (scene) body.scene_id = scene;
             if (prompt) body.prompt = prompt;
+            body.mode = state.postMode; // public → posts/, private → posts-private/
           }
           if (job === "train") {
             // Обучение — выделенный эндпоинт (регистрирует LoRA в реестре до запуска).

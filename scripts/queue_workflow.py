@@ -269,7 +269,10 @@ def generate_post(args: argparse.Namespace) -> None:
     post_name = args.name or datetime.now().strftime("%Y-%m-%d-%H%M%S")
     if Path(post_name).name != post_name:
         raise ValueError("Post name must not contain a path")
-    destination = ROOT / "models" / model_id / "posts" / post_name
+    # Dual-mode destination (feature 005): transit folder in ComfyUI stays
+    # "posts/<model_id>" — only the final per-model folder switches.
+    subdir = "posts" if args.mode == "public" else "posts-private"
+    destination = ROOT / "models" / model_id / subdir / post_name
     destination.mkdir(parents=True, exist_ok=False)
 
     try:
@@ -314,6 +317,12 @@ def parser() -> argparse.ArgumentParser:
     post.add_argument("--seed", type=int, default=27191)
     post.add_argument("--lora-strength", type=float, default=0.8)
     post.add_argument("--negative", default="", help="Extra negative terms; canonical guardrail terms are always kept")
+    post.add_argument(
+        "--mode",
+        choices=("public", "private"),
+        default="public",
+        help="public → models/<id>/posts/, private → models/<id>/posts-private/",
+    )
     post.add_argument("--model", default=None, help="Model id from models/registry.json (default: active)")
     post.set_defaults(handler=generate_post)
     return root
