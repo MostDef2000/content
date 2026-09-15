@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 import shutil
 import sys
@@ -287,6 +288,174 @@ def generate_post(args: argparse.Namespace) -> None:
     print(destination)
 
 
+GROUP_LAYOUT_COLUMNS = {"row": 1, "grid2": 2, "grid3": 3}
+
+
+def _cover_crop(image: Any, width: int, height: int) -> Any:
+    """Scale ``image`` to cover width×height, then center-crop to exactly that."""
+    scale = max(width / image.width, height / image.height)
+    scaled = image.resize((round(image.width * scale), round(image.height * scale)))
+    left = (scaled.width - width) // 2
+    top = (scaled.height - height) // 2
+    return scaled.crop((left, top, left + width, top + height))
+
+
+def _compose_grid(images: list[Any], columns: int) -> Any:
+    """Paste member images into a columns-wide grid canvas.
+
+    The first image defines the cell size; images of a different size are
+    scaled to cover the cell and center-cropped, equal-size ones are pasted
+    as-is. Unfilled tiles keep the neutral canvas fill (230, 230, 230).
+    """
+    from PIL import Image  # lazy: only the group composite needs Pillow
+
+    cell_w, cell_h = images[0].size
+    rows = math.ceil(len(images) / columns)
+    canvas = Image.new("RGB", (columns * cell_w, rows * cell_h), (230, 230, 230))
+    for index, image in enumerate(images):
+        cell = image if image.size == (cell_w, cell_h) else _cover_crop(image, cell_w, cell_h)
+        if cell.mode != "RGB":
+            cell = cell.convert("RGB")
+        canvas.paste(cell, ((index % columns) * cell_w, (index // columns) * cell_h))
+    return canvas
+
+
+def generate_group(args: argparse.Namespace) -> None:
+    members = [item.strip() for item in args.models.split(",")]
+    if not 1 <= len(members) <= 5:
+        raise ValueError(f"--models needs 1..5 members, got {len(members)}")
+    if len(set(members)) != len(members):
+        raise ValueError(f"--models contains duplicate members: {members}")
+
+    # Pillow is only needed for the composite; import lazily so py_compile and
+    # --help work in environments without it (fail fast before queuing).
+    try:
+        from PIL import Image  # noqa: F401 — used below to open member images
+    except ImportError as exc:
+        raise RuntimeError(
+            "Pillow required for group composite; rebuild manager image "
+            "(see management/requirements.txt)"
+        ) from exc
+
+    # Pre-flight before queuing anything: registry entry, character, profile
+    # and deployed LoRA for every member (mirrors generate_post checks).
+    registry_models = load_registry().get("models") or []
+    plans: list[dict[str, Any]] = []
+    for member_id in members:
+        entry = next(
+            (item for item in registry_models if str(item.get("id")) == member_id),
+            None,
+        )
+        if entry is None:
+            known = ", ".join(str(item.get("id")) for item in registry_models)
+            raise RuntimeError(f"Unknown model id {member_id!r}; registered models: {known}")
+        character = load_character(member_id)
+        profile_path = ROOT / "models" / member_id / "prompt_profile.json"
+        profile: dict[str, Any] = {}
+        if profile_path.exists():
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        # Registry lora wins; older entries may lack it — fall back to the
+        # canonical <id>.safetensors name (same rule as generate_post).
+        registry_lora = str(entry.get("lora") or f"{member_id}.safetensors")
+        lora_path = ROOT / "runtime" / "models" / "loras" / registry_lora
+        if not lora_path.is_file():
+            raise FileNotFoundError(
+                f"LoRA for model {member_id!r} is not available: expected {lora_path} "
+                f"(registry lora: {entry.get('lora')!r}). Train it with "
+                f"'scripts/train_lora.sh {member_id}' and copy the .safetensors into "
+                "runtime/models/loras/."
+            )
+        plans.append(
+            {
+                "id": member_id,
+                "lora": registry_lora,
+                "profile": profile,
+                "age": int(character.get("age", prompts.AGE_FLOOR)),
+            }
+        )
+
+    batch = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # Transit stays per-member in ComfyUI (group/<batch>/<member_id>); the
+    # staging folder collects the moved results for the composite.
+    staging_root = OUTPUT_ROOT / "group" / batch
+    staging_root.mkdir(parents=True)
+
+    destination: Path | None = None
+    try:
+        member_paths: list[Path] = []
+        for index, plan in enumerate(plans):
+            member_id = str(plan["id"])
+            positive = guardrail_positive(args.prompt, int(plan["age"]))
+            negative = prompts.build_negative(
+                str(plan["profile"].get("negative", ""))
+                + (f", {args.negative}" if args.negative else ""),
+                mode="post",
+            )
+            workflow = load_workflow("flux_lora")
+            workflow["6"]["inputs"]["text"] = positive
+            workflow["31"]["inputs"]["seed"] = args.seed + index
+            workflow["40"]["inputs"]["lora_name"] = str(plan["lora"])
+            workflow["40"]["inputs"]["strength_model"] = args.lora_strength
+            workflow["9"]["inputs"]["filename_prefix"] = f"group/{batch}/{member_id}"
+            set_negative(workflow, negative)
+            print(f"Generating group member {index}/{len(plans)} ({member_id})...")
+            images = queue_and_wait(args.url, workflow)
+            source = output_path(images[0])
+            target = staging_root / f"{index:02d}_{member_id}{source.suffix}"
+            shutil.move(source, target)
+            member_paths.append(target)
+            plan["positive"] = positive
+
+        member_images = [Image.open(path) for path in member_paths]
+        canvas = _compose_grid(member_images, GROUP_LAYOUT_COLUMNS[args.layout])
+
+        primary = members[0]
+        name = args.name or datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        if Path(name).name != name:
+            raise ValueError("Group name must not contain a path")
+        # Destination follows the primary member's per-model posts layout (005).
+        subdir = "posts" if args.mode == "public" else "posts-private"
+        new_destination = ROOT / "models" / primary / subdir / name
+        new_destination.mkdir(parents=True, exist_ok=False)
+        destination = new_destination
+
+        canvas.save(new_destination / "photo.jpg", format="JPEG", quality=92)
+        (new_destination / "caption.txt").write_text(args.caption.strip() + "\n", encoding="utf-8")
+        # First line: the primary member's positive (single-post format);
+        # then a labeled section per member (ages may differ → phrases differ).
+        prompt_sections = [f"{plans[0]['positive']}\n"]
+        for plan in plans:
+            prompt_sections.append(f"--- {plan['id']} ---\n{plan['positive']}\n")
+        (new_destination / "prompt.txt").write_text("".join(prompt_sections), encoding="utf-8")
+        group_meta = {
+            "members": members,
+            "layout": args.layout,
+            "mode": args.mode,
+            "seeds": [args.seed + index for index in range(len(plans))],
+            "loras": {str(plan["id"]): str(plan["lora"]) for plan in plans},
+            "caption": args.caption.strip(),
+        }
+        (new_destination / "group.json").write_text(
+            json.dumps(group_meta, indent=2) + "\n", encoding="utf-8"
+        )
+    except Exception:
+        # Rollback: remove the destination only if this run created it (never
+        # a pre-existing folder), and the staging folder only while empty.
+        if destination is not None:
+            shutil.rmtree(destination, ignore_errors=True)
+        if staging_root.is_dir() and not any(staging_root.iterdir()):
+            staging_root.rmdir()
+        raise
+    # Success: staging is transit, not an artifact — drop the moved member
+    # files and remove the staging folder while empty (runtime/output/group/
+    # itself stays in place).
+    for path in member_paths:
+        path.unlink(missing_ok=True)
+    if staging_root.is_dir() and not any(staging_root.iterdir()):
+        staging_root.rmdir()
+    print(destination)
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Queue sequential FLUX jobs in ComfyUI")
     # Manager container reaches ComfyUI by compose service name; respect COMFY_URL.
@@ -325,12 +494,39 @@ def parser() -> argparse.ArgumentParser:
     )
     post.add_argument("--model", default=None, help="Model id from models/registry.json (default: active)")
     post.set_defaults(handler=generate_post)
+
+    group = commands.add_parser("group", help="Generate a multi-model group composite (1..5 members)")
+    group.add_argument(
+        "--models",
+        required=True,
+        help="Comma-separated member ids from models/registry.json (1..5, no duplicates)",
+    )
+    group.add_argument("--prompt", required=True, help="Shared scene prompt; guardrail phrase injected per member age")
+    group.add_argument(
+        "--layout",
+        choices=("row", "grid2", "grid3"),
+        default="row",
+        help="row → 1 column, grid2 → 2 columns, grid3 → 3 columns",
+    )
+    group.add_argument(
+        "--mode",
+        choices=("public", "private"),
+        default="public",
+        help="Destination follows the primary member: public → models/<primary>/posts/, private → posts-private/",
+    )
+    group.add_argument("--caption", required=True)
+    group.add_argument("--name", help="Destination folder name under models/<primary>/<subdir>/ (default: timestamp)")
+    group.add_argument("--seed", type=int, default=27191)
+    group.add_argument("--lora-strength", type=float, default=0.8)
+    group.add_argument("--negative", default="", help="Shared extra negative terms; canonical guardrail terms are always kept")
+    group.set_defaults(handler=generate_group)
     return root
 
 
 def main() -> int:
     args = parser().parse_args()
-    args.model_id = resolve_model_id(args.model)
+    if hasattr(args, "model"):
+        args.model_id = resolve_model_id(args.model)
     args.handler(args)
     return 0
 

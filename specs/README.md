@@ -44,3 +44,13 @@ Issue + видимая область работ
   trigger-word фикс базовой каптион-строки, guardrail-проверка до записи.
 - `005-dual-mode` — флаг `--mode public|private` в `queue_workflow.py post`:
   папки назначения `models/<id>/posts/` и `models/<id>/posts-private/`.
+- `006-clear-dataset` — массовая очистка обучающего датасета модели
+  (`models/<id>/dataset/`) с мягким удалением в `runtime/trash/dataset/`
+  (manager endpoint `DELETE /api/models/{id}/dataset?confirm=<id>` +
+  UI-диалог, подтверждение вводом id); реализовано в Фазе 3 — unit-тесты
+  `tests/test_clear_dataset.py`, серверный smoke — SYSADMIN-HANDOFF.
+- `007-group-photos` — подкоманда `group` в `queue_workflow.py`: группа из
+  1..5 моделей (последовательная генерация, guardrail по возрасту члена),
+  PIL-композит (`row`/`grid2`/`grid3`), папка поста первичной модели
+  (`posts`/`posts-private`) с `group.json`; зависимость `Pillow>=10,<13` в
+  `management/requirements.txt` (ленивый импорт).

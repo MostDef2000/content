@@ -57,6 +57,17 @@
     .warn-note { color:var(--warn); font-size:12px; }
     .ok-text { color:var(--ok); font-size:12px; }
     .privacy-note { background:rgba(255,180,84,.12); color:var(--warn); border:1px solid rgba(255,180,84,.35); border-radius:8px; padding:8px 10px; font-size:12px; margin-bottom:8px; }
+    .chips { display:flex; flex-wrap:wrap; gap:8px; }
+    .chip { display:inline-flex; align-items:center; gap:6px; background:#2a2f3a; border:1px solid #2c313c; border-radius:999px; padding:6px 10px; font-size:13px; cursor:pointer; }
+    .chip.disabled { opacity:.5; cursor:not-allowed; }
+    .chip input { width:auto; }
+    .lora-ok { color:var(--ok); font-size:11px; font-weight:600; }
+    .lora-no { color:var(--err); font-size:11px; font-weight:600; }
+    dialog { background:var(--card); color:var(--text); border:1px solid #2c313c; border-radius:12px; padding:16px; width:min(560px, 92vw); max-height:82vh; overflow:auto; }
+    dialog::backdrop { background:rgba(5,6,10,.7); }
+    dialog h2 { margin:0; }
+    .mini-grid { display:flex; flex-wrap:wrap; gap:6px; margin:10px 0; }
+    .mini-grid img { width:64px; height:64px; object-fit:cover; border-radius:6px; border:1px solid #262a33; }
     .lightbox { position:fixed; inset:0; background:rgba(5,6,10,.9); display:flex; align-items:center; justify-content:center; z-index:100; cursor:zoom-out; }
     .lightbox img { max-width:92vw; max-height:92vh; border-radius:10px; box-shadow:0 10px 40px rgba(0,0,0,.6); }
     .lightbox[hidden] { display:none; }
@@ -78,6 +89,7 @@
   <nav class="tabs">
     <button class="tab active" data-tab="pipeline">Пайплайн</button>
     <button class="tab" data-tab="dataset">Датасет</button>
+    <button class="tab" data-tab="group">Групповой кадр</button>
     <button class="tab" data-tab="models">Модели</button>
     <button class="tab" data-tab="profile">Промт-профиль</button>
     <button class="tab" data-tab="library">Библиотека сцен</button>
@@ -202,6 +214,7 @@
         <div class="row">
           <button id="dsCaptionAll">Caption all</button>
           <button id="dsTrain">Обучить LoRA</button>
+          <button id="dsWipe" class="ghost">Очистить датасет…</button>
           <span id="dsTrainWarn" class="muted">—</span>
         </div>
         <p class="muted">Обучение требует ≥15 картинок и captioned == total (у каждого кадра должен быть каптион).</p>
@@ -218,6 +231,54 @@
         </div>
         <p class="muted">Клик по картинке — превью. Тоггл меняет тег записи манифеста, ✕ удаляет файл из датасета.</p>
         <div id="dsGrid" class="ds-grid"><span class="muted">— загрузка…</span></div>
+      </div>
+    </section>
+
+    <!-- ======================= ГРУППОВОЙ КАДР ======================= -->
+    <section data-tab="group" hidden style="display:grid; gap:16px">
+      <div class="card" id="cardGroup">
+        <h2>Групповой кадр (несколько моделей)</h2>
+        <p class="muted">До 5 моделей композитом (PIL). Первая выбранная (активная) — primary: её профиль/LoRA и её папка получают пост. Члены генерируются последовательно — GPU занят надолго.</p>
+        <label>Участники (порядок чипов = порядок моделей; активная — первой)</label>
+        <div id="grpModels" class="chips"><span class="muted">— загрузка…</span></div>
+        <div id="grpCount" class="muted">выбрано 0/5</div>
+
+        <label>Сцена (из пресетов/библиотеки, режим «post»)</label>
+        <select id="grpScene"></select>
+        <label>Prompt (необязательно)</label>
+        <textarea id="grpPrompt" rows="3" placeholder="или введите prompt (сцена имеет приоритет если пуста)"></textarea>
+
+        <label>Раскладка</label>
+        <div class="seg" id="grpLayoutSeg">
+          <button type="button" class="segbtn active" data-grplayout="row">row</button>
+          <button type="button" class="segbtn" data-grplayout="grid2">grid2</button>
+          <button type="button" class="segbtn" data-grplayout="grid3">grid3</button>
+        </div>
+
+        <label>Режим поста</label>
+        <div class="seg" id="grpModeSeg">
+          <button type="button" class="segbtn active" data-grpmode="public">Публичный (IG)</button>
+          <button type="button" class="segbtn" data-grpmode="private">Приватный</button>
+        </div>
+        <p class="mode-note">папка posts-private первичной модели, без превью в UI</p>
+
+        <label>Caption (обязателен)</label>
+        <textarea id="grpCaption" rows="2" placeholder="Текст поста #group"></textarea>
+        <div class="grid2">
+          <div>
+            <label>Имя папки (необязательно)</label>
+            <input id="grpName" placeholder="2026-09-15-beach" />
+          </div>
+          <div>
+            <label>Seed</label>
+            <input id="grpSeed" type="number" value="27191" />
+          </div>
+        </div>
+        <label>LoRA strength</label>
+        <input id="grpStrength" type="number" step="0.05" value="0.8" min="0" max="1.5" />
+        <div class="row" style="margin-top:10px">
+          <button data-job="group" id="grpGo">Сгенерировать группу</button>
+        </div>
       </div>
     </section>
 
@@ -324,6 +385,22 @@
 
   <div id="lightbox" class="lightbox" hidden><img id="lightboxImg" alt="preview"></div>
 
+  <dialog id="wipeDialog">
+    <div class="row" style="justify-content:space-between">
+      <h2>Очистить датасет</h2>
+      <button id="wipeClose" class="ghost tagbtn" title="Закрыть">✕</button>
+    </div>
+    <p id="wipeStats" class="muted">—</p>
+    <div id="wipePreviewGrid" class="mini-grid"></div>
+    <p class="warn-note">Файлы переносятся в runtime/trash/dataset/ — восстановимо вручную</p>
+    <label>введите id модели <span id="wipeConfirmHint" class="warn-note">—</span> для подтверждения</label>
+    <input id="wipeConfirmInput" autocomplete="off" spellcheck="false" />
+    <div class="row" style="margin-top:12px">
+      <button id="wipeCancel" class="ghost">Отмена</button>
+      <button id="wipeGo" disabled>Очистить</button>
+    </div>
+  </dialog>
+
   <script>
     const $ = (id) => document.getElementById(id);
 
@@ -340,6 +417,10 @@
       datasetFilter: "all",  // клиентский фильтр грида: all | tasteful | explicit
       postsPrivate: [],      // метаданные GET /api/posts-private (без превью)
       galleryTab: "public",  // подвкладка галереи: public | private
+      models: [],            // полный список GET /api/models (для чипов группового кадра)
+      grpLayout: "row",      // раскладка группы: row | grid2 | grid3 (Фаза 3)
+      grpMode: "public",     // режим группового поста: public | private (Фаза 3)
+      // выбор участников хранится в чекбоксах чипов #grpModels (порядок = DOM)
     };
 
     const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
@@ -412,7 +493,9 @@
       $("modelSelect").innerHTML = models
         .map((m) => `<option value="${esc(m.id)}">${esc(m.name)} · ${esc(m.id)}${m.active ? " ★" : ""}</option>`).join("");
       if (state.activeId) $("modelSelect").value = state.activeId;
+      state.models = models; // нужно чипам группового кадра (stats.lora_file)
       renderModelsList(models);
+      renderGroupChips();
     }
 
     function renderModelsList(models) {
@@ -709,6 +792,7 @@
       fillSceneSelect($("candScene"), "candidates");
       fillSceneSelect($("expScene"), "expand");
       fillSceneSelect($("postScene"), "post");
+      fillSceneSelect($("grpScene"), "post");
     }
 
     // ------------------------- датасет (Фаза 2: manifest tasteful|explicit) -------------------------
@@ -873,6 +957,113 @@
       box.innerHTML = '<div class="privacy-note">🔒 Превью недоступно по дизайну приватности</div>' + cards;
     }
 
+    // ------------------------- групповой кадр (Фаза 3 #8) -------------------------
+    // Выбор участников хранится в самих чипах (checkbox): порядок сбора = порядок DOM,
+    // активная модель отрендерена первой и помечена «(основная)».
+    function renderGroupChips() {
+      const box = $("grpModels");
+      if (!box) return;
+      const models = [...(state.models || [])]
+        .sort((a, b) => (b.id === state.activeId) - (a.id === state.activeId));
+      if (!models.length) {
+        box.innerHTML = '<span class="muted">— нет моделей; создайте их на вкладке «Модели»</span>';
+      } else {
+        box.innerHTML = models.map((m) => {
+          const hasLora = !!(m.stats && m.stats.lora_file);
+          const isActive = m.id === state.activeId;
+          const badge = hasLora ? '<span class="lora-ok">✓ LoRA</span>' : '<span class="lora-no">нет LoRA</span>';
+          return `<label class="chip${hasLora ? "" : " disabled"}" title="${esc(m.name)} (${esc(m.id)})">
+            <input type="checkbox" data-id="${esc(m.id)}"${hasLora ? "" : " disabled"}>
+            ${esc(m.name)} (${esc(m.id)})${isActive ? " (основная)" : ""} ${badge}
+          </label>`;
+        }).join("");
+        box.querySelectorAll("input[type=checkbox]").forEach((c) => {
+          c.onchange = () => {
+            // больше 5 выбранных быть не может: лишний только что выбранный — откатываем
+            if (c.checked && box.querySelectorAll("input[type=checkbox]:checked").length > 5) c.checked = false;
+            updateGrpCount();
+          };
+        });
+      }
+      updateGrpCount();
+    }
+
+    function updateGrpCount() {
+      const el = $("grpCount");
+      if (!el) return;
+      const n = document.querySelectorAll("#grpModels input[type=checkbox]:checked").length;
+      el.textContent = `выбрано ${n}/5`;
+    }
+
+    document.querySelectorAll("#grpLayoutSeg .segbtn").forEach((b) => {
+      b.onclick = () => {
+        state.grpLayout = b.dataset.grplayout;
+        document.querySelectorAll("#grpLayoutSeg .segbtn").forEach((x) => x.classList.toggle("active", x === b));
+      };
+    });
+
+    document.querySelectorAll("#grpModeSeg .segbtn").forEach((b) => {
+      b.onclick = () => {
+        state.grpMode = b.dataset.grpmode;
+        document.querySelectorAll("#grpModeSeg .segbtn").forEach((x) => x.classList.toggle("active", x === b));
+        $("cardGroup").classList.toggle("warn-border", state.grpMode === "private");
+      };
+    });
+
+    // ------------------------- очистка датасета (Фаза 3 #7) -------------------------
+    $("dsWipe").onclick = () => {
+      if (!state.activeId) { alert("Нет активной модели."); return; }
+      const recs = state.dataset || [];
+      const stats = state.datasetStats || {};
+      const total = stats.total ?? recs.length;
+      const captioned = stats.captioned ?? recs.filter((r) => r.caption).length;
+      $("wipeStats").textContent = `Будет удалено: ${total} картинок (${captioned} каптионов)`;
+      const grid = $("wipePreviewGrid");
+      grid.innerHTML = "";
+      if (!recs.length) {
+        grid.innerHTML = '<span class="muted">— датасет и так пуст</span>';
+      } else {
+        recs.slice(0, 12).forEach((rec) => {
+          const img = document.createElement("img");
+          img.src = fileUrl("dataset", rec.filename);
+          img.alt = rec.filename; img.title = rec.filename; img.loading = "lazy";
+          grid.appendChild(img);
+        });
+        if (recs.length > 12) {
+          const more = document.createElement("span");
+          more.className = "muted";
+          more.textContent = `…и ещё ${recs.length - 12}`;
+          grid.appendChild(more);
+        }
+      }
+      $("wipeConfirmHint").textContent = state.activeId;
+      $("wipeConfirmInput").value = "";
+      $("wipeGo").disabled = true;
+      $("wipeDialog").showModal();
+    };
+
+    $("wipeConfirmInput").addEventListener("input", () => {
+      $("wipeGo").disabled = $("wipeConfirmInput").value.trim() !== state.activeId;
+    });
+
+    $("wipeCancel").onclick = () => $("wipeDialog").close();
+    $("wipeClose").onclick = () => $("wipeDialog").close();
+    // клик по backdrop (вне содержимого диалога) — закрыть без действий
+    $("wipeDialog").addEventListener("click", (e) => {
+      if (e.target === $("wipeDialog")) $("wipeDialog").close();
+    });
+
+    $("wipeGo").onclick = async () => {
+      const id = state.activeId;
+      if (!id || $("wipeConfirmInput").value.trim() !== id) return;
+      try {
+        const d = await api("DELETE", `/api/models/${encodeURIComponent(id)}/dataset?confirm=${encodeURIComponent(id)}`);
+        $("wipeDialog").close();
+        alert(`Удалено: ${d.deleted.images} картинок, ${d.deleted.captions} каптионов\nTrash: ${d.trash_path}`);
+        refresh();
+      } catch (e) { alert("Ошибка очистки датасета: " + e.message); }
+    };
+
     // ------------------------- превью (активная модель) -------------------------
     async function refresh() {
       await loadStatus();
@@ -986,9 +1177,43 @@
             if (prompt) body.prompt = prompt;
             body.mode = state.postMode; // public → posts/, private → posts-private/
           }
+          if (job === "group") {
+            // ids собираем В ПОРЯДКЕ чипов: активная (основная) отрендерена первой
+            const ids = [...document.querySelectorAll("#grpModels input[type=checkbox]")]
+              .filter((c) => c.checked)
+              .map((c) => c.dataset.id);
+            const caption = $("grpCaption").value.trim();
+            const prompt = $("grpPrompt").value.trim();
+            const scene = $("grpScene").value;
+            if (!ids.length) { alert("Выберите хотя бы одну модель"); return; }
+            if (ids.length > 5) { alert("Максимум 5 моделей на групповой кадр."); return; }
+            if (!caption) { alert("Caption обязателен"); return; }
+            if (!prompt && !scene) { alert("Выберите сцену или введите prompt"); return; }
+            // Чипы без LoRA задизейблены, но подстрахуемся (лучше alert, чем 4xx).
+            const byId = new Map((state.models || []).map((m) => [m.id, m]));
+            const noLora = ids.filter((id) => {
+              const m = byId.get(id);
+              return !m || !(m.stats && m.stats.lora_file);
+            });
+            if (noLora.length) { alert("Нет LoRA у моделей: " + noLora.join(", ")); return; }
+            body = {
+              models: ids,
+              layout: state.grpLayout || "row",
+              mode: state.grpMode || "public",
+              caption,
+              seed: +$("grpSeed").value,
+              lora_strength: +$("grpStrength").value,
+            };
+            const name = $("grpName").value.trim();
+            if (name) body.name = name;
+            if (prompt) body.prompt = prompt;        // prompt приоритетнее сцены
+            else if (scene) body.scene_id = scene;   // иначе берём сцену
+          }
           if (job === "train") {
             // Обучение — выделенный эндпоинт (регистрирует LoRA в реестре до запуска).
             await api("POST", "/api/train/start");
+          } else if (job === "group") {
+            await api("POST", "/api/jobs/group", body);
           } else {
             await api("POST", "/api/jobs/" + job, body);
           }

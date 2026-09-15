@@ -587,6 +587,16 @@ async def activate_model(model_id: str) -> dict[str, Any]:
     return {"ok": True, "active_id": model_id}
 
 
+def _model_has_active_job(model_id: str) -> bool:
+    """True while a queued/running job references this model — solo jobs via
+    model_id, group jobs via any member of their `models` list."""
+    return any(
+        j.get("status") in ("queued", "running")
+        and (j.get("model_id") == model_id or model_id in (j.get("models") or []))
+        for j in jobs.values()
+    )
+
+
 @app.delete("/api/models/{model_id}")
 async def delete_model(model_id: str, confirm: str = "") -> dict[str, Any]:
     _validate_model_id(model_id)
@@ -601,8 +611,8 @@ async def delete_model(model_id: str, confirm: str = "") -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="model not found")
     if target.get("active"):
         raise HTTPException(status_code=400, detail="activate another model first")
-    if any(j.get("model_id") == model_id and j.get("status") == "running" for j in jobs.values()):
-        raise HTTPException(status_code=409, detail="model has a running job")
+    if _model_has_active_job(model_id):
+        raise HTTPException(status_code=409, detail="model has an active job")
 
     model_dir = _model_dir(model_id)
     if model_dir.exists():
@@ -893,6 +903,59 @@ async def upload_model_dataset(
     return {"ok": True, "added": added, "manifest": {"version": manifest["version"], "images": manifest["images"]}}
 
 
+@app.delete("/api/models/{model_id}/dataset")
+async def wipe_model_dataset(model_id: str, confirm: str = "") -> dict[str, Any]:
+    """Bulk soft-delete (feature 006): move the whole dataset images/ dir into
+    runtime/trash/dataset/<model_id>-wipe-<ts>/ (atomic os.replace, manifest
+    copied along) and reset to an empty manifest. Registered before the
+    single-image delete route so both paths stay unambiguous."""
+    async with _manifest_lock:
+        _model_or_404(model_id)
+        if confirm != model_id:
+            raise HTTPException(status_code=400, detail="confirm must equal the model id")
+        if _model_has_active_job(model_id):
+            raise HTTPException(status_code=409, detail="model has an active job")
+
+        image_dir = _dataset_image_dir(model_id)
+        files = [p for p in image_dir.iterdir() if p.is_file()] if image_dir.is_dir() else []
+        image_files = [p for p in files if p.suffix.lower() in IMAGE_SUFFIXES]
+        image_stems = {p.stem for p in image_files}
+        captions = sum(1 for p in files if p.suffix.lower() == ".txt" and p.stem in image_stems)
+        counts = {
+            "images": len(image_files),
+            "captions": captions,
+            "other": len(files) - len(image_files) - captions,
+        }
+
+        trash_path: str | None = None
+        if files:  # empty (or missing) images/ → safe no-op, no trash folder
+            DATASET_TRASH.mkdir(parents=True, exist_ok=True)
+            base_name = f"{model_id}-wipe-{int(time.time())}"
+            trash_dir = DATASET_TRASH / base_name
+            attempt = 2
+            while trash_dir.exists():  # collision → "-2", "-3", ...
+                trash_dir = DATASET_TRASH / f"{base_name}-{attempt}"
+                attempt += 1
+            try:
+                os.replace(image_dir, trash_dir)  # atomic same-filesystem move
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail=f"could not move dataset to trash: {exc}")
+            manifest_path = _dataset_manifest_path(model_id)
+            if manifest_path.exists():
+                shutil.copy2(manifest_path, trash_dir / "manifest.json")
+            trash_path = str(trash_dir)
+
+        image_dir.mkdir(parents=True, exist_ok=True)
+        _save_manifest(model_id, {"version": 1, "images": []})
+    return {
+        "ok": True,
+        "model_id": model_id,
+        "trash_path": trash_path,
+        "deleted": counts,
+        "manifest": {"version": 1, "images": []},
+    }
+
+
 @app.delete("/api/models/{model_id}/dataset/{filename}")
 async def delete_model_dataset_image(model_id: str, filename: str) -> dict[str, Any]:
     """Soft-delete one dataset image and its <filename>.txt pair into
@@ -1137,6 +1200,99 @@ async def job_post(payload: dict[str, Any]) -> dict[str, Any]:
     if name:
         cmd += ["--name", name]
     return await _launch("post", cmd, model_id=model_id)
+
+
+def _validate_group_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate the group-job payload (feature 007). Pure — no job is launched,
+    so unit tests can call it directly. Returns ids/entries/prompt_text/
+    layout/mode/caption/name/seed/strength/negative. The guardrail phrase is
+    NOT injected here: scripts/queue_workflow.py injects it per member (ages
+    may differ), so only blocked terms are checked."""
+    models_raw = payload.get("models")
+    if not isinstance(models_raw, list) or not 1 <= len(models_raw) <= 5:
+        raise HTTPException(status_code=422, detail="models must be a list of 1..5 unique model ids")
+    ids = [str(item).strip() for item in models_raw]
+    if len(set(ids)) != len(ids):
+        raise HTTPException(status_code=422, detail="models must be a list of 1..5 unique model ids")
+
+    entries: list[dict[str, Any]] = []
+    for member_id in ids:
+        entry = _model_or_404(member_id)
+        entries.append(entry)
+        # Registry lora wins; fall back to the canonical <id>.safetensors name
+        # (same rule as job_post / generate_group).
+        lora = str(entry.get("lora") or f"{member_id}.safetensors")
+        if not (LORAS_DIR / lora).is_file():
+            raise HTTPException(
+                status_code=400,
+                detail=f"LoRA для модели {member_id} не обучена или не скопирована в runtime/models/loras/ (ожидался {lora})",
+            )
+
+    caption = str(payload.get("caption", "")).strip()
+    if not caption:
+        raise HTTPException(status_code=400, detail="caption required")
+
+    # Exactly one of prompt / scene_id (XOR).
+    raw = str(payload.get("prompt", "")).strip()
+    scene_id = str(payload.get("scene_id", "")).strip()
+    if bool(raw) == bool(scene_id):
+        raise HTTPException(status_code=400, detail="prompt or scene_id required")
+    if raw:
+        prompt_text = raw
+    else:
+        prompt_text = _resolve_scene_text(ids[0], scene_id)
+    _assert_clean_prompt(prompt_text)
+
+    layout = str(payload.get("layout") or "row").strip()
+    if layout not in ("row", "grid2", "grid3"):
+        raise HTTPException(status_code=422, detail="layout must be row, grid2 or grid3")
+    mode = str(payload.get("mode") or "public").strip()
+    if mode not in ("public", "private"):
+        raise HTTPException(status_code=422, detail="mode must be public or private")
+
+    name = None
+    if payload.get("name"):
+        name = _safe_name(str(payload["name"]))
+        subdir = "posts" if mode == "public" else "posts-private"
+        if (_model_dir(ids[0]) / subdir / name).exists():
+            raise HTTPException(status_code=409, detail="post name already exists")
+
+    return {
+        "ids": ids,
+        "entries": entries,
+        "prompt_text": prompt_text,
+        "layout": layout,
+        "mode": mode,
+        "caption": caption,
+        "name": name,
+        "seed": int(payload.get("seed", 27191)),
+        "strength": float(payload.get("lora_strength", 0.8)),
+        "negative": str(payload.get("negative", "")),
+    }
+
+
+@app.post("/api/jobs/group")
+async def job_group(payload: dict[str, Any]) -> dict[str, Any]:
+    plan = _validate_group_payload(payload)
+    ids = plan["ids"]
+    cmd = [
+        "python", "scripts/queue_workflow.py", "group",
+        "--models", ",".join(ids),
+        "--prompt", plan["prompt_text"],
+        "--layout", plan["layout"],
+        "--mode", plan["mode"],
+        "--caption", plan["caption"],
+        "--seed", str(plan["seed"]),
+        "--lora-strength", str(plan["strength"]),
+    ]
+    if plan["name"]:
+        cmd += ["--name", plan["name"]]
+    if plan["negative"]:
+        cmd += ["--negative", plan["negative"]]
+    result = await _launch("group", cmd, model_id=ids[0])
+    # Group members on the job record so _model_has_active_job sees every one.
+    jobs[result["job_id"]]["models"] = ids
+    return {**result, "models": ids, "primary": ids[0], "layout": plan["layout"]}
 
 
 @app.post("/api/train/start")
