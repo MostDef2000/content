@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "id": "valery23",
+      "name": "Valery",
+      "age": 23,
+      "height_cm": 178,
+      "tags": ["fitness", "editorial"],
+      "active": true,
+      "created": "2026-09-15T00:00:00Z",
+      "lora": "valery23.safetensors",
+      "groups": []
+    }
+  ]
+}

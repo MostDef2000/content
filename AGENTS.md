@@ -31,6 +31,19 @@ nginx-фронт + домен `3d.mostdef.ru`; Caddy установлен, но 
 2. Одна задача = один canonical Issue; значимые изменения ссылаются на один feature spec.
 3. Тяжёлые GPU-задачи — строго по одной (busy-лок в `manager`); 12 ГБ VRAM общие с YOLO-воркером.
 4. Никогда не коммитить: `.env`, секреты, токены, `runtime/`, `dataset/`, `posts/`,
-   `reference/`, `ai-toolkit/`, `lora/output/`, веса моделей, логи, сгенерированный вывод.
+   `reference/`, `ai-toolkit/`, `lora/output/`, веса моделей, логи, сгенерированный вывод —
+   и те же данные в per-model путях: `models/*/reference/`, `models/*/dataset/`,
+   `models/*/lora/output/`, `models/*/posts/`, `models/*/posts-private/`.
 5. Персонаж — взрослый вымышленный; без реальных людей и несовершеннолетних.
 6. Секреты только в `.env` на сервере (`chmod 600`); в чат и Git не попадают.
+
+## Данные и папки (фаза 1)
+
+- Реестр моделей: `models/registry.json`; данные модели — `models/<id>/`
+  (tracked: `character.json`, `prompt_profile.json`; gitignored генерат:
+  `reference/candidates/`, `dataset/images/`, `lora/output/`, `posts/`,
+  `posts-private/`). Библиотека сцен: `models/library.json`.
+- LoRA-копия для генерации — `runtime/models/loras/<id>.safetensors`.
+- Удаление модели — перенос её папки в `runtime/trash/` (мягкое удаление).
+- Разовая миграция старого single-model layout —
+  `scripts/migrate_to_registry.py` (идемпотентна, бэкап в `runtime/backup/`).

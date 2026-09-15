@@ -49,7 +49,7 @@ docker compose up -d                 # поднимает comfyui + manager
 1. **Кандидаты** — сгенерировать 8 эталонных лиц (`reference/candidates/`).
 2. Выбрать один файл в выпадающем списке **Датасет** → **Расширить датасет** (Kontext-вариации).
 3. Дописать подписи: `python lora/caption.py` (затем вручную отредактировать `dataset/images/*.txt`).
-4. **Обучить LoRA** (ai-toolkit, 12 ГБ, долго) → скопировать `lora/output/.../*.safetensors` в `runtime/models/loras/valery23.safetensors`.
+4. **Обучить LoRA** (ai-toolkit, 12 ГБ, долго) → скопировать `models/<id>/lora/output/.../*.safetensors` в `runtime/models/loras/<id>.safetensors` (для `valery23` — `valery23.safetensors`).
 5. **Сгенерировать пост** → папка `posts/<name>/photo.jpg + caption.txt`.
 
 ### Или из консоли (без UI)
@@ -64,14 +64,27 @@ python scripts/queue_workflow.py post --prompt "..." --caption "..." --name 2026
 
 ## Папки
 
+Per-model layout (фаза 1 редизайна — specs/002, specs/003):
+
 - `management/` — управляющее приложение (FastAPI + HTML)
 - `comfy/` — workflow JSON (bootstrap, kontext_variation, flux_lora)
-- `reference/candidates/` — кандидаты лица
-- `dataset/images/` — обучающий датасет (jpg + txt)
-- `lora/output/` — чекпоинты LoRA
-- `runtime/models/`, `runtime/input`, `runtime/output` — монтируются в ComfyUI
-- `posts/` — готовые папки для ручной выкладки
+- `models/registry.json` — реестр моделей (id, имя, возраст, теги, активная модель, lora-файл)
+- `models/library.json` — библиотека сцен промтов (expand / candidates / post)
+- `models/<id>/` — данные конкретной модели:
+  - `character.json`, `prompt_profile.json` — tracked-конфигурация
+  - `reference/candidates/` — кандидаты лица
+  - `dataset/images/` — обучающий датасет (jpg + txt)
+  - `lora/output/` — чекпоинты LoRA
+  - `posts/`, `posts-private/` — готовые папки для ручной выкладки
+- `runtime/models/loras/<id>.safetensors` — LoRA-копия модели для ComfyUI
+- `runtime/input`, `runtime/output` — монтируются в ComfyUI
+- `runtime/trash/` — удалённые модели (мягкое удаление, восстановимо)
+- `runtime/backup/` — бэкапы миграции
 - `deploy/Caddyfile` — референс конфига (живой фронт на РУ — nginx, см. AUDIT.md §10)
+
+Разовая миграция со старого single-model layout (корневые `reference/`,
+`dataset/`, `posts/`): `python scripts/migrate_to_registry.py` — идемпотентна,
+делает бэкап в `runtime/backup/`, повторный запуск безопасен.
 
 ## Безопасность
 

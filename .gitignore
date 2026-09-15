@@ -10,3 +10,8 @@ reference/candidates/
 reference/selected.*
 posts/
 management/__pycache__/
+models/*/reference/
+models/*/dataset/
+models/*/lora/output/
+models/*/posts/
+models/*/posts-private/

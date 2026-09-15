@@ -1,0 +1,126 @@
+{
+  "version": 1,
+  "scenes": [
+    {
+      "id": "expand-head-turn",
+      "name": "Head turn, soft smile",
+      "mode": "expand",
+      "text": "same fictional adult woman, identical face, slight head turn, soft smile, fitted olive athletic top, neutral studio, photorealistic portrait",
+      "tags": [
+        "athletic",
+        "studio"
+      ]
+    },
+    {
+      "id": "expand-white-tee",
+      "name": "White tee, daylight",
+      "mode": "expand",
+      "text": "same woman, identical face, hair slightly pulled back, white fitted tee, bright daylight, casual confident pose",
+      "tags": [
+        "casual",
+        "daylight"
+      ]
+    },
+    {
+      "id": "expand-gym",
+      "name": "Gym athletic",
+      "mode": "expand",
+      "text": "same woman, identical face, gym setting, black sports bra and leggings, tasteful athletic framing, strong posture",
+      "tags": [
+        "gym",
+        "athletic"
+      ]
+    },
+    {
+      "id": "expand-rooftop",
+      "name": "Evening rooftop",
+      "mode": "expand",
+      "text": "same woman, identical face, evening rooftop, fitted dark fashion top, city lights bokeh, confident gaze",
+      "tags": [
+        "evening",
+        "urban"
+      ]
+    },
+    {
+      "id": "expand-beauty",
+      "name": "Beauty close-up",
+      "mode": "expand",
+      "text": "same woman, identical face, close-up beauty shot, dewy skin, minimal makeup, shallow depth of field",
+      "tags": [
+        "beauty",
+        "close-up"
+      ]
+    },
+    {
+      "id": "expand-street",
+      "name": "Urban street style",
+      "mode": "expand",
+      "text": "same woman, identical face, leaning against wall, beige crop top, relaxed fit, urban street style",
+      "tags": [
+        "street",
+        "urban"
+      ]
+    },
+    {
+      "id": "expand-mirror",
+      "name": "Fitness studio mirror",
+      "mode": "expand",
+      "text": "same woman, identical face, fitness studio mirror, athletic wear, dynamic stance, professional lighting",
+      "tags": [
+        "fitness",
+        "studio"
+      ]
+    },
+    {
+      "id": "expand-cafe",
+      "name": "Outdoor cafe lifestyle",
+      "mode": "expand",
+      "text": "same woman, identical face, outdoor cafe, light summer dress, natural smile, lifestyle editorial",
+      "tags": [
+        "lifestyle",
+        "editorial"
+      ]
+    },
+    {
+      "id": "candidates-studio",
+      "name": "Casting studio portrait",
+      "mode": "candidates",
+      "text": "chest-up casting portrait, neutral warm-gray studio, soft frontal beauty lighting, 85mm lens, eye-level camera, centered symmetrical composition",
+      "tags": [
+        "casting",
+        "studio"
+      ]
+    },
+    {
+      "id": "candidates-beauty",
+      "name": "Casting beauty gaze",
+      "mode": "candidates",
+      "text": "minimal luminous makeup, direct calm gaze, soft frontal lighting, shallow depth of field, premium editorial realism",
+      "tags": [
+        "casting",
+        "beauty"
+      ]
+    },
+    {
+      "id": "post-instagram-fashion",
+      "name": "Instagram fashion editorial",
+      "mode": "post",
+      "text": "Instagram fashion photograph, premium editorial lighting, confident contemporary fitness fashion, tasteful and non-explicit",
+      "tags": [
+        "post",
+        "fashion"
+      ]
+    },
+    {
+      "id": "post-gym-athletic",
+      "name": "Gym editorial",
+      "mode": "post",
+      "text": "gym setting, black sports bra and leggings, tasteful athletic framing, strong posture, premium editorial lighting",
+      "tags": [
+        "post",
+        "gym",
+        "athletic"
+      ]
+    }
+  ]
+}

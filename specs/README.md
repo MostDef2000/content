@@ -33,3 +33,9 @@ Issue + видимая область работ
 ## Active features
 
 - `001-sdd-adoption` — подключение SDD-процесса оркестратора к проекту.
+- `002-multi-model-registry` — реестр моделей (`models/registry.json`),
+  per-model папки `models/<id>/`, мягкое удаление в `runtime/trash/`,
+  идемпотентная миграция `scripts/migrate_to_registry.py`.
+- `003-prompt-profile-and-library` — `prompts.py` (сборка positive/negative с
+  guardrail), per-model `prompt_profile.json`, библиотека сцен
+  `models/library.json`.

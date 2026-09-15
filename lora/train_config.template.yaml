@@ -1,12 +1,14 @@
 ---
+# Rendered by scripts/train_lora.sh: {{MODEL_ID}} -> <model id>, written to
+# runtime/train/<model id>.yaml before launching ai-toolkit.
 job: extension
 config:
-  name: valery23_flux_v1
+  name: "{{MODEL_ID}}_flux_v1"
   process:
     - type: sd_trainer
-      training_folder: ../lora/output
+      training_folder: ../models/{{MODEL_ID}}/lora/output
       device: cuda:0
-      trigger_word: valery23
+      trigger_word: "{{MODEL_ID}}"
       network:
         type: lora
         linear: 16
@@ -17,7 +19,7 @@ config:
         max_step_saves_to_keep: 4
         push_to_hub: false
       datasets:
-        - folder_path: ../dataset/images
+        - folder_path: ../models/{{MODEL_ID}}/dataset/images
           caption_ext: txt
           caption_dropout_rate: 0.0
           shuffle_tokens: false

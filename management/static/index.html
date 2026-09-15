@@ -8,8 +8,12 @@
     :root { --bg:#0f1115; --card:#1a1d24; --accent:#7c5cff; --ok:#3ecf8e; --warn:#ffb454; --err:#ff6b6b; --text:#e6e8ee; --muted:#9aa0ad; }
     * { box-sizing: border-box; }
     body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); }
-    header { padding:16px 20px; border-bottom:1px solid #262a33; display:flex; align-items:center; gap:12px; }
+    header { padding:16px 20px; border-bottom:1px solid #262a33; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
     header h1 { font-size:18px; margin:0; }
+    header select { width:auto; min-width:180px; }
+    .tabs { max-width:960px; margin:0 auto; padding:14px 20px 0; display:flex; gap:8px; flex-wrap:wrap; }
+    .tab { background:#2a2f3a; border-radius:8px 8px 0 0; padding:8px 14px; }
+    .tab.active { background:var(--accent); }
     .wrap { max-width:960px; margin:0 auto; padding:20px; display:grid; gap:16px; }
     .card { background:var(--card); border:1px solid #262a33; border-radius:12px; padding:16px; }
     .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
@@ -24,7 +28,7 @@
     .badge.busy { background:rgba(255,180,84,.15); color:var(--warn); }
     pre { background:#0b0d11; border:1px solid #23272f; border-radius:8px; padding:10px; max-height:240px; overflow:auto; font-size:12px; white-space:pre-wrap; }
     .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
-    @media (max-width:720px){ .grid2{ grid-template-columns:1fr; } }
+    @media (max-width:720px){ .grid2{ grid-template-columns:1fr; } .scene-row{ grid-template-columns:1fr !important; } }
     h2 { font-size:15px; margin:0 0 4px; }
     .muted { color:var(--muted); font-size:12px; }
     .thumbs { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
@@ -32,6 +36,13 @@
     .thumbs img.selected { border-color:var(--accent); }
     .thumbs .empty { color:var(--muted); font-size:12px; }
     .postcard img { width:140px; height:140px; object-fit:cover; border-radius:8px; display:block; margin-bottom:6px; cursor:zoom-in; }
+    .model-card { border:1px solid #2c313c; border-radius:10px; padding:12px; display:grid; gap:6px; }
+    .model-card.active-card { border-color:var(--ok); }
+    .stat { font-size:12px; color:var(--muted); }
+    .scene-row { display:grid; grid-template-columns:170px 1fr 40px; gap:8px; margin-bottom:8px; align-items:start; }
+    .lib-item { border:1px solid #2c313c; border-radius:10px; padding:10px; margin-bottom:8px; }
+    .dirty-tag { color:var(--warn); font-size:12px; display:none; margin-left:8px; }
+    .dirty .dirty-tag { display:inline; }
     .lightbox { position:fixed; inset:0; background:rgba(5,6,10,.9); display:flex; align-items:center; justify-content:center; z-index:100; cursor:zoom-out; }
     .lightbox img { max-width:92vw; max-height:92vh; border-radius:10px; box-shadow:0 10px 40px rgba(0,0,0,.6); }
     .lightbox[hidden] { display:none; }
@@ -40,6 +51,8 @@
 <body>
   <header>
     <h1>Valery Model Manager</h1>
+    <select id="modelSelect" title="Активная модель"></select>
+    <span id="activeModel" class="badge busy">модель: ?</span>
     <span id="comfy" class="badge down">comfy: ?</span>
     <span id="gpu" class="badge busy">gpu: ?</span>
     <span id="cpu" class="badge up">cpu: ?</span>
@@ -48,93 +61,223 @@
     <button id="logout" class="ghost" style="margin-left:auto">Выйти</button>
   </header>
 
+  <nav class="tabs">
+    <button class="tab active" data-tab="pipeline">Пайплайн</button>
+    <button class="tab" data-tab="models">Модели</button>
+    <button class="tab" data-tab="profile">Промт-профиль</button>
+    <button class="tab" data-tab="library">Библиотека сцен</button>
+  </nav>
+
   <div class="wrap">
-    <div class="card">
-      <div class="row">
-        <button id="start">Старт ComfyUI</button>
-        <button id="stop" class="ghost">Стоп ComfyUI</button>
-        <button id="restart" class="ghost">Рестарт</button>
-        <button id="refresh" class="ghost">Обновить</button>
-      </div>
-    </div>
-
-    <div class="grid2">
+    <!-- ======================= ПАЙПЛАЙН ======================= -->
+    <section data-tab="pipeline" style="display:grid; gap:16px">
       <div class="card">
-        <h2>1. Кандидаты лица</h2>
-        <p class="muted">Генерирует эталонные портреты (последовательно).</p>
-        <label>Количество</label>
-        <input id="candCount" type="number" value="8" min="1" max="20" />
-        <label>Seed</label>
-        <input id="candSeed" type="number" value="17023" />
-        <label>Промт персонажа (общий для всех кандидатов)</label>
-        <textarea id="candPrompt" rows="5"></textarea>
-        <p class="muted">Меняешь промт — получаешь новый «кастинг» лиц. Правка сохраняется на сервере; очистишь — вернётся исходный.</p>
-        <div class="row" style="margin-top:10px">
-          <button data-job="candidates">Сгенерировать</button>
+        <div class="row">
+          <button id="start">Старт ComfyUI</button>
+          <button id="stop" class="ghost">Стоп ComfyUI</button>
+          <button id="restart" class="ghost">Рестарт</button>
+          <button id="refresh" class="ghost">Обновить</button>
         </div>
       </div>
 
-      <div class="card">
-        <h2>2. Датасет из эталона</h2>
-        <p class="muted">Один выбранный портрет → вариации через Kontext.</p>
-        <label>Эталон</label>
-        <select id="refSelect"></select>
-        <div id="refThumbs" class="thumbs"><span class="empty">— пока нет кандидатов</span></div>
-        <label>Количество</label>
-        <input id="expCount" type="number" value="8" min="1" max="20" />
-        <div id="dsThumbs" class="thumbs"><span class="empty">— датасет пуст</span></div>
-        <div class="row" style="margin-top:10px">
-          <button data-job="expand">Расширить датасет</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>3. Обучить LoRA</h2>
-      <p class="muted">Запускает ai-toolkit (12 ГБ, долго). Только когда GPU свободен.</p>
-      <div class="row">
-        <button data-job="train">Обучить LoRA</button>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>4. Сгенерировать пост</h2>
-      <label>Prompt</label>
-      <textarea id="postPrompt" rows="3" placeholder="valery23 в ... , photorealistic, natural skin, no text"></textarea>
-      <label>Caption (для Instagram)</label>
-      <textarea id="postCaption" rows="2" placeholder="Текст поста #fitness"></textarea>
       <div class="grid2">
-        <div>
-          <label>Имя папки (необязательно)</label>
-          <input id="postName" placeholder="2026-09-12-gym" />
-        </div>
-        <div>
+        <div class="card">
+          <h2>1. Кандидаты лица</h2>
+          <p class="muted">Генерирует эталонные портреты (последовательно). Промт собирается на бэкенде из промт-профиля активной модели.</p>
+          <label>Сцена (из пресетов/библиотеки, режим «candidates»)</label>
+          <select id="candScene"></select>
+          <label>Количество</label>
+          <input id="candCount" type="number" value="8" min="1" max="20" />
           <label>Seed</label>
-          <input id="postSeed" type="number" value="27191" />
+          <input id="candSeed" type="number" value="17023" />
+          <div class="row" style="margin-top:10px">
+            <button data-job="candidates">Сгенерировать</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>2. Датасет из эталона</h2>
+          <p class="muted">Один выбранный портрет → вариации через Kontext.</p>
+          <label>Эталон</label>
+          <select id="refSelect"></select>
+          <div id="refThumbs" class="thumbs"><span class="empty">— пока нет кандидатов</span></div>
+          <label>Сцена (опционально, режим «expand»)</label>
+          <select id="expScene"></select>
+          <label>Количество</label>
+          <input id="expCount" type="number" value="8" min="1" max="20" />
+          <div id="dsThumbs" class="thumbs"><span class="empty">— датасет пуст</span></div>
+          <div class="row" style="margin-top:10px">
+            <button data-job="expand">Расширить датасет</button>
+          </div>
         </div>
       </div>
-      <label>LoRA strength</label>
-      <input id="postStrength" type="number" step="0.05" value="0.8" min="0" max="1.5" />
-      <div class="row" style="margin-top:10px">
-        <button data-job="post">Сгенерировать пост</button>
+
+      <div class="card">
+        <h2>3. Обучить LoRA</h2>
+        <p class="muted">Запускает ai-toolkit (12 ГБ, долго). Только когда GPU свободен.</p>
+        <div class="row">
+          <button data-job="train">Обучить LoRA</button>
+        </div>
       </div>
-    </div>
 
-    <div class="card">
-      <h2>Задачи и лог</h2>
-      <pre id="log">—</pre>
-    </div>
+      <div class="card">
+        <h2>4. Сгенерировать пост</h2>
+        <label>Сцена (из пресетов/библиотеки, режим «post»)</label>
+        <select id="postScene"></select>
+        <label>Prompt (необязательно — иначе соберётся из профиля и сцены)</label>
+        <textarea id="postPrompt" rows="3" placeholder="оставьте пустым, чтобы использовать промт-профиль + сцену"></textarea>
+        <label>Caption (для Instagram)</label>
+        <textarea id="postCaption" rows="2" placeholder="Текст поста #fitness"></textarea>
+        <div class="grid2">
+          <div>
+            <label>Имя папки (необязательно)</label>
+            <input id="postName" placeholder="2026-09-12-gym" />
+          </div>
+          <div>
+            <label>Seed</label>
+            <input id="postSeed" type="number" value="27191" />
+          </div>
+        </div>
+        <label>LoRA strength</label>
+        <input id="postStrength" type="number" step="0.05" value="0.8" min="0" max="1.5" />
+        <div class="row" style="margin-top:10px">
+          <button data-job="post">Сгенерировать пост</button>
+        </div>
+      </div>
 
-    <div class="card">
-      <h2>Готовые посты</h2>
-      <div id="posts" class="muted">—</div>
-    </div>
+      <div class="card">
+        <h2>Задачи и лог</h2>
+        <pre id="log">—</pre>
+      </div>
+
+      <div class="card">
+        <h2>Готовые посты</h2>
+        <div id="posts" class="muted">—</div>
+      </div>
+    </section>
+
+    <!-- ======================= МОДЕЛИ ======================= -->
+    <section data-tab="models" hidden style="display:grid; gap:16px">
+      <div class="card">
+        <h2>Модели</h2>
+        <p class="muted">Реестр моделей. Активная модель используется генерацией, профилем и превью.</p>
+        <div id="modelsList" style="display:grid; gap:10px"><span class="muted">— загрузка…</span></div>
+      </div>
+
+      <div class="card">
+        <h2>Новая модель</h2>
+        <p class="muted">id: строчные латинские буквы/цифры/дефис, от 2 символов (например «valery23»). Возраст — целое число (пол проверить нельзя, минимум 23 на сервере).</p>
+        <div class="grid2">
+          <div>
+            <label>id</label>
+            <input id="newId" placeholder="valery23" />
+          </div>
+          <div>
+            <label>Имя</label>
+            <input id="newName" placeholder="Valery" />
+          </div>
+        </div>
+        <div class="grid2">
+          <div>
+            <label>Возраст</label>
+            <input id="newAge" type="number" value="23" min="23" />
+          </div>
+          <div>
+            <label>Теги (через запятую)</label>
+            <input id="newTags" placeholder="fitness, editorial" />
+          </div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button id="modelCreate">Создать модель</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======================= ПРОМТ-ПРОФИЛЬ ======================= -->
+    <section data-tab="profile" hidden style="display:grid; gap:16px">
+      <div class="card" id="cardProfile">
+        <h2>Промт-профиль<span id="profDirty" class="dirty-tag">• есть несохранённые изменения</span></h2>
+        <p class="muted" id="profCharacter">—</p>
+        <label>Face</label>
+        <textarea id="profFace" rows="3"></textarea>
+        <label>Body</label>
+        <textarea id="profBody" rows="3"></textarea>
+        <label>Style</label>
+        <textarea id="profStyle" rows="3"></textarea>
+        <label>Negative</label>
+        <textarea id="profNegative" rows="2"></textarea>
+
+        <h2 style="margin-top:14px">Сцены профиля (id → текст)</h2>
+        <div id="profScenes"></div>
+        <div class="row" style="margin-top:8px">
+          <button id="profSceneAdd" class="ghost">+ Добавить сцену</button>
+          <button id="profileSave">Сохранить профиль</button>
+        </div>
+
+        <h2 style="margin-top:14px">Guardrail (только чтение)</h2>
+        <p class="muted">Фраза-предохранитель (добавляется на бэкенде автоматически):</p>
+        <pre id="guardPhrase">—</pre>
+        <p class="muted">Канонический negative:</p>
+        <pre id="guardNeg">—</pre>
+      </div>
+    </section>
+
+    <!-- ======================= БИБЛИОТЕКА СЦЕН ======================= -->
+    <section data-tab="library" hidden style="display:grid; gap:16px">
+      <div class="card">
+        <h2>Библиотека сцен</h2>
+        <p class="muted">Общая для всех моделей. «Загрузить в модель» копирует текст сцены в промт-профиль активной модели (не забудьте «Сохранить профиль»).</p>
+        <div id="libList"><span class="muted">— загрузка…</span></div>
+      </div>
+
+      <div class="card">
+        <h2>Новая сцена</h2>
+        <div class="grid2">
+          <div>
+            <label>id</label>
+            <input id="libNewId" placeholder="post-cafe" />
+          </div>
+          <div>
+            <label>Название</label>
+            <input id="libNewName" placeholder="Cafe editorial" />
+          </div>
+        </div>
+        <label>Режим</label>
+        <select id="libNewMode">
+          <option value="candidates">candidates</option>
+          <option value="expand">expand</option>
+          <option value="post" selected>post</option>
+        </select>
+        <label>Текст сцены</label>
+        <textarea id="libNewText" rows="3" placeholder="cafe interior, window light, candid editorial framing"></textarea>
+        <div class="row" style="margin-top:10px">
+          <button id="libAdd">Добавить в библиотеку</button>
+        </div>
+      </div>
+    </section>
   </div>
 
   <div id="lightbox" class="lightbox" hidden><img id="lightboxImg" alt="preview"></div>
 
   <script>
     const $ = (id) => document.getElementById(id);
+
+    const state = {
+      activeId: null,        // активная модель (id) — источник для /files/<id>/...
+      profileFor: null,      // для какой модели загружен профиль
+      refName: "",           // выбранный эталон (переживает refresh)
+      presets: [],           // пресеты сцен из /api/prompt-profile
+      library: [],           // сцены из /api/library
+      profileScenes: {},     // рабочая копия сцен профиля (id → text)
+    };
+
+    const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+      (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+    const truncate = (s, n) => { s = String(s ?? ""); return s.length > n ? s.slice(0, n) + "…" : s; };
+
+    // Превью-URL всегда через активную модель: /files/<model_id>/<kind>/<filename>
+    const fileUrl = (kind, ...rest) =>
+      `/files/${encodeURIComponent(state.activeId)}/${kind}/${rest.map(encodeURIComponent).join("/")}`;
 
     function renderThumbs(el, items, onPick) {
       if (!items.length) { el.innerHTML = '<span class="empty">— пусто</span>'; return; }
@@ -180,7 +323,98 @@
       return res.json();
     };
 
-    async function refresh() {
+    // ------------------------- вкладки -------------------------
+    document.querySelectorAll(".tab").forEach((t) => {
+      t.onclick = () => {
+        document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x === t));
+        document.querySelectorAll("section[data-tab]").forEach((s) => { s.hidden = s.dataset.tab !== t.dataset.tab; });
+      };
+    });
+
+    // ------------------------- модели -------------------------
+    async function loadModels() {
+      let data;
+      try { data = await api("GET", "/api/models"); }
+      catch (e) { $("modelsList").innerHTML = `<span class="muted">Ошибка загрузки: ${esc(e.message)}</span>`; return; }
+      const models = data.models || [];
+      if (!state.activeId && data.active_id) state.activeId = data.active_id;
+      $("modelSelect").innerHTML = models
+        .map((m) => `<option value="${esc(m.id)}">${esc(m.name)} · ${esc(m.id)}${m.active ? " ★" : ""}</option>`).join("");
+      if (state.activeId) $("modelSelect").value = state.activeId;
+      renderModelsList(models);
+    }
+
+    function renderModelsList(models) {
+      const list = $("modelsList");
+      if (!models.length) {
+        list.innerHTML = '<span class="muted">— моделей нет; создайте первую ниже</span>';
+        return;
+      }
+      list.innerHTML = models.map((m) => {
+        const st = m.stats || {};
+        return `<div class="model-card ${m.active ? "active-card" : ""}">
+          <div class="row" style="justify-content:space-between">
+            <div><b>${esc(m.name)}</b> <span class="muted">· ${esc(m.id)} · ${esc(m.age)} лет</span></div>
+            ${m.active ? '<span class="badge up">активна</span>' : ""}
+          </div>
+          <div class="stat">кандидаты: ${st.candidates ?? 0} · датасет: ${st.dataset ?? 0} · посты: ${st.posts ?? 0} · lora_file: ${st.lora_file ? "да" : "нет"}${m.lora ? " (" + esc(m.lora) + ")" : ""}</div>
+          ${(m.tags && m.tags.length) ? `<div class="stat">теги: ${m.tags.map(esc).join(", ")}</div>` : ""}
+          <div class="row" style="margin-top:6px">
+            <button data-activate="${esc(m.id)}" ${m.active ? "disabled" : ""}>Сделать активной</button>
+            <button class="ghost" data-del="${esc(m.id)}">Удалить</button>
+          </div>
+        </div>`;
+      }).join("");
+      list.querySelectorAll("[data-activate]").forEach((b) => { b.onclick = () => activateModel(b.dataset.activate); });
+      list.querySelectorAll("[data-del]").forEach((b) => { b.onclick = () => deleteModel(b.dataset.del); });
+    }
+
+    async function activateModel(id) {
+      try {
+        await api("POST", `/api/models/${encodeURIComponent(id)}/activate`);
+      } catch (e) {
+        alert("Ошибка активации: " + e.message);
+        await loadModels();
+        return;
+      }
+      state.activeId = id;
+      await loadModels();
+      await loadProfile();
+      refresh();
+    }
+
+    async function deleteModel(id) {
+      const ans = prompt(`Удалить модель «${id}» вместе с её данными (переносится в runtime/trash)?\nДля подтверждения введите её id:`);
+      if (ans === null) return;
+      if (ans.trim() !== id) { alert("id не совпал — удаление отменено."); return; }
+      try {
+        await api("DELETE", `/api/models/${encodeURIComponent(id)}?confirm=${encodeURIComponent(id)}`);
+        await loadModels();
+        refresh();
+      } catch (e) { alert("Ошибка удаления: " + e.message); }
+    }
+
+    $("modelCreate").onclick = async () => {
+      const id = $("newId").value.trim();
+      const name = $("newName").value.trim();
+      const age = $("newAge").value.trim();
+      const tags = $("newTags").value.split(",").map((t) => t.trim()).filter(Boolean);
+      if (!id || !name || !age) { alert("Заполните id, имя и возраст."); return; }
+      try {
+        await api("POST", "/api/models", { id, name, age: +age, tags });
+        $("newId").value = ""; $("newName").value = ""; $("newAge").value = ""; $("newTags").value = "";
+        await loadModels();
+        refresh();
+      } catch (e) { alert("Ошибка создания: " + e.message); }
+    };
+
+    $("modelSelect").onchange = () => {
+      const id = $("modelSelect").value;
+      if (id && id !== state.activeId) activateModel(id);
+    };
+
+    // ------------------------- статус -------------------------
+    async function loadStatus() {
       try {
         const s = await api("GET", "/api/status");
         $("comfy").textContent = "comfy: " + (s.comfy_up ? "up" : "down");
@@ -193,22 +427,239 @@
         $("ram").className = "badge " + (s.ram_percent > 85 ? "down" : s.ram_percent > 60 ? "busy" : "up");
         $("disk").textContent = "свободно " + s.disk_free_gb + " ГБ";
         document.querySelectorAll("button[data-job]").forEach(b => b.disabled = s.gpu_busy);
+
+        const am = s.active_model;
+        if (am) {
+          $("activeModel").textContent = `${am.name} · lora: ${am.lora_file ? "да" : "нет"}`;
+          $("activeModel").className = "badge " + (am.lora_file ? "up" : "busy");
+          if (!state.activeId) state.activeId = am.id;
+          if (am.id !== state.activeId) {
+            // активную сменили вне этой вкладки — синхронизируемся
+            state.activeId = am.id;
+            await loadModels();
+            await loadProfile();
+          } else if (state.profileFor !== state.activeId) {
+            await loadProfile();
+          }
+        } else {
+          $("activeModel").textContent = "нет активной модели";
+          $("activeModel").className = "badge down";
+        }
       } catch (e) { /* ignore */ }
+    }
+
+    // ------------------------- промт-профиль -------------------------
+    function setProfileDirty(v) {
+      $("cardProfile").classList.toggle("dirty", v);
+    }
+
+    function collectProfileScenes() {
+      const rows = {};
+      document.querySelectorAll("#profScenes .scene-row").forEach((r) => {
+        const id = r.querySelector(".scene-id").value.trim();
+        if (id) rows[id] = r.querySelector(".scene-text").value;
+      });
+      state.profileScenes = rows;
+      return rows;
+    }
+
+    function renderProfileScenes() {
+      const box = $("profScenes");
+      box.innerHTML = "";
+      const ids = Object.keys(state.profileScenes);
+      if (!ids.length) {
+        box.innerHTML = '<span class="muted">— сцен нет; добавьте вручную или из библиотеки</span>';
+        return;
+      }
+      for (const id of ids) {
+        const row = document.createElement("div");
+        row.className = "scene-row";
+        const idInput = document.createElement("input");
+        idInput.className = "scene-id"; idInput.value = id; idInput.placeholder = "scene-id";
+        const tInput = document.createElement("textarea");
+        tInput.className = "scene-text"; tInput.rows = 2; tInput.value = state.profileScenes[id];
+        const del = document.createElement("button");
+        del.className = "ghost"; del.textContent = "✕"; del.title = "Удалить сцену";
+        del.onclick = () => { delete state.profileScenes[id]; renderProfileScenes(); setProfileDirty(true); };
+        row.append(idInput, tInput, del);
+        box.appendChild(row);
+      }
+    }
+
+    async function loadProfile() {
+      state.profileFor = state.activeId;
+      if (!state.activeId) {
+        $("profCharacter").textContent = "— нет активной модели";
+        ["profFace", "profBody", "profStyle", "profNegative"].forEach((id) => { $(id).value = ""; });
+        state.profileScenes = {};
+        renderProfileScenes();
+        $("guardPhrase").textContent = "—"; $("guardNeg").textContent = "—";
+        setProfileDirty(false);
+        renderSceneSelects();
+        return;
+      }
+      try {
+        const p = await api("GET", "/api/prompt-profile?model_id=" + encodeURIComponent(state.activeId));
+        state.presets = p.presets || [];
+        $("profCharacter").textContent = `Персонаж: ${p.character?.name ?? "?"} (${p.character?.age ?? "?"}) · модель ${p.model_id}`;
+        $("profFace").value = p.profile.face;
+        $("profBody").value = p.profile.body;
+        $("profStyle").value = p.profile.style;
+        $("profNegative").value = p.profile.negative;
+        state.profileScenes = { ...(p.profile.scenes || {}) };
+        renderProfileScenes();
+        $("guardPhrase").textContent = p.guardrail?.phrase ?? "—";
+        $("guardNeg").textContent = p.guardrail?.canonical_negative ?? "—";
+        setProfileDirty(false);
+        renderSceneSelects();
+      } catch (e) {
+        $("profCharacter").textContent = "Не удалось загрузить профиль: " + e.message;
+      }
+    }
+
+    $("profileSave").onclick = async () => {
+      if (!state.activeId) { alert("Нет активной модели."); return; }
+      const scenes = collectProfileScenes();
+      try {
+        await api("POST", "/api/prompt-profile", {
+          model_id: state.activeId,
+          face: $("profFace").value,
+          body: $("profBody").value,
+          style: $("profStyle").value,
+          negative: $("profNegative").value,
+          scenes,
+        });
+        setProfileDirty(false);
+      } catch (e) { alert("Ошибка сохранения профиля: " + e.message); }
+    };
+
+    $("profSceneAdd").onclick = () => {
+      collectProfileScenes();
+      let n = 1;
+      while (("scene-" + n) in state.profileScenes) n++;
+      state.profileScenes["scene-" + n] = "";
+      renderProfileScenes();
+      setProfileDirty(true);
+    };
+
+    ["profFace", "profBody", "profStyle", "profNegative"].forEach((id) => {
+      $(id).addEventListener("input", () => setProfileDirty(true));
+    });
+    $("profScenes").addEventListener("input", () => setProfileDirty(true));
+
+    // ------------------------- библиотека сцен -------------------------
+    async function loadLibrary() {
+      try {
+        const data = await api("GET", "/api/library");
+        state.library = data.scenes || [];
+        renderLibrary();
+        renderSceneSelects();
+      } catch (e) { /* ignore */ }
+    }
+
+    async function saveLibrary() {
+      try {
+        await api("POST", "/api/library", { scenes: state.library });
+        renderSceneSelects();
+      } catch (e) { alert("Ошибка сохранения библиотеки: " + e.message); }
+    }
+
+    function renderLibrary() {
+      const box = $("libList");
+      if (!state.library.length) { box.innerHTML = '<span class="muted">— библиотека пуста</span>'; return; }
+      box.innerHTML = state.library.map((s, i) => `
+        <div class="lib-item">
+          <div class="row" style="justify-content:space-between">
+            <div><b>${esc(s.name || s.id)}</b> <span class="muted">· ${esc(s.id)} · ${esc(s.mode)}${(s.tags && s.tags.length) ? " · " + s.tags.map(esc).join(", ") : ""}</span></div>
+            <div class="row">
+              <button data-copy="${i}">Загрузить в модель</button>
+              <button class="ghost" data-libdel="${i}">Удалить</button>
+            </div>
+          </div>
+          <div class="muted" style="margin-top:4px">${esc(truncate(s.text, 200))}</div>
+        </div>`).join("");
+      box.querySelectorAll("[data-copy]").forEach((b) => { b.onclick = () => sceneToProfile(state.library[+b.dataset.copy]); });
+      box.querySelectorAll("[data-libdel]").forEach((b) => {
+        b.onclick = async () => {
+          const s = state.library[+b.dataset.libdel];
+          if (!confirm(`Удалить сцену «${s.id}» из библиотеки?`)) return;
+          state.library.splice(+b.dataset.libdel, 1);
+          await saveLibrary();
+          renderLibrary();
+        };
+      });
+    }
+
+    function sceneToProfile(scene) {
+      if (!scene) return;
+      if (!state.activeId) { alert("Нет активной модели."); return; }
+      collectProfileScenes();
+      state.profileScenes = { ...state.profileScenes, [scene.id]: scene.text };
+      renderProfileScenes();
+      setProfileDirty(true);
+      document.querySelector('.tab[data-tab="profile"]').click();
+      $("profCharacter").textContent = `Сцена «${scene.id}» скопирована в профиль — нажмите «Сохранить профиль».`;
+    }
+
+    $("libAdd").onclick = async () => {
+      const id = $("libNewId").value.trim();
+      const name = $("libNewName").value.trim();
+      const mode = $("libNewMode").value;
+      const text = $("libNewText").value.trim();
+      if (!id || !text) { alert("Нужны id и текст сцены."); return; }
+      if (state.library.some((s) => s.id === id)) { alert("Сцена с таким id уже есть."); return; }
+      state.library.push({ id, name, mode, text, tags: [] });
+      $("libNewId").value = ""; $("libNewName").value = ""; $("libNewText").value = "";
+      await saveLibrary();
+      renderLibrary();
+    };
+
+    // ------------------------- селекторы сцен (пайплайн) -------------------------
+    function sceneOptions(mode) {
+      const seen = new Set();
+      const out = [];
+      for (const s of [...state.presets, ...state.library]) {
+        if (s.mode !== mode || seen.has(s.id)) continue;
+        seen.add(s.id);
+        out.push(s);
+      }
+      return out;
+    }
+
+    function fillSceneSelect(sel, mode) {
+      const prev = sel.value;
+      const opts = sceneOptions(mode);
+      sel.innerHTML = '<option value="">— без сцены —</option>' +
+        opts.map((s) => `<option value="${esc(s.id)}">${esc(s.name || s.id)} (${esc(s.id)})</option>`).join("");
+      if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+    }
+
+    function renderSceneSelects() {
+      fillSceneSelect($("candScene"), "candidates");
+      fillSceneSelect($("expScene"), "expand");
+      fillSceneSelect($("postScene"), "post");
+    }
+
+    // ------------------------- превью (активная модель) -------------------------
+    async function refresh() {
+      await loadStatus();
 
       try {
         const r = await api("GET", "/api/references");
         const sel = $("refSelect");
-        sel.innerHTML = r.references.map(n => `<option>${n}</option>`).join("");
+        sel.innerHTML = r.references.map(n => `<option>${esc(n)}</option>`).join("");
+        if (state.refName && r.references.includes(state.refName)) sel.value = state.refName;
+        state.refName = sel.value;
         renderThumbs(
           $("refThumbs"),
-          r.references.map(n => ({ name: n, url: "/files/reference/candidates/" + n, selected: n === sel.value })),
-          (it) => { sel.value = it.name; }
+          r.references.map(n => ({ name: n, url: fileUrl("reference", n), selected: n === sel.value })),
+          (it) => { sel.value = it.name; state.refName = it.name; }
         );
       } catch (e) {}
 
       try {
         const d = await api("GET", "/api/dataset");
-        renderThumbs($("dsThumbs"), d.images.map(n => ({ name: n, url: "/files/dataset/images/" + n })), null);
+        renderThumbs($("dsThumbs"), d.images.map(n => ({ name: n, url: fileUrl("dataset", n) })), null);
       } catch (e) {}
 
       try {
@@ -221,7 +672,7 @@
       try {
         const p = await api("GET", "/api/posts");
         $("posts").innerHTML = p.posts.length
-          ? p.posts.map(x => `<div class="postcard" style="margin:6px 0">${x.photo ? `<img src="/files/posts/${x.name}/${x.photo}" alt="${x.name}" loading="lazy" onclick="openLightbox(this.src)" onerror="this.remove()">` : ""}📁 <b>${x.name}</b>${x.caption ? "<br><span class='muted'>" + x.caption + "</span>" : ""}</div>`).join("")
+          ? p.posts.map(x => `<div class="postcard" style="margin:6px 0">${x.photo ? `<img src="${fileUrl("posts", x.name, x.photo)}" alt="${esc(x.name)}" loading="lazy" onclick="openLightbox(this.src)" onerror="this.remove()">` : ""}📁 <b>${esc(x.name)}</b>${x.caption ? "<br><span class='muted'>" + esc(x.caption) + "</span>" : ""}</div>`).join("")
           : "—";
       } catch (e) {}
     }
@@ -252,25 +703,48 @@
         const job = btn.dataset.job;
         try {
           let body = {};
-          if (job === "candidates") body = { count: +$("candCount").value, seed: +$("candSeed").value, prompt: $("candPrompt").value.trim() };
-          if (job === "expand") body = { reference: $("refSelect").value, count: +$("expCount").value };
-          if (job === "post") body = {
-            prompt: $("postPrompt").value, caption: $("postCaption").value,
-            name: $("postName").value || undefined, seed: +$("postSeed").value,
-            lora_strength: +$("postStrength").value,
-          };
-          await api("POST", "/api/jobs/" + job, body);
+          if (job === "candidates") {
+            body = { count: +$("candCount").value, seed: +$("candSeed").value };
+            if ($("candScene").value) body.scene_id = $("candScene").value;
+          }
+          if (job === "expand") {
+            if (!$("refSelect").value) { alert("Сначала сгенерируйте и выберите эталон."); return; }
+            body = { reference: $("refSelect").value, count: +$("expCount").value };
+            if ($("expScene").value) body.scene_id = $("expScene").value;
+          }
+          if (job === "post") {
+            const scene = $("postScene").value;
+            const prompt = $("postPrompt").value.trim();
+            if (!$("postCaption").value.trim()) { alert("Caption обязателен."); return; }
+            if (!scene && !prompt) { alert("Выберите сцену или введите prompt."); return; }
+            body = {
+              caption: $("postCaption").value.trim(),
+              name: $("postName").value || undefined,
+              seed: +$("postSeed").value,
+              lora_strength: +$("postStrength").value,
+            };
+            if (scene) body.scene_id = scene;
+            if (prompt) body.prompt = prompt;
+          }
+          if (job === "train") {
+            // Обучение — выделенный эндпоинт (регистрирует LoRA в реестре до запуска).
+            await api("POST", "/api/train/start");
+          } else {
+            await api("POST", "/api/jobs/" + job, body);
+          }
           refresh();
         } catch (e) { alert("Ошибка: " + e.message); }
       };
     });
 
-    refresh();
+    // ------------------------- старт -------------------------
+    (async function init() {
+      await loadModels();   // селектор + карточки моделей
+      await loadLibrary();  // глобальная библиотека сцен
+      await loadStatus();   // бейджи + активная модель (подтягивает профиль)
+      refresh();            // превью + лог
+    })();
     setInterval(refresh, 5000);
-
-    api("GET", "/api/character")
-      .then((c) => { $("candPrompt").value = c.prompt; })
-      .catch(() => {});
   </script>
 </body>
 </html>

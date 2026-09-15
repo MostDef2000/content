@@ -10,6 +10,7 @@ COPY management/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY management/main.py /workspace/management/main.py
+COPY prompts.py /workspace/prompts.py
 COPY management/static /workspace/management/static
 
 EXPOSE 8000
