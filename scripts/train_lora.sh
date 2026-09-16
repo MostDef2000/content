@@ -68,16 +68,21 @@ if [[ "${image_count}" -lt 15 ]] || [[ "${image_count}" -ne "${caption_count}" ]
   exit 2
 fi
 
-if [[ -f "${TEMPLATE}" ]]; then
-  mkdir -p "$(dirname "${RENDERED}")"
-  sed "s/{{MODEL_ID}}/${MODEL_ID}/g" "${TEMPLATE}" > "${RENDERED}"
-elif [[ -f "${ROOT}/lora/train_config.yaml" ]]; then
-  # Legacy single-model config (pre-registry layout) — use as-is.
-  RENDERED="${ROOT}/lora/train_config.yaml"
-  echo "Warning: ${TEMPLATE} missing, falling back to legacy ${RENDERED}" >&2
-else
+# Config template is mandatory — no legacy single-model fallback (which could
+# silently train the wrong dataset). Fail loudly before any render attempt.
+if [[ ! -f "${TEMPLATE}" ]]; then
   echo "Missing config template: ${TEMPLATE}" >&2
   exit 2
+fi
+
+mkdir -p "$(dirname "${RENDERED}")"
+sed "s/{{MODEL_ID}}/${MODEL_ID}/g" "${TEMPLATE}" > "${RENDERED}"
+
+# Test seam: SKIP_TRAIN=1 stops right after rendering without running training.
+# Never set in production.
+if [[ "${SKIP_TRAIN:-}" == "1" ]]; then
+  echo "SKIP_TRAIN=1: rendered ${RENDERED}; not running training."
+  exit 0
 fi
 
 cd "${TOOLKIT}"

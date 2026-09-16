@@ -625,6 +625,56 @@ def test_expand_empty_library_exits_before_network():
             queue_workflow.queue_and_wait = original_queue
 
 
+def test_stream_job_strips_skip_train_from_child_env():
+    # SKIP_TRAIN is the fail-fast test seam of scripts/train_lora.sh: if it
+    # ever reaches a job's child env (e.g. set on the server via compose/
+    # systemd), real training is silently skipped in prod (job "done", no
+    # LoRA). _stream_job must strip it from the env it passes along.
+    captured: dict = {}
+
+    class _FakeStdout:
+        def __aiter__(self):
+            async def _gen():
+                return
+                yield  # pragma: no cover  (never reached)
+
+            return _gen()
+
+    class _FakeProcess:
+        returncode = 0
+
+        def __init__(self) -> None:
+            self.stdout = _FakeStdout()
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    async def _fake_exec(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return _FakeProcess()
+
+    original_exec = asyncio.create_subprocess_exec
+    original_skip = os.environ.get("SKIP_TRAIN")
+    os.environ["SKIP_TRAIN"] = "1"  # hostile server env
+    job_id = "skiptrain-test"
+    main.jobs[job_id] = {"id": job_id, "kind": "train", "status": "queued"}
+    asyncio.create_subprocess_exec = _fake_exec
+    try:
+        _run(main._stream_job(job_id, ["bash", "scripts/train_lora.sh"]))
+    finally:
+        asyncio.create_subprocess_exec = original_exec
+        if original_skip is None:
+            os.environ.pop("SKIP_TRAIN", None)
+        else:
+            os.environ["SKIP_TRAIN"] = original_skip
+        main.jobs.pop(job_id, None)
+
+    env = captured["kwargs"].get("env")
+    assert env is not None, "env must be passed to create_subprocess_exec"
+    assert "SKIP_TRAIN" not in env, "SKIP_TRAIN must not reach the child process"
+    assert env.get("PYTHONUNBUFFERED") == "1"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, function in sorted(globals().items()):

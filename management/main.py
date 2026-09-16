@@ -97,6 +97,7 @@ async def _stream_job(job_id: str, cmd: list[str]) -> None:
     log_path = JOBS_DIR / f"{job_id}.log"
     jobs[job_id].update(status="running", log_path=str(log_path))
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}  # stream prints instead of buffering
+    env.pop("SKIP_TRAIN", None)  # train_lora.sh test seam — must not reach a prod child process
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
