@@ -731,12 +731,16 @@
             <div><b>${esc(s.name || s.id)}</b> <span class="muted">· ${esc(s.id)} · ${esc(s.mode)}${(s.tags && s.tags.length) ? " · " + s.tags.map(esc).join(", ") : ""}</span></div>
             <div class="row">
               <button data-copy="${i}">Загрузить в модель</button>
+              <button class="ghost" data-libedit="${i}">Изменить</button>
               <button class="ghost" data-libdel="${i}">Удалить</button>
             </div>
           </div>
           <div class="muted" style="margin-top:4px">${esc(truncate(s.text, 200))}</div>
         </div>`).join("");
       box.querySelectorAll("[data-copy]").forEach((b) => { b.onclick = () => sceneToProfile(state.library[+b.dataset.copy]); });
+      box.querySelectorAll("[data-libedit]").forEach((b) => {
+        b.onclick = () => openLibraryEdit(b.closest(".lib-item"), +b.dataset.libedit);
+      });
       box.querySelectorAll("[data-libdel]").forEach((b) => {
         b.onclick = async () => {
           const s = state.library[+b.dataset.libdel];
@@ -746,6 +750,50 @@
           renderLibrary();
         };
       });
+    }
+
+    // Инлайн-редактирование сцены: карточка .lib-item заменяется на форму.
+    // «Загрузить в модель» и «Удалить» в режиме редактирования не показываются.
+    function openLibraryEdit(card, i) {
+      const s = state.library[i];
+      if (!card || !s) return;
+      card.innerHTML = `
+        <div class="grid2">
+          <div>
+            <label>id</label>
+            <input data-libeid value="${esc(s.id)}" placeholder="scene-id" />
+          </div>
+          <div>
+            <label>Название</label>
+            <input data-libename value="${esc(s.name || "")}" placeholder="Название сцены" />
+          </div>
+        </div>
+        <label>Режим</label>
+        <select data-libemode>
+          <option value="candidates">candidates</option>
+          <option value="expand">expand</option>
+          <option value="post">post</option>
+        </select>
+        <label>Текст сцены</label>
+        <textarea data-libetag rows="3" placeholder="текст сцены"></textarea>
+        <div class="row" style="margin-top:10px">
+          <button data-libesave>Сохранить</button>
+          <button class="ghost" data-libecancel>Отмена</button>
+        </div>`;
+      card.querySelector("[data-libemode]").value = s.mode;
+      card.querySelector("[data-libetag]").value = s.text || "";
+      card.querySelector("[data-libecancel]").onclick = () => renderLibrary();
+      card.querySelector("[data-libesave]").onclick = async () => {
+        const id = card.querySelector("[data-libeid]").value.trim();
+        const name = card.querySelector("[data-libename]").value.trim();
+        const mode = card.querySelector("[data-libemode]").value;
+        const text = card.querySelector("[data-libetag]").value.trim();
+        if (!id || !text) { alert("Нужны id и текст сцены."); return; }
+        if (state.library.some((o, j) => j !== i && o.id === id)) { alert("Сцена с таким id уже есть."); return; }
+        state.library[i] = { id, name, mode, text, tags: s.tags || [] };
+        await saveLibrary();
+        renderLibrary();
+      };
     }
 
     function sceneToProfile(scene) {
