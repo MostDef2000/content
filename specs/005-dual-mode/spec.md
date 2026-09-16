@@ -54,8 +54,20 @@
 - NFR-2: rollback-поведение идентично в обоих режимах — evidence: единый
   except-блок с `shutil.rmtree` вокруг записи файлов поста.
 
+## Privacy and preview (amendment, owner decision 16.09)
+
+- С 16.09 по решению владельца превью приватных постов в UI ВКЛЮЧЕНО:
+  файлы `models/<id>/posts-private/` отдаются через
+  `/files/<id>/posts-private/<post>/<file>` под тем же basicauth, что и
+  остальные превью (в whitelist `_FILE_KIND_DIRS` добавлен kind
+  `posts-private`; `list_posts_private` возвращает `photo`).
+- Приватность = отдельная папка `posts-private/` и отдельная вкладка/сегмент
+  в UI, а НЕ отдельный контур доступа: механизма доступа у приватных постов
+  отдельного нет.
+
 ## Compatibility and boundaries
 
-Не меняет подкоманды candidates/expand, workflows JSON, `lora/caption.py`,
-manager. Не трогает `posts/`, `posts-private/`, `runtime/` вне
-существующего транзита `runtime/output/posts/`.
+Не меняет подкоманды candidates/expand, workflows JSON, `lora/caption.py`.
+Manager: изменения по поправке 16.09 (превью `posts-private`, см. раздел
+«Privacy and preview»). Не трогает `posts/`, `posts-private/`, `runtime/`
+вне существующего транзита `runtime/output/posts/`.

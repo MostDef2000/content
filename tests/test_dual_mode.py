@@ -1,5 +1,6 @@
-"""Import-safe tests for management.main dual-mode privacy invariants
-(feature 005): "posts-private" is never in the /files whitelist, and
+"""Import-safe tests for management.main dual-mode file-serving invariants
+(feature 005, amended 16.09): "posts-private" IS in the /files whitelist
+(owner decision: private-post preview re-enabled, same basicauth) and
 serve_model_file blocks path traversal out of the whitelisted kind dir.
 pytest-compatible; pytest is not required.
 
@@ -55,9 +56,12 @@ def _make_model_files() -> None:
     (private / "secret.jpg").write_bytes(b"\xff\xd8\xff secret jpg")
 
 
-def test_posts_private_never_in_file_whitelist():
-    assert "posts-private" not in main._FILE_KIND_DIRS
-    # sanity: the public kinds are whitelisted, so the invariant is meaningful
+def test_posts_private_in_file_whitelist():
+    # Owner decision 16.09: private-post preview re-enabled — "posts-private"
+    # is served by /files under the same basicauth as the public kinds.
+    assert "posts-private" in main._FILE_KIND_DIRS
+    assert main._FILE_KIND_DIRS["posts-private"] == "posts-private"
+    # sanity: the public kinds are whitelisted too
     for kind in ("reference", "dataset", "posts"):
         assert kind in main._FILE_KIND_DIRS, kind
 
@@ -79,14 +83,12 @@ def test_serve_model_file_blocks_traversal():
         raise AssertionError("HTTPException(400) expected for ../ traversal into posts-private")
 
 
-def test_serve_model_file_never_serves_posts_private_kind():
+def test_serve_model_file_serves_posts_private_kind():
+    # Owner decision 16.09: preview of private posts is served by /files.
     _make_model_files()
-    try:
-        _run(main.serve_model_file(MODEL_ID, "posts-private", "secret.jpg"))
-    except main.HTTPException as exc:
-        assert exc.status_code == 404, f"expected 404, got {exc.status_code}"
-    else:
-        raise AssertionError("HTTPException(404) expected: posts-private must never be served")
+    response = _run(main.serve_model_file(MODEL_ID, "posts-private", "secret.jpg"))
+    assert isinstance(response, main.FileResponse)
+    assert response.status_code == 200
 
 
 if __name__ == "__main__":

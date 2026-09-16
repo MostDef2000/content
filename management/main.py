@@ -32,11 +32,13 @@ MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 MAX_UPLOAD_MB = 20  # per-file cap for dataset uploads
 
-# /files serving whitelist — "posts-private" is never served.
+# /files serving whitelist — "posts-private" is served under the same
+# basicauth as every other kind (owner decision 16.09: preview re-enabled).
 _FILE_KIND_DIRS = {
     "reference": "reference/candidates",
     "dataset": "dataset/images",
     "posts": "posts",
+    "posts-private": "posts-private",
 }
 DATASET_TRASH = TRASH_DIR / "dataset"  # soft-delete bin for dataset image pairs
 
@@ -1005,8 +1007,8 @@ async def caption_model_dataset(model_id: str) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Generated-artifact previews (candidates / dataset / posts) — one whitelisted
-# endpoint; "posts-private" is never served.
+# Generated-artifact previews (candidates / dataset / posts / posts-private)
+# — one whitelisted endpoint under the same basicauth as the rest of the app.
 # --------------------------------------------------------------------------- #
 @app.get("/files/{model_id}/{kind}/{filename:path}")
 async def serve_model_file(model_id: str, kind: str, filename: str) -> FileResponse:
@@ -1369,8 +1371,9 @@ async def list_posts() -> dict[str, Any]:
 
 @app.get("/api/posts-private")
 async def list_posts_private() -> dict[str, Any]:
-    """Private (explicit-mode) posts of the active model — metadata only, never
-    any image-path fields ("posts-private" is not served by /files either)."""
+    """Private (explicit-mode) posts of the active model. Preview is included:
+    photo name per post and "posts-private" is served by /files under the same
+    basicauth (owner decision 16.09)."""
     folder = _active_model_dir("posts-private")
     if folder is None or not folder.exists():
         return {"posts": []}
@@ -1378,11 +1381,13 @@ async def list_posts_private() -> dict[str, Any]:
     for post in sorted(folder.iterdir()):
         if not post.is_dir():
             continue
+        photo = next(post.glob("photo.*"), None)
         caption = post / "caption.txt"
         prompt = post / "prompt.txt"
         posts.append(
             {
                 "name": post.name,
+                "photo": photo.name if photo else None,
                 "caption": caption.read_text(encoding="utf-8").strip() if caption.exists() else None,
                 "prompt": prompt.read_text(encoding="utf-8").strip() if prompt.exists() else None,
                 "created": datetime.fromtimestamp(post.stat().st_mtime, tz=timezone.utc).isoformat(),
