@@ -1166,7 +1166,13 @@ async def job_candidates(payload: dict[str, Any]) -> dict[str, Any]:
     character = _load_character(model_id)
     profile = _load_profile(model_id)
     count = int(payload.get("count", 8))
-    seed = int(payload.get("seed", 17023))
+    # No seed in the payload (UI leaves the field empty) → random seed in
+    # [0, 2**31); an explicit seed is used as-is (int validation as before).
+    seed_raw = payload.get("seed")
+    if seed_raw is None or not str(seed_raw).strip():
+        seed = random.randint(0, 2**31 - 1)
+    else:
+        seed = int(seed_raw)
     scene_id = str(payload.get("scene_id") or payload.get("scene") or "").strip()
     scene_text = _resolve_scene_text(model_id, scene_id) if scene_id else ""
 
@@ -1190,7 +1196,10 @@ async def job_candidates(payload: dict[str, Any]) -> dict[str, Any]:
     ]
     if engine_fields["uncensor"]:
         cmd += ["--uncensor"]
-    return await _launch("candidates", cmd, model_id=model_id)
+    result = await _launch("candidates", cmd, model_id=model_id)
+    # The actual seed (random or explicit) on the job record for the UI/audit.
+    jobs[result["job_id"]]["seed"] = seed
+    return result
 
 
 @app.post("/api/jobs/expand")
@@ -1276,7 +1285,13 @@ async def job_post(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="prompt or scene_id required")
 
     name = _safe_name(str(payload.get("name", ""))) if payload.get("name") else None
-    seed = int(payload.get("seed", 27191))
+    # No seed in the payload (UI leaves the field empty) → random seed in
+    # [0, 2**31); an explicit seed is used as-is (int validation as before).
+    seed_raw = payload.get("seed")
+    if seed_raw is None or not str(seed_raw).strip():
+        seed = random.randint(0, 2**31 - 1)
+    else:
+        seed = int(seed_raw)
     strength = float(payload.get("lora_strength", 0.8))
     cmd = [
         "python", "scripts/queue_workflow.py", "post",
@@ -1294,8 +1309,10 @@ async def job_post(payload: dict[str, Any]) -> dict[str, Any]:
     if engine_fields["uncensor"]:
         cmd += ["--uncensor"]
     result = await _launch("post", cmd, model_id=model_id)
-    # Engine on the job record so /api/jobs shows which engine generated the post.
+    # Engine on the job record so /api/jobs shows which engine generated the post,
+    # and the actual seed (random or explicit) for the UI/audit.
     jobs[result["job_id"]]["engine"] = engine
+    jobs[result["job_id"]]["seed"] = seed
     return result
 
 
@@ -1354,6 +1371,15 @@ def _validate_group_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if (_model_dir(ids[0]) / subdir / name).exists():
             raise HTTPException(status_code=409, detail="post name already exists")
 
+    # No seed in the payload (UI leaves the field empty) → random seed in
+    # [0, 2**31); an explicit seed is used as-is (int validation as before).
+    # One seed per group run; per-member seed+i is queue_workflow's job.
+    seed_raw = payload.get("seed")
+    if seed_raw is None or not str(seed_raw).strip():
+        seed = random.randint(0, 2**31 - 1)
+    else:
+        seed = int(seed_raw)
+
     return {
         "ids": ids,
         "entries": entries,
@@ -1362,7 +1388,7 @@ def _validate_group_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "mode": mode,
         "caption": caption,
         "name": name,
-        "seed": int(payload.get("seed", 27191)),
+        "seed": seed,
         "strength": float(payload.get("lora_strength", 0.8)),
         "negative": str(payload.get("negative", "")),
     }
@@ -1387,8 +1413,10 @@ async def job_group(payload: dict[str, Any]) -> dict[str, Any]:
     if plan["negative"]:
         cmd += ["--negative", plan["negative"]]
     result = await _launch("group", cmd, model_id=ids[0])
-    # Group members on the job record so _model_has_active_job sees every one.
+    # Group members on the job record so _model_has_active_job sees every one,
+    # and the actual seed (random or explicit) for the UI/audit.
     jobs[result["job_id"]]["models"] = ids
+    jobs[result["job_id"]]["seed"] = plan["seed"]
     return {**result, "models": ids, "primary": ids[0], "layout": plan["layout"]}
 
 

@@ -318,6 +318,67 @@ def test_expand_explicit_seed_in_cmd():
     assert main.jobs[job_id]["seed"] == 777
 
 
+def test_candidates_no_seed_gets_random_seed_in_cmd_and_job():
+    # Payload without seed (UI leaves the field empty) → random seed in
+    # [0, 2**31) is passed to the cmd AND stored on the job record.
+    spy = _LaunchSpy()
+    with _with_spy(spy):
+        _run(main.job_candidates({"prompt": "a quiet studio shot"}))
+    kind, cmd, model_id, job_id = spy.calls[-1]
+    assert kind == "candidates" and model_id == MODEL_ID
+    assert "--seed" in cmd, cmd
+    seed = int(cmd[cmd.index("--seed") + 1])
+    assert 0 <= seed < 2**31, seed
+    assert main.jobs[job_id]["seed"] == seed
+
+
+def test_post_no_seed_gets_random_seed_in_cmd_and_job():
+    # Payload without seed (UI leaves the field empty) → random seed in
+    # [0, 2**31) is passed to the cmd AND stored on the job record.
+    spy = _LaunchSpy()
+    with _with_spy(spy):
+        _run(
+            main.job_post(
+                {
+                    "caption": "a caption",
+                    "prompt": "a quiet studio shot",
+                }
+            )
+        )
+    kind, cmd, model_id, job_id = spy.calls[-1]
+    assert kind == "post" and model_id == MODEL_ID
+    assert "--seed" in cmd, cmd
+    seed = int(cmd[cmd.index("--seed") + 1])
+    assert 0 <= seed < 2**31, seed
+    assert main.jobs[job_id]["seed"] == seed
+
+
+def test_candidates_explicit_seed_in_cmd():
+    # An explicit seed is used as-is (int validation), never randomized.
+    spy = _LaunchSpy()
+    with _with_spy(spy):
+        _run(main.job_candidates({"prompt": "a quiet studio shot", "seed": 555}))
+    kind, cmd, model_id, job_id = spy.calls[-1]
+    assert kind == "candidates" and model_id == MODEL_ID
+    assert cmd[cmd.index("--seed") + 1] == "555", cmd
+    assert main.jobs[job_id]["seed"] == 555
+
+
+def test_group_no_seed_gets_random_seed_in_cmd_and_job():
+    # Payload without seed (UI leaves the field empty) → random seed in
+    # [0, 2**31) is passed to the cmd AND stored on the job record
+    # (one seed per group run; per-member seed+i is queue_workflow's job).
+    spy = _LaunchSpy()
+    with _with_spy(spy):
+        _run(main.job_group({"models": [MODEL_ID], "prompt": "a shared scene", "caption": "a caption"}))
+    kind, cmd, model_id, job_id = spy.calls[-1]
+    assert kind == "group" and model_id == MODEL_ID
+    assert "--seed" in cmd, cmd
+    seed = int(cmd[cmd.index("--seed") + 1])
+    assert 0 <= seed < 2**31, seed
+    assert main.jobs[job_id]["seed"] == seed
+
+
 def test_library_scene_texts_mode_filter_and_bad_inputs():
     import tempfile
 

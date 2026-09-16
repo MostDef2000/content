@@ -121,7 +121,7 @@
           <label>Количество</label>
           <input id="candCount" type="number" value="8" min="1" max="20" />
           <label>Seed</label>
-          <input id="candSeed" type="number" value="17023" />
+          <input id="candSeed" type="number" placeholder="случайный" />
           <label>
             <input type="checkbox" id="candUncensor" style="width:auto">
             uncensor LoRA
@@ -245,7 +245,7 @@
           </div>
           <div>
             <label>Seed</label>
-            <input id="postSeed" type="number" value="27191" />
+            <input id="postSeed" type="number" placeholder="случайный" />
           </div>
         </div>
         <label>LoRA strength</label>
@@ -294,7 +294,7 @@
           </div>
           <div>
             <label>Seed</label>
-            <input id="grpSeed" type="number" value="27191" />
+            <input id="grpSeed" type="number" placeholder="случайный" />
           </div>
         </div>
         <label>LoRA strength</label>
@@ -1279,7 +1279,8 @@
         try {
           let body = {};
           if (job === "candidates") {
-            body = { count: +$("candCount").value, seed: +$("candSeed").value, uncensor: $("candUncensor").checked };
+            body = { count: +$("candCount").value, uncensor: $("candUncensor").checked };
+            if ($("candSeed").value) body.seed = +$("candSeed").value; // пустое поле → seed не отправляем (бэкенд берёт случайный)
             if ($("candScene").value) body.scene_id = $("candScene").value;
           }
           if (job === "expand") {
@@ -1296,11 +1297,11 @@
             body = {
               caption: $("postCaption").value.trim(),
               name: $("postName").value || undefined,
-              seed: +$("postSeed").value,
               lora_strength: +$("postStrength").value,
               engine: state.postEngine, // flux (default) | sdxl
               uncensor: state.postEngine === "flux" && $("postUncensor").checked,
             };
+            if ($("postSeed").value) body.seed = +$("postSeed").value; // пустое поле → seed не отправляем (бэкенд берёт случайный)
             if (scene) body.scene_id = scene;
             if (prompt) body.prompt = prompt;
             body.mode = state.postMode; // public → posts/, private → posts-private/
@@ -1329,9 +1330,9 @@
               layout: state.grpLayout || "row",
               mode: state.grpMode || "public",
               caption,
-              seed: +$("grpSeed").value,
               lora_strength: +$("grpStrength").value,
             };
+            if ($("grpSeed").value) body.seed = +$("grpSeed").value; // пустое поле → seed не отправляем (бэкенд берёт случайный)
             const name = $("grpName").value.trim();
             if (name) body.name = name;
             if (prompt) body.prompt = prompt;        // prompt приоритетнее сцены
