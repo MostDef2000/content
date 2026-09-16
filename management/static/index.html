@@ -990,12 +990,40 @@
       $("dsUpload").disabled = false;
     };
 
+    // Busy-состояние «Caption all»: на время запроса кнопка disabled + «Каптионирование…»
+    // (эндпоинт ждёт синхронно caption.py --force, может идти минуты). Если запрос висит
+    // дольше 10с — подсказка «возможно завис». Восстановление (disabled + исходный текст)
+    // — в finally: и при успехе, и при ошибке, и при network-fail.
     $("dsCaptionAll").onclick = async () => {
+      const btn = $("dsCaptionAll");
+      const warn = $("dsTrainWarn");
       if (!state.activeId) { alert("Нет активной модели."); return; }
+      const originalText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Каптионирование…";
+      const hangTimer = setTimeout(() => { btn.textContent = "Каптионирование… (долго, возможно завис)"; }, 10000);
       try {
-        await api("POST", `/api/models/${encodeURIComponent(state.activeId)}/dataset/caption`, { force: true });
-        refresh();
-      } catch (e) { alert("Ошибка каптионирования: " + e.message); }
+        // Эндпоинт отдаёт HTTP 200 и при сбое caption.py: body.ok === false + returncode/output_tail.
+        const body = await api("POST", `/api/models/${encodeURIComponent(state.activeId)}/dataset/caption`, { force: true });
+        if (body.ok === true) {
+          refresh();
+          // Временный статус; следующий refresh (5-сек цикл) перезапишет штатным текстом готовности.
+          warn.textContent = "Каптионы обновлены ✓";
+          warn.className = "ok-text";
+        } else {
+          alert(`Каптионирование упало (код ${body.returncode}): ${(body.output_tail || []).slice(-3).join(" | ")}`);
+          warn.textContent = "Ошибка каптионирования ✗";
+          warn.className = "warn-note";
+        }
+      } catch (e) {
+        alert("Ошибка каптионирования: " + e.message);
+        warn.textContent = "Ошибка каптионирования ✗";
+        warn.className = "warn-note";
+      } finally {
+        clearTimeout(hangTimer);
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
     };
 
     $("dsTrain").onclick = async () => {
