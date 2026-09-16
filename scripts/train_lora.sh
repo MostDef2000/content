@@ -4,6 +4,26 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOOLKIT="${ROOT}/ai-toolkit"
 
+# Copy the newest *.safetensors checkpoint from models/<model id>/lora/output/
+# into runtime/models/loras/<model id>.safetensors (where ComfyUI/manager load
+# the character LoRA). Second arg overrides ROOT for fixture testing:
+#   copy_lora_output MODEL_ID ROOT
+copy_lora_output() {
+  local model_id="$1"
+  local root="${2:-${ROOT}}"
+  local out_dir="${root}/models/${model_id}/lora/output"
+  local dest="${root}/runtime/models/loras/${model_id}.safetensors"
+  local newest
+  newest="$(find "${out_dir}" -type f -name '*.safetensors' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2- || true)"
+  if [[ -z "${newest}" ]]; then
+    echo "Training finished but no *.safetensors checkpoint found under ${out_dir}; nothing to copy to ${dest}." >&2
+    return 3
+  fi
+  mkdir -p "$(dirname "${dest}")"
+  cp -f "${newest}" "${dest}"
+  echo "LoRA ready: ${newest} -> ${dest}"
+}
+
 if [[ ! -x "${TOOLKIT}/venv/bin/python" ]]; then
   echo "Run scripts/install_trainer.sh first." >&2
   exit 2
@@ -61,4 +81,11 @@ else
 fi
 
 cd "${TOOLKIT}"
-exec "${TOOLKIT}/venv/bin/python" run.py "${RENDERED}"
+train_rc=0
+"${TOOLKIT}/venv/bin/python" run.py "${RENDERED}" || train_rc=$?
+if [[ "${train_rc}" -ne 0 ]]; then
+  echo "Training '${MODEL_ID}' failed: run.py exited with code ${train_rc}." >&2
+  exit "${train_rc}"
+fi
+
+copy_lora_output "${MODEL_ID}"

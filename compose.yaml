@@ -24,6 +24,7 @@ services:
     build:
       context: .
       dockerfile: management/Dockerfile
+    gpus: all
     ports:
       - "${MANAGER_PORT:-8000}:8000"
     environment:
@@ -32,4 +33,5 @@ services:
     volumes:
       - .:/workspace
       - /var/run/docker.sock:/var/run/docker.sock
+    shm_size: "8gb"
     restart: unless-stopped
