@@ -1,7 +1,8 @@
 """Import-safe tests for lora/caption.py dataset-manifest helpers (Phase 2,
 feature 004): reconcile-with-disk, caption_for, base_caption trigger fix,
-save round-trip and the manifest version guard. pytest-compatible; pytest is
-not required.
+save round-trip and the manifest version guard; plus
+queue_workflow.next_dataset_index (append-instead-of-overwrite on repeated
+expand runs). pytest-compatible; pytest is not required.
 
 Run either way:
     python -m pytest tests/test_dataset_manifest.py -q
@@ -25,9 +26,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent  # content/
 sys.path.insert(0, str(REPO_ROOT))  # for `import prompts`
 sys.path.insert(0, str(REPO_ROOT / "lora"))  # for `import caption`
+sys.path.insert(0, str(REPO_ROOT / "scripts"))  # for `import queue_workflow`
 
 import caption  # noqa: E402  (lora/caption.py)
 import prompts  # noqa: E402
+import queue_workflow  # noqa: E402  (scripts/queue_workflow.py)
 
 MODEL_ID = "unittestmodel"
 FIXED_TS = 1767225600  # 2026-01-01T00:00:00Z — deterministic image mtimes
@@ -179,6 +182,39 @@ def test_load_manifest_rejects_version_gt_1():
             pass
         else:
             raise AssertionError("RuntimeError expected for manifest version 2")
+
+
+def test_next_dataset_index_empty_dir_is_1():
+    with tempfile.TemporaryDirectory(prefix="content-nextindex-") as tmp:
+        dataset_dir = Path(tmp)
+        assert queue_workflow.next_dataset_index(dataset_dir, MODEL_ID) == 1
+
+
+def test_next_dataset_index_after_full_run():
+    with tempfile.TemporaryDirectory(prefix="content-nextindex-") as tmp:
+        dataset_dir = Path(tmp)
+        # a first expand run: anchor _00 plus variations _01.._08
+        for idx in range(9):
+            (dataset_dir / f"{MODEL_ID}_{idx:02d}.jpg").write_bytes(b"\xff\xd8\xff stub")
+        assert queue_workflow.next_dataset_index(dataset_dir, MODEL_ID) == 9
+
+
+def test_next_dataset_index_hole_uses_max_plus_one():
+    with tempfile.TemporaryDirectory(prefix="content-nextindex-") as tmp:
+        dataset_dir = Path(tmp)
+        # sparse: only _00 and _05 exist (e.g. deleted variants in between)
+        for idx in (0, 5):
+            (dataset_dir / f"{MODEL_ID}_{idx:02d}.jpg").write_bytes(b"\xff\xd8\xff stub")
+        assert queue_workflow.next_dataset_index(dataset_dir, MODEL_ID) == 6
+
+
+def test_next_dataset_index_ignores_non_matching_stems():
+    with tempfile.TemporaryDirectory(prefix="content-nextindex-") as tmp:
+        dataset_dir = Path(tmp)
+        # other model's image and a stray notes file must not count
+        (dataset_dir / "other_01.jpg").write_bytes(b"\xff\xd8\xff stub")
+        (dataset_dir / "valery23_notes.txt").write_bytes(b"notes")
+        assert queue_workflow.next_dataset_index(dataset_dir, MODEL_ID) == 1
 
 
 if __name__ == "__main__":

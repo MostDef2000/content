@@ -5,6 +5,7 @@ import copy
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import time
@@ -167,6 +168,13 @@ def generate_candidates(args: argparse.Namespace) -> None:
         print(target)
 
 
+def next_dataset_index(dataset_dir: Path, model_id: str) -> int:
+    """Next free _NN suffix so repeated expand runs append instead of overwrite."""
+    pattern = re.compile(rf"^{re.escape(model_id)}_(\d+)$")
+    indices = [int(m.group(1)) for p in dataset_dir.glob(f"{model_id}_*") if (m := pattern.match(p.stem))]
+    return (max(indices) + 1) if indices else 1
+
+
 def expand_dataset(args: argparse.Namespace) -> None:
     model_id = args.model_id
     source = Path(args.reference).resolve()
@@ -178,8 +186,10 @@ def expand_dataset(args: argparse.Namespace) -> None:
     dataset_dir = ROOT / "models" / model_id / "dataset" / "images"
     dataset_dir.mkdir(parents=True, exist_ok=True)
 
-    # Keep original as first dataset entry
-    shutil.copy2(source, dataset_dir / f"{model_id}_00.jpg")
+    # Keep original as first dataset entry (reference anchor is written once —
+    # re-copying on each run would overwrite it if the reference changed).
+    if not (dataset_dir / f"{model_id}_00.jpg").exists():
+        shutil.copy2(source, dataset_dir / f"{model_id}_00.jpg")
 
     age = int(load_character(model_id).get("age", prompts.AGE_FLOOR))
     template = load_workflow("kontext_variation")
@@ -200,14 +210,16 @@ def expand_dataset(args: argparse.Namespace) -> None:
         # Guardrail phrase injected per scene: Kontext has no negative node.
         positives = [guardrail_positive(str(scene["text"]), age) for scene in scenes]
 
-    for idx in range(1, args.count + 1):
+    start = next_dataset_index(dataset_dir, model_id)
+    for offset in range(args.count):
+        idx = start + offset
         prompt = positives[(idx - 1) % len(positives)]
         workflow = copy.deepcopy(template)
         workflow["6"]["inputs"]["text"] = prompt
         workflow["41"]["inputs"]["image"] = staged.name
         workflow["25"]["inputs"]["noise_seed"] = args.seed + idx
         workflow["9"]["inputs"]["filename_prefix"] = f"dataset/{model_id}-{idx:02d}"
-        print(f"Generating dataset variation {idx}/{args.count}: {prompt[:60]}...")
+        print(f"Generating dataset variation {idx} ({offset + 1}/{args.count}): {prompt[:60]}...")
         images = queue_and_wait(args.url, workflow)
         img = output_path(images[0])
         target = dataset_dir / f"{model_id}_{idx:02d}{img.suffix}"
