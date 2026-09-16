@@ -1300,9 +1300,9 @@ async def job_post(payload: dict[str, Any]) -> dict[str, Any]:
             )
     character = _load_character(model_id)
     profile = _load_profile(model_id)
+    # Optional caption (Instagram post text): an empty value is accepted; the
+    # cmd still carries --caption "" and queue_workflow then skips caption.txt.
     caption = str(payload.get("caption", "")).strip()
-    if not caption:
-        raise HTTPException(status_code=400, detail="caption required")
     # Dual-mode (feature 005): public → posts/, private → posts-private/.
     # Guardrail validation applies to both modes.
     mode = str(payload.get("mode") or "public").strip()
@@ -1352,6 +1352,9 @@ async def job_post(payload: dict[str, Any]) -> dict[str, Any]:
     # and the actual seed (random or explicit) for the UI/audit.
     jobs[result["job_id"]]["engine"] = engine
     jobs[result["job_id"]]["seed"] = seed
+    # Actual caption on the job record: empty → null (consistent with
+    # list_posts, which reports caption=None when caption.txt is absent).
+    jobs[result["job_id"]]["caption"] = caption or None
     return result
 
 

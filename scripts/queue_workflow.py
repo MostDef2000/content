@@ -394,7 +394,10 @@ def generate_post(args: argparse.Namespace) -> None:
         images = queue_and_wait(args.url, workflow)
         source = output_path(images[0])
         shutil.move(source, destination / f"photo{source.suffix}")
-        (destination / "caption.txt").write_text(args.caption.strip() + "\n", encoding="utf-8")
+        # Optional caption: caption.txt is written only for a non-empty value
+        # (list_posts reports caption=None when the file is absent).
+        if args.caption.strip():
+            (destination / "caption.txt").write_text(args.caption.strip() + "\n", encoding="utf-8")
         (destination / "prompt.txt").write_text(positive.strip() + "\n", encoding="utf-8")
     except Exception:
         shutil.rmtree(destination, ignore_errors=True)
@@ -605,7 +608,7 @@ def parser() -> argparse.ArgumentParser:
 
     post = commands.add_parser("post", help="Generate one folder for manual posting")
     post.add_argument("--prompt", default="", help="Positive prompt; omit to build it from character.json + prompt_profile.json")
-    post.add_argument("--caption", required=True)
+    post.add_argument("--caption", default="", help="Optional Instagram caption; empty value → caption.txt is not created")
     post.add_argument("--name")
     post.add_argument("--seed", type=int, default=27191)
     post.add_argument("--lora-strength", type=float, default=0.8)

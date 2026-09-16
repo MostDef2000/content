@@ -6,7 +6,11 @@ allow_engine=False) and the cmd lines built by the job endpoints: post carries
 --engine sdxl (plus --uncensor when true) and the job record gains "engine",
 while group carries neither flag. Also covers the flux-LoRA gating: a missing
 LoRA file must 400 a flux post but not an sdxl post (the SDXL graph has no
-LoraLoader), and candidates/expand carry --uncensor when requested.
+ LoraLoader), and candidates/expand carry --uncensor when requested.
+Also covers the optional post caption: an empty/absent caption no longer 400s,
+the cmd still carries --caption "" (group keeps the required caption), the job
+record stores null for an empty caption, and queue_workflow.generate_post skips
+caption.txt for an empty caption but writes it for a filled one.
 pytest-compatible; pytest is not required.
 
 Run either way:
@@ -377,6 +381,161 @@ def test_group_no_seed_gets_random_seed_in_cmd_and_job():
     seed = int(cmd[cmd.index("--seed") + 1])
     assert 0 <= seed < 2**31, seed
     assert main.jobs[job_id]["seed"] == seed
+
+
+def test_post_empty_caption_accepted_no_400():
+    # Optional caption (Instagram post text): an empty/blank caption must not
+    # 400; the cmd still carries --caption "" and the job record stores null.
+    spy = _LaunchSpy()
+    with _with_spy(spy):
+        result = _run(main.job_post({"caption": "   ", "prompt": "a quiet studio shot"}))
+    kind, cmd, model_id, job_id = spy.calls[-1]
+    assert kind == "post" and model_id == MODEL_ID
+    assert result == {"job_id": job_id, "status": "queued"}
+    assert "--caption" in cmd, cmd
+    assert cmd[cmd.index("--caption") + 1] == "", cmd
+    assert main.jobs[job_id]["caption"] is None
+
+
+def test_post_missing_caption_key_accepted():
+    # No "caption" key in the payload at all → same contract as an empty one.
+    spy = _LaunchSpy()
+    with _with_spy(spy):
+        result = _run(main.job_post({"prompt": "a quiet studio shot"}))
+    kind, cmd, model_id, job_id = spy.calls[-1]
+    assert kind == "post" and model_id == MODEL_ID
+    assert result == {"job_id": job_id, "status": "queued"}
+    assert cmd[cmd.index("--caption") + 1] == "", cmd
+    assert main.jobs[job_id]["caption"] is None
+
+
+def test_post_filled_caption_unchanged():
+    # A filled caption behaves exactly as before the change.
+    spy = _LaunchSpy()
+    with _with_spy(spy):
+        _run(main.job_post({"caption": "hello #fitness", "prompt": "a quiet studio shot"}))
+    kind, cmd, model_id, job_id = spy.calls[-1]
+    assert kind == "post" and model_id == MODEL_ID
+    assert cmd[cmd.index("--caption") + 1] == "hello #fitness", cmd
+    assert main.jobs[job_id]["caption"] == "hello #fitness"
+
+
+def test_post_caption_arg_optional_in_parser():
+    # post: --caption is optional (default ""); group: --caption stays required.
+    args = queue_workflow.parser().parse_args(["post", "--prompt", "x"])
+    assert args.caption == ""
+    import contextlib
+    import io
+
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        try:
+            queue_workflow.parser().parse_args(["group", "--models", MODEL_ID, "--prompt", "x"])
+        except SystemExit:
+            pass  # argparse exits on the still-required --caption
+        else:
+            raise AssertionError("group --caption must remain required")
+
+
+def _run_generate_post(caption: str, name: str) -> dict:
+    """Run queue_workflow.generate_post in a temp ROOT with a stubbed
+    queue_and_wait; return a snapshot of the created post folder (taken
+    before the temp tree is cleaned up)."""
+    import argparse
+
+    with tempfile.TemporaryDirectory(prefix="gw-post-") as tmp:
+        root = Path(tmp) / "repo"
+        out_root = Path(tmp) / "comfy-output"
+        model_id = "pm1"
+        (root / "models" / model_id).mkdir(parents=True)
+        (root / "models" / "registry.json").write_text(
+            json.dumps({"version": 1, "models": [{"id": model_id, "active": True, "lora": f"{model_id}.safetensors"}]}),
+            encoding="utf-8",
+        )
+        (root / "models" / model_id / "character.json").write_text(
+            json.dumps({"name": "Valery", "age": 23}), encoding="utf-8"
+        )
+        loras = root / "runtime" / "models" / "loras"
+        loras.mkdir(parents=True)
+        (loras / f"{model_id}.safetensors").write_bytes(b"")  # flux preflight: existence matters
+        (root / "comfy").mkdir(parents=True)
+        # Minimal flux_lora graph: nodes 6/31/40/9 touched by generate_post; no "33"
+        # so set_negative stays a no-op.
+        (root / "comfy" / "workflow_flux_lora.json").write_text(
+            json.dumps(
+                {
+                    "6": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}},
+                    "31": {"class_type": "KSampler", "inputs": {"seed": 0}},
+                    "40": {"class_type": "LoraLoaderModelOnly", "inputs": {"lora_name": "", "strength_model": 0.8}},
+                    "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": ""}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        out_root.mkdir(parents=True)
+        (out_root / "photo.png").write_bytes(b"stub")
+
+        def _fake_queue(*_args, **_kwargs):
+            return [{"subfolder": "", "filename": "photo.png"}]
+
+        original_root = queue_workflow.ROOT
+        original_out_root = queue_workflow.OUTPUT_ROOT
+        original_queue = queue_workflow.queue_and_wait
+        queue_workflow.ROOT = root
+        queue_workflow.OUTPUT_ROOT = out_root
+        queue_workflow.queue_and_wait = _fake_queue
+        try:
+            queue_workflow.generate_post(
+                argparse.Namespace(
+                    model_id=model_id,
+                    engine="flux",
+                    uncensor=False,
+                    prompt="",
+                    negative="",
+                    caption=caption,
+                    name=name,
+                    seed=1,
+                    lora_strength=0.8,
+                    mode="public",
+                    url="http://127.0.0.1:9",
+                )
+            )
+            destination = root / "models" / model_id / "posts" / name
+            caption_path = destination / "caption.txt"
+            return {
+                "destination": destination,
+                # Snapshot the facts inside the with-block: the temp tree is
+                # torn down when the helper returns, so Paths must not be
+                # re-checked by the test itself.
+                "destination_exists": destination.is_dir(),
+                "has_photo": (destination / "photo.png").is_file(),
+                "caption_text": caption_path.read_text(encoding="utf-8") if caption_path.is_file() else None,
+                "has_prompt": (destination / "prompt.txt").is_file(),
+            }
+        finally:
+            queue_workflow.ROOT = original_root
+            queue_workflow.OUTPUT_ROOT = original_out_root
+            queue_workflow.queue_and_wait = original_queue
+
+
+def test_generate_post_empty_caption_no_file():
+    # Empty --caption: the post folder is still created (photo + prompt), but
+    # caption.txt must NOT exist (list_posts then reports caption=None).
+    result = _run_generate_post("", "empty-cap")
+    assert result["destination_exists"], result["destination"]
+    assert result["has_photo"], "photo.png must still be moved into the post folder"
+    assert result["caption_text"] is None, "caption.txt must not be created for an empty caption"
+    assert result["has_prompt"]
+
+
+def test_generate_post_filled_caption_writes_file():
+    # A filled caption is written to caption.txt (stripped + trailing newline)
+    # exactly as before the change.
+    result = _run_generate_post("  my caption  ", "filled-cap")
+    assert result["destination_exists"], result["destination"]
+    assert result["has_photo"]
+    assert result["caption_text"] == "my caption\n", result["caption_text"]
+    assert result["has_prompt"]
 
 
 def test_library_scene_texts_mode_filter_and_bad_inputs():

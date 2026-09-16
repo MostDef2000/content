@@ -228,8 +228,8 @@
         <select id="postScene"></select>
         <label>Prompt (необязательно — иначе соберётся из профиля и сцены)</label>
         <textarea id="postPrompt" rows="3" placeholder="оставьте пустым, чтобы использовать промт-профиль + сцену"></textarea>
-        <label>Caption (для Instagram)</label>
-        <textarea id="postCaption" rows="2" placeholder="Текст поста #fitness"></textarea>
+        <label>Caption (для Instagram, необязательно)</label>
+        <textarea id="postCaption" rows="2" placeholder="Текст поста для Instagram — можно оставить пустым"></textarea>
         <div class="grid2">
           <div>
             <label>Имя папки (необязательно)</label>
@@ -1324,7 +1324,6 @@
           if (job === "post") {
             const scene = $("postScene").value;
             const prompt = $("postPrompt").value.trim();
-            if (!$("postCaption").value.trim()) { alert("Caption обязателен."); return; }
             if (!scene && !prompt) { alert("Выберите сцену или введите prompt."); return; }
             body = {
               caption: $("postCaption").value.trim(),
