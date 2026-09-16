@@ -30,7 +30,8 @@ positive/negative с жёстким guardrail: только взрослая в�
   human/celebrity/politician), `build_positive` (identity+guardrail → face →
   body → mode-каркас → style → scene → tail → финальная самопроверка),
   `build_negative` (канонический негатив + mode-добавки + user, dedupe по
-  словам, порядок сохранён), `default_profile`, `scene_presets`.
+  словам, порядок сохранён), `default_profile` (`scene_presets` удалён
+  16.09.2026 — единственный источник сцен: `models/library.json` через UI).
 - `models/<id>/prompt_profile.json` — результат `default_profile(character)`.
 - `models/library.json` — сцены `{id,name,mode,text,tags}`: 8 expand-текстов
   из `VARIATION_PROMPTS` + ≥2 candidates + ≥2 post.
@@ -44,8 +45,10 @@ positive/negative с жёстким guardrail: только взрослая в�
       «canteen», «a healthy woman» — чисто (word-boundary).
 - [ ] `build_negative()` всегда содержит «real person» и «child»; user-текст
       не вычитает канонические термы.
-- [ ] `scene_presets()` непуст и содержит mode="expand"; `models/library.json`
-      консистентен с `scene_presets()`.
+- [ ] ~~`scene_presets()` непуст и содержит mode="expand"; `models/library.json`
+      консистентен с `scene_presets()`.~~ — superseded (16.09.2026): пресеты
+      удалены по решению; единственный источник сцен — `models/library.json`
+      (управляется через UI), ротация expand-вариаций — из библиотеки.
 - [ ] `py_compile prompts.py tests/test_prompts.py`; import-smoke проходит.
 
 ## NFR

@@ -130,6 +130,36 @@ def load_character(model_id: str) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def library_scene_texts(path_or_list, mode: str) -> list[str]:
+    """Scene texts for ``mode`` from the user's scene library (models/library.json).
+
+    ``path_or_list`` may be a path to the library file — either a top-level
+    ``[{"id","name","mode","text","tags"}]`` list or the tracked
+    ``{"version": 1, "scenes": [...]}`` wrapper — or a ready list of scene
+    dicts. Missing file or broken JSON never raises: the result is simply
+    empty, so a fresh/absent library degrades to "no scenes" instead of a
+    crash.
+    """
+    data = path_or_list
+    if not isinstance(data, list):
+        try:
+            data = json.loads(Path(data).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        if isinstance(data, dict):
+            data = data.get("scenes")
+    if not isinstance(data, list):
+        return []
+    texts: list[str] = []
+    for scene in data:
+        if not isinstance(scene, dict) or scene.get("mode") != mode:
+            continue
+        text = str(scene.get("text") or "").strip()
+        if text:
+            texts.append(text)
+    return texts
+
+
 def guardrail_positive(raw: str, age: int) -> str:
     """User-supplied positive: blocked-term check + guardrail phrase injection."""
     positive = raw.strip()
@@ -251,11 +281,14 @@ def expand_dataset(args: argparse.Namespace) -> None:
         # One override prompt replaces the scene rotation for every variation.
         positives = [guardrail_positive(args.prompt, age)]
     else:
-        scenes = prompts.scene_presets("expand")
-        if not scenes:
-            raise RuntimeError("No expand scenes available (prompts.scene_presets('expand') is empty)")
+        # Scene rotation comes only from the user's library (models/library.json,
+        # maintained in the manager UI). No built-in presets anymore.
+        mode = "expand"
+        texts = library_scene_texts(ROOT / "models" / "library.json", mode)
+        if not texts:
+            sys.exit(f"В библиотеке нет сцен режима {mode} — добавьте через UI")
         # Guardrail phrase injected per scene: Kontext has no negative node.
-        positives = [guardrail_positive(str(scene["text"]), age) for scene in scenes]
+        positives = [guardrail_positive(text, age) for text in texts]
 
     start = next_dataset_index(dataset_dir, model_id)
     for offset in range(args.count):

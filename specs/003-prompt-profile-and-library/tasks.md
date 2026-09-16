@@ -7,12 +7,14 @@
 
 - [x] T001 Создать `prompts.py` (MODES, AGE_FLOOR, GuardrailError,
       guardrail_phrase, validate_positive, build_positive, build_negative,
-      default_profile, scene_presets). DoD: py_compile; чистый модуль без I/O.
+      default_profile; scene_presets удалён 16.09.2026). DoD: py_compile; чистый модуль без I/O.
 - [x] T002 Создать `tests/test_prompts.py` (import-safe, pytest-совместимые).
       DoD: py_compile; `__main__`-раннер зелёный.
 - [x] T003 Создать `models/valery23/prompt_profile.json` из
       `default_profile(character)`. DoD: json.tool; совпадает с функцией.
-- [x] T004 Создать `models/library.json` из `scene_presets()`.
+- [x] T004 Создать `models/library.json` (первичный источник — пресеты;
+      с 16.09.2026 единственный источник сцен — библиотека через UI,
+      `scene_presets()` удалён).
       DoD: json.tool; ≥8 expand + ≥2 candidates + ≥2 post.
 - [x] T005 Подключить `prompts.py` к `queue_workflow.py`/manager.
       DoD: отдельная задача (queue_workflow — другой воркер).

@@ -32,6 +32,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent  # content/
 sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+import queue_workflow  # noqa: E402  (pure library_scene_texts helper)
 
 _TMP_WORKSPACE = tempfile.TemporaryDirectory(prefix="engine-ws-")
 # StaticFiles(directory=...) is mounted at import time and requires the dir.
@@ -284,6 +286,123 @@ def test_expand_uncensor_flag_in_cmd():
     kind, cmd, model_id, _job_id = spy.calls[-1]
     assert kind == "expand" and model_id == MODEL_ID
     assert "--uncensor" in cmd, cmd
+
+
+def test_expand_no_seed_gets_random_seed_in_cmd_and_job():
+    # Payload without seed → random seed in [0, 2**31) is passed to the cmd
+    # AND stored on the job record (field "seed").
+    candidates_dir = _MODEL_DIR / "reference" / "candidates"
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+    (candidates_dir / f"{MODEL_ID}-02.jpg").write_bytes(b"")
+    spy = _LaunchSpy()
+    with _with_spy(spy):
+        _run(main.job_expand({"reference": f"{MODEL_ID}-02.jpg"}))
+    kind, cmd, model_id, job_id = spy.calls[-1]
+    assert kind == "expand" and model_id == MODEL_ID
+    assert "--seed" in cmd, cmd
+    seed = int(cmd[cmd.index("--seed") + 1])
+    assert 0 <= seed < 2**31, seed
+    assert main.jobs[job_id]["seed"] == seed
+
+
+def test_expand_explicit_seed_in_cmd():
+    candidates_dir = _MODEL_DIR / "reference" / "candidates"
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+    (candidates_dir / f"{MODEL_ID}-03.jpg").write_bytes(b"")
+    spy = _LaunchSpy()
+    with _with_spy(spy):
+        _run(main.job_expand({"reference": f"{MODEL_ID}-03.jpg", "seed": 777}))
+    kind, cmd, model_id, job_id = spy.calls[-1]
+    assert kind == "expand" and model_id == MODEL_ID
+    assert cmd[cmd.index("--seed") + 1] == "777", cmd
+    assert main.jobs[job_id]["seed"] == 777
+
+
+def test_library_scene_texts_mode_filter_and_bad_inputs():
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="lib-scenes-") as tmp:
+        tmp_path = Path(tmp)
+        scenes = [
+            {"id": "a", "name": "A", "mode": "expand", "text": "expand one", "tags": []},
+            {"id": "b", "name": "B", "mode": "post", "text": "post one", "tags": []},
+            {"id": "c", "name": "C", "mode": "expand", "text": "expand two", "tags": []},
+        ]
+        # Mode filter on a plain top-level list.
+        lib = tmp_path / "library.json"
+        lib.write_text(json.dumps(scenes), encoding="utf-8")
+        assert queue_workflow.library_scene_texts(str(lib), "expand") == ["expand one", "expand two"]
+        assert queue_workflow.library_scene_texts(str(lib), "post") == ["post one"]
+        assert queue_workflow.library_scene_texts(str(lib), "candidates") == []
+        # The tracked wrapper format {"version": 1, "scenes": [...]} as well.
+        wrapper = tmp_path / "library_wrapped.json"
+        wrapper.write_text(json.dumps({"version": 1, "scenes": scenes}), encoding="utf-8")
+        assert queue_workflow.library_scene_texts(str(wrapper), "expand") == ["expand one", "expand two"]
+        # Missing file → [].
+        assert queue_workflow.library_scene_texts(str(tmp_path / "absent.json"), "expand") == []
+        # Broken JSON → [].
+        bad = tmp_path / "broken.json"
+        bad.write_text("{not json", encoding="utf-8")
+        assert queue_workflow.library_scene_texts(str(bad), "expand") == []
+        # A ready list (no file) works too.
+        assert queue_workflow.library_scene_texts(scenes, "post") == ["post one"]
+
+
+def test_expand_empty_library_exits_before_network():
+    # workorder без --prompt + пустая/отсутствующая library.json:
+    # library_scene_texts возвращает [], и expand_dataset обязан SystemExit
+    # «В библиотеке нет сцен…» ДО каких-либо сетевых вызовов (queue_and_wait
+    # патчем атрибута подменён на fail-loud заглушку — до неё дойти нельзя).
+    import argparse
+
+    with tempfile.TemporaryDirectory(prefix="empty-lib-") as tmp:
+        tmp_root = Path(tmp)
+        model_id = "m-empty"
+        model_dir = tmp_root / "models" / model_id
+        model_dir.mkdir(parents=True)
+        (model_dir / "character.json").write_text(
+            json.dumps({"name": "Empty", "age": 23}), encoding="utf-8"
+        )
+        # load_workflow() читает шаблон до проверки библиотеки — заглушка {}.
+        (tmp_root / "comfy").mkdir(parents=True)
+        (tmp_root / "comfy" / "workflow_kontext_variation.json").write_text("{}", encoding="utf-8")
+        reference = tmp_root / "reference.jpg"
+        reference.write_bytes(b"")
+
+        # Пустая библиотека: и отсутствующий файл, и обёртка с пустым scenes → [].
+        lib_path = tmp_root / "models" / "library.json"
+        assert queue_workflow.library_scene_texts(str(lib_path), "expand") == []
+        lib_path.write_text(json.dumps({"version": 1, "scenes": []}), encoding="utf-8")
+        assert queue_workflow.library_scene_texts(str(lib_path), "expand") == []
+
+        args = argparse.Namespace(
+            model_id=model_id,
+            reference=str(reference),
+            prompt=None,  # без --prompt → ротация сцен из библиотеки
+            negative="",
+            uncensor=False,
+            count=2,
+            seed=1,
+            url="http://127.0.0.1:9",
+        )
+
+        def _no_network(*_args, **_kwargs):
+            raise AssertionError("queue_and_wait must not be called with an empty library")
+
+        original_root = queue_workflow.ROOT
+        original_queue = queue_workflow.queue_and_wait
+        queue_workflow.ROOT = tmp_root  # не писать в реальный репозиторий
+        queue_workflow.queue_and_wait = _no_network
+        try:
+            try:
+                queue_workflow.expand_dataset(args)
+            except SystemExit as exc:
+                assert exc.code == "В библиотеке нет сцен режима expand — добавьте через UI", exc.code
+            else:
+                raise AssertionError("SystemExit expected for expand with an empty scene library")
+        finally:
+            queue_workflow.ROOT = original_root
+            queue_workflow.queue_and_wait = original_queue
 
 
 if __name__ == "__main__":

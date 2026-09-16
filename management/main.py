@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import re
 import shutil
 import tempfile
@@ -687,7 +688,6 @@ async def get_prompt_profile(model_id: str | None = None) -> dict[str, Any]:
             "phrase": prompts.guardrail_phrase(_model_age(character)),
             "canonical_negative": prompts.CANONICAL_NEGATIVE,
         },
-        "presets": prompts.scene_presets(),
     }
 
 
@@ -1203,7 +1203,13 @@ async def job_expand(payload: dict[str, Any]) -> dict[str, Any]:
     if not src.exists() or candidates_dir not in src.parents:
         raise HTTPException(status_code=400, detail="reference not found")
     count = int(payload.get("count", 8))
-    seed = int(payload.get("seed", 38447))
+    # No seed in the payload (UI leaves the field empty) → random seed in
+    # [0, 2**31); an explicit seed is used as-is (int validation as before).
+    seed_raw = payload.get("seed")
+    if seed_raw is None:
+        seed = random.randint(0, 2**31 - 1)
+    else:
+        seed = int(seed_raw)
     profile = _load_profile(model_id)
     scene_id = str(payload.get("scene_id") or payload.get("scene") or "").strip()
     engine_fields = _validate_engine_fields(payload, allow_engine=False)
@@ -1219,7 +1225,10 @@ async def job_expand(payload: dict[str, Any]) -> dict[str, Any]:
         cmd += ["--prompt", _resolve_scene_text(model_id, scene_id)]
     if engine_fields["uncensor"]:
         cmd += ["--uncensor"]
-    return await _launch("expand", cmd, model_id=model_id)
+    result = await _launch("expand", cmd, model_id=model_id)
+    # The actual seed (random or explicit) on the job record for the UI/audit.
+    jobs[result["job_id"]]["seed"] = seed
+    return result
 
 
 @app.post("/api/jobs/post")

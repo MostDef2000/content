@@ -116,7 +116,7 @@
         <div class="card">
           <h2>1. Кандидаты лица</h2>
           <p class="muted">Генерирует эталонные портреты (последовательно). Промт собирается на бэкенде из промт-профиля активной модели.</p>
-          <label>Сцена (из пресетов/библиотеки, режим «candidates»)</label>
+          <label>Сцена (из библиотеки, режим «candidates»)</label>
           <select id="candScene"></select>
           <label>Количество</label>
           <input id="candCount" type="number" value="8" min="1" max="20" />
@@ -141,6 +141,8 @@
           <select id="expScene"></select>
           <label>Количество</label>
           <input id="expCount" type="number" value="8" min="1" max="20" />
+          <label>Seed</label>
+          <input id="expSeed" type="number" placeholder="случайный" />
           <label>
             <input type="checkbox" id="expUncensor" style="width:auto">
             uncensor LoRA
@@ -230,7 +232,7 @@
           <input type="checkbox" id="postUncensor" style="width:auto">
           uncensor LoRA (только FLUX)
         </label>
-        <label>Сцена (из пресетов/библиотеки, режим «post»)</label>
+        <label>Сцена (из библиотеки, режим «post»)</label>
         <select id="postScene"></select>
         <label>Prompt (необязательно — иначе соберётся из профиля и сцены)</label>
         <textarea id="postPrompt" rows="3" placeholder="оставьте пустым, чтобы использовать промт-профиль + сцену"></textarea>
@@ -264,7 +266,7 @@
         <div id="grpModels" class="chips"><span class="muted">— загрузка…</span></div>
         <div id="grpCount" class="muted">выбрано 0/5</div>
 
-        <label>Сцена (из пресетов/библиотеки, режим «post»)</label>
+        <label>Сцена (из библиотеки)</label>
         <select id="grpScene"></select>
         <label>Prompt (необязательно)</label>
         <textarea id="grpPrompt" rows="3" placeholder="или введите prompt (сцена имеет приоритет если пуста)"></textarea>
@@ -429,9 +431,8 @@
       activeId: null,        // активная модель (id) — источник для /files/<id>/...
       profileFor: null,      // для какой модели загружен профиль
       refName: "",           // выбранный эталон (переживает refresh; жёстко персистируется в character.json)
-      refModel: null,        // модель, к которой относится выбранный эталон (сброс при смене модели)
-      presets: [],           // пресеты сцен из /api/prompt-profile
-      library: [],           // сцены из /api/library
+       refModel: null,        // модель, к которой относится выбранный эталон (сброс при смене модели)
+       library: [],           // сцены из /api/library (единственный источник пикеров сцен)
       profileScenes: {},     // рабочая копия сцен профиля (id → text)
       postMode: "public",    // режим нового поста: public | private (Фаза 2)
       postEngine: "flux",    // движок нового поста: flux | sdxl (Фаза 4)
@@ -684,7 +685,6 @@
       }
       try {
         const p = await api("GET", "/api/prompt-profile?model_id=" + encodeURIComponent(state.activeId));
-        state.presets = p.presets || [];
         // Эталон: восстанавливаем из character.json. Обновляем state только
         // когда поле реально пришло; при смене модели — сброс на сохранённое
         // значение новой модели (его может не быть — тогда "").
@@ -857,9 +857,10 @@
 
     // ------------------------- селекторы сцен (пайплайн) -------------------------
     function sceneOptions(mode) {
+      // Только библиотека пользователя (state.library), отфильтрованная по mode.
       const seen = new Set();
       const out = [];
-      for (const s of [...state.presets, ...state.library]) {
+      for (const s of state.library) {
         if (s.mode !== mode || seen.has(s.id)) continue;
         seen.add(s.id);
         out.push(s);
@@ -1284,6 +1285,7 @@
           if (job === "expand") {
             if (!$("refSelect").value) { alert("Сначала сгенерируйте и выберите эталон."); return; }
             body = { reference: $("refSelect").value, count: +$("expCount").value, uncensor: $("expUncensor").checked };
+            if ($("expSeed").value) body.seed = +$("expSeed").value; // пустое поле → seed не отправляем (бэкенд берёт случайный)
             if ($("expScene").value) body.scene_id = $("expScene").value;
           }
           if (job === "post") {

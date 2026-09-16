@@ -108,7 +108,6 @@ def test_unknown_mode_rejected():
     for call in (
         lambda: prompts.build_positive(name="Valery", age=23, mode="video"),
         lambda: prompts.build_negative(mode="video"),
-        lambda: prompts.scene_presets("video"),
     ):
         try:
             call()
@@ -131,15 +130,6 @@ def test_default_profile_shape():
     assert profile["style"] == "editorial"
     assert profile["negative"] == ""
     assert "casting" in profile["scenes"]
-
-
-def test_scene_presets_nonempty_with_expand():
-    presets = prompts.scene_presets()
-    assert presets, "scene library must not be empty"
-    assert any(preset["mode"] == "expand" for preset in presets)
-    assert all(set(preset) == {"id", "name", "mode", "text", "tags"} for preset in presets)
-    expand_only = prompts.scene_presets("expand")
-    assert expand_only and all(preset["mode"] == "expand" for preset in expand_only)
 
 
 if __name__ == "__main__":
