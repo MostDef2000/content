@@ -31,6 +31,7 @@ TRASH_DIR = WORKSPACE / "runtime" / "trash"  # soft-delete bin, never auto-clean
 MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 MAX_UPLOAD_MB = 20  # per-file cap for dataset uploads
+POST_ENGINES = ("flux", "sdxl")  # generation engines accepted by /api/jobs/post
 
 # /files serving whitelist — "posts-private" is served under the same
 # basicauth as every other kind (owner decision 16.09: preview re-enabled).
@@ -1138,6 +1139,26 @@ async def _serial_job(job_id: str, cmd: list[str]) -> None:
         await _stream_job(job_id, cmd)
 
 
+def _validate_engine_fields(payload: dict[str, Any], *, allow_engine: bool) -> dict[str, Any]:
+    """Validate the generation-engine payload fields (feature: SDXL/Pony engine).
+
+    Pure (no job is launched), so unit tests can call it directly.
+    ``allow_engine`` is True only for the post job: ``engine``
+    ("flux"|"sdxl", default "flux") is a post-only field, while ``uncensor``
+    (bool, default false) is accepted by candidates/expand/post (flux paths
+    only — group takes neither). Invalid values raise HTTPException(400)."""
+    if allow_engine:
+        engine = str(payload.get("engine") or "flux").strip().lower()
+        if engine not in POST_ENGINES:
+            raise HTTPException(status_code=400, detail=f"engine must be one of {list(POST_ENGINES)}")
+    else:
+        engine = "flux"
+    uncensor = payload.get("uncensor", False)
+    if not isinstance(uncensor, bool):
+        raise HTTPException(status_code=400, detail="uncensor must be a boolean (true/false)")
+    return {"engine": engine, "uncensor": uncensor}
+
+
 @app.post("/api/jobs/candidates")
 async def job_candidates(payload: dict[str, Any]) -> dict[str, Any]:
     model = _active_model_or_404()
@@ -1160,12 +1181,15 @@ async def job_candidates(payload: dict[str, Any]) -> dict[str, Any]:
         prompt = _build_model_prompt(character, profile, "candidates", scene_text)
 
     negative = prompts.build_negative(profile.get("negative", ""), mode="candidates")
+    engine_fields = _validate_engine_fields(payload, allow_engine=False)
     cmd = [
         "python", "scripts/queue_workflow.py", "candidates",
         "--count", str(count), "--seed", str(seed),
         "--prompt", prompt,
         "--model", model_id, "--negative", negative,
     ]
+    if engine_fields["uncensor"]:
+        cmd += ["--uncensor"]
     return await _launch("candidates", cmd, model_id=model_id)
 
 
@@ -1182,6 +1206,7 @@ async def job_expand(payload: dict[str, Any]) -> dict[str, Any]:
     seed = int(payload.get("seed", 38447))
     profile = _load_profile(model_id)
     scene_id = str(payload.get("scene_id") or payload.get("scene") or "").strip()
+    engine_fields = _validate_engine_fields(payload, allow_engine=False)
     cmd = [
         "python", "scripts/queue_workflow.py", "expand",
         "--reference", str(src), "--count", str(count), "--seed", str(seed),
@@ -1192,6 +1217,8 @@ async def job_expand(payload: dict[str, Any]) -> dict[str, Any]:
         # Resolved scene text overrides the expand scene rotation (guardrail
         # phrase is enforced downstream by queue_workflow.expand_dataset).
         cmd += ["--prompt", _resolve_scene_text(model_id, scene_id)]
+    if engine_fields["uncensor"]:
+        cmd += ["--uncensor"]
     return await _launch("expand", cmd, model_id=model_id)
 
 
@@ -1199,14 +1226,21 @@ async def job_expand(payload: dict[str, Any]) -> dict[str, Any]:
 async def job_post(payload: dict[str, Any]) -> dict[str, Any]:
     model = _active_model_or_404()
     model_id = str(model["id"])
-    # Registry lora wins; older entries may lack it — fall back to the canonical
-    # <id>.safetensors name produced by scripts/train_lora.sh deployment.
-    lora = str(model.get("lora") or f"{model_id}.safetensors")
-    if not (LORAS_DIR / lora).is_file():
-        raise HTTPException(
-            status_code=400,
-            detail=f"LoRA не обучена или не скопирована в runtime/models/loras/ (ожидался {lora})",
-        )
+    engine_fields = _validate_engine_fields(payload, allow_engine=True)
+    engine = engine_fields["engine"]
+    # The character LoRA file is required only for the flux engine: the SDXL
+    # (Pony) graph has no LoraLoader, so sdxl posts must not 400 on a missing
+    # LoRA (mirrored by the preflight in scripts/queue_workflow.py).
+    if engine == "flux":
+        # Registry lora wins; older entries may lack it — fall back to the
+        # canonical <id>.safetensors name produced by scripts/train_lora.sh
+        # deployment.
+        lora = str(model.get("lora") or f"{model_id}.safetensors")
+        if not (LORAS_DIR / lora).is_file():
+            raise HTTPException(
+                status_code=400,
+                detail=f"LoRA не обучена или не скопирована в runtime/models/loras/ (ожидался {lora})",
+            )
     character = _load_character(model_id)
     profile = _load_profile(model_id)
     caption = str(payload.get("caption", "")).strip()
@@ -1245,7 +1279,15 @@ async def job_post(payload: dict[str, Any]) -> dict[str, Any]:
     ]
     if name:
         cmd += ["--name", name]
-    return await _launch("post", cmd, model_id=model_id)
+    # --engine is a post-only flag (candidates/expand are flux-only);
+    # --uncensor is added only when requested (flux paths only, no-op for sdxl).
+    cmd += ["--engine", engine]
+    if engine_fields["uncensor"]:
+        cmd += ["--uncensor"]
+    result = await _launch("post", cmd, model_id=model_id)
+    # Engine on the job record so /api/jobs shows which engine generated the post.
+    jobs[result["job_id"]]["engine"] = engine
+    return result
 
 
 def _validate_group_payload(payload: dict[str, Any]) -> dict[str, Any]:

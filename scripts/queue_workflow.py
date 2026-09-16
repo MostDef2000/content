@@ -20,6 +20,22 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_ROOT = ROOT / "runtime" / "output"
 
+# Generation engines (Phase 4): flux = FLUX.1-dev FP8 + character LoRA;
+# sdxl = Pony Diffusion V6 XL txt2img. ComfyUI's models dir is runtime/models
+# (compose.yaml mounts it to /opt/ComfyUI/models) — the checkpoints live in
+# runtime/models/checkpoints/ (next to flux1-dev-fp8.safetensors) and the
+# LoRAs in runtime/models/loras/ (same dir as the character LoRAs).
+SDXL_CKPT = "ponyDiffusionV6XL.safetensors"
+SDXL_CKPT_PATH = ROOT / "runtime" / "models" / "checkpoints" / SDXL_CKPT
+UNCENSOR_LORA = "flux1-uncensored.safetensors"
+UNCENSOR_LORA_PATH = ROOT / "runtime" / "models" / "loras" / UNCENSOR_LORA
+# Pony (SDXL) prompt scaffolding: quality-score prefix on the positive (the
+# guarded character/scene composition is kept verbatim), fixed low-quality
+# terms on the negative.
+SDXL_POSITIVE_PREFIX = "score_9, score_8_up, score_7_up, source_photo"
+SDXL_NEGATIVE = "score_6, score_5, score_4, worst quality, low quality, blurry, deformed, watermark"
+UNCENSOR_NODE_ID = "43"
+
 # prompts.py (guardrail prompt assembly) lives at the repo root, next to scripts/.
 sys.path.insert(0, str(ROOT))
 import prompts  # noqa: E402
@@ -138,6 +154,31 @@ def set_negative(workflow: dict[str, Any], text: str) -> None:
         node["inputs"]["text"] = text
 
 
+def inject_uncensor_lora(workflow: dict[str, Any], loader_node: str, consumer_node: str) -> bool:
+    """Best-effort uncensor LoRA for the flux path (--uncensor).
+
+    Inserts a LoraLoaderModelOnly (node ``UNCENSOR_NODE_ID``) with
+    ``flux1-uncensored.safetensors`` (strength_model 1.0) between the model
+    loader (``loader_node``) and its first consumer (``consumer_node``),
+    mirroring the existing flux_lora character-LoRA inclusion (node "40").
+    A missing LoRA file never fails the run: it logs a warning and the graph
+    is left unwrapped. Returns True when the LoRA was injected.
+    """
+    if not UNCENSOR_LORA_PATH.is_file():
+        print(f"uncensor lora not found, продолжаю без неё: {UNCENSOR_LORA_PATH}")
+        return False
+    workflow[UNCENSOR_NODE_ID] = {
+        "inputs": {
+            "lora_name": UNCENSOR_LORA,
+            "strength_model": 1.0,
+            "model": [loader_node, 0],
+        },
+        "class_type": "LoraLoaderModelOnly",
+    }
+    workflow[consumer_node]["inputs"]["model"] = [UNCENSOR_NODE_ID, 0]
+    return True
+
+
 def generate_candidates(args: argparse.Namespace) -> None:
     model_id = args.model_id
     character = load_character(model_id)
@@ -146,6 +187,9 @@ def generate_candidates(args: argparse.Namespace) -> None:
     destination = ROOT / "models" / model_id / "reference" / "candidates"
     destination.mkdir(parents=True, exist_ok=True)
     template = load_workflow("bootstrap")
+    if args.uncensor:
+        # bootstrap graph: CheckpointLoaderSimple "30" → KSampler "31"
+        inject_uncensor_lora(template, "30", "31")
     if args.prompt:
         # Override the positive character prompt (the non-empty CLIPTextEncode).
         positive = guardrail_positive(args.prompt, age)
@@ -193,6 +237,9 @@ def expand_dataset(args: argparse.Namespace) -> None:
 
     age = int(load_character(model_id).get("age", prompts.AGE_FLOOR))
     template = load_workflow("kontext_variation")
+    if args.uncensor:
+        # kontext graph: UNETLoader "12" → ModelSamplingFlux "30"
+        inject_uncensor_lora(template, "12", "30")
     # Place reference where LoadImage can find it (sequential use — never two models at once on 12GB)
     staged = input_dir / f"{model_id}_reference.jpg"
     shutil.copy2(source, staged)
@@ -233,6 +280,10 @@ def expand_dataset(args: argparse.Namespace) -> None:
 
 def generate_post(args: argparse.Namespace) -> None:
     model_id = args.model_id
+    # Engine preflight (fail fast before any readiness checks / queueing):
+    # the sdxl path needs the Pony checkpoint in the shared ComfyUI models dir.
+    if args.engine == "sdxl" and not SDXL_CKPT_PATH.is_file():
+        sys.exit(f"SDXL checkpoint not found: {SDXL_CKPT_PATH} — нужен handoff на скачивание")
     entry = next(
         (item for item in load_registry().get("models") or [] if str(item.get("id")) == model_id),
         {},
@@ -246,15 +297,18 @@ def generate_post(args: argparse.Namespace) -> None:
     # Fail fast before queuing anything if the trained LoRA is not deployed.
     # Registry lora wins; older entries may lack it — fall back to the canonical
     # <id>.safetensors name produced by scripts/train_lora.sh deployment.
+    # flux engine only: the SDXL (Pony) graph has no LoraLoader, so the
+    # character LoRA file is irrelevant for sdxl posts.
     registry_lora = str(entry.get("lora") or f"{model_id}.safetensors")
-    lora_path = ROOT / "runtime" / "models" / "loras" / registry_lora
-    if not lora_path.is_file():
-        raise FileNotFoundError(
-            f"LoRA for model {model_id!r} is not available: expected {lora_path} "
-            f"(registry lora: {entry.get('lora')!r}). Train it with "
-            f"'scripts/train_lora.sh {model_id}' and copy the .safetensors into "
-            "runtime/models/loras/."
-        )
+    if args.engine == "flux":
+        lora_path = ROOT / "runtime" / "models" / "loras" / registry_lora
+        if not lora_path.is_file():
+            raise FileNotFoundError(
+                f"LoRA for model {model_id!r} is not available: expected {lora_path} "
+                f"(registry lora: {entry.get('lora')!r}). Train it with "
+                f"'scripts/train_lora.sh {model_id}' and copy the .safetensors into "
+                "runtime/models/loras/."
+            )
 
     age = int(character.get("age", prompts.AGE_FLOOR))
     if args.prompt:
@@ -271,13 +325,28 @@ def generate_post(args: argparse.Namespace) -> None:
             scene=str((profile.get("scenes") or {}).get("post", "")),
         )
 
-    workflow = load_workflow("flux_lora")
-    workflow["6"]["inputs"]["text"] = positive
-    workflow["31"]["inputs"]["seed"] = args.seed
-    workflow["40"]["inputs"]["strength_model"] = args.lora_strength
-    workflow["40"]["inputs"]["lora_name"] = registry_lora
-    workflow["9"]["inputs"]["filename_prefix"] = f"posts/{model_id}"
-    set_negative(workflow, prompts.build_negative(args.negative, mode="post"))
+    if args.engine == "sdxl":
+        # Pony (SDXL) txt2img: the same prompt-composition principle (character
+        # + scene, guardrail phrase enforced upstream), wrapped in the pony
+        # quality-score prefix; fixed pony negative. The character LoRA is
+        # flux-specific, so the SDXL graph has no LoraLoader.
+        positive = f"{SDXL_POSITIVE_PREFIX}, {positive}"
+        workflow = load_workflow("sdxl")
+        workflow["6"]["inputs"]["text"] = positive
+        workflow["31"]["inputs"]["seed"] = args.seed
+        workflow["9"]["inputs"]["filename_prefix"] = f"posts/{model_id}"
+        set_negative(workflow, SDXL_NEGATIVE)
+    else:
+        workflow = load_workflow("flux_lora")
+        if args.uncensor:
+            # flux_lora graph: CheckpointLoaderSimple "30" → LoraLoaderModelOnly "40"
+            inject_uncensor_lora(workflow, "30", "40")
+        workflow["6"]["inputs"]["text"] = positive
+        workflow["31"]["inputs"]["seed"] = args.seed
+        workflow["40"]["inputs"]["strength_model"] = args.lora_strength
+        workflow["40"]["inputs"]["lora_name"] = registry_lora
+        workflow["9"]["inputs"]["filename_prefix"] = f"posts/{model_id}"
+        set_negative(workflow, prompts.build_negative(args.negative, mode="post"))
 
     post_name = args.name or datetime.now().strftime("%Y-%m-%d-%H%M%S")
     if Path(post_name).name != post_name:
@@ -469,7 +538,7 @@ def generate_group(args: argparse.Namespace) -> None:
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(description="Queue sequential FLUX jobs in ComfyUI")
+    root = argparse.ArgumentParser(description="Queue sequential generation jobs in ComfyUI (FLUX / SDXL-Pony)")
     # Manager container reaches ComfyUI by compose service name; respect COMFY_URL.
     root.add_argument("--url", default=os.environ.get("COMFY_URL", "http://comfyui:8188"))
     commands = root.add_subparsers(dest="command", required=True)
@@ -480,6 +549,11 @@ def parser() -> argparse.ArgumentParser:
     candidates.add_argument("--prompt", default="", help="Override the character prompt (guardrail phrase enforced)")
     candidates.add_argument("--negative", default="", help="Extra negative terms; canonical guardrail terms are always kept")
     candidates.add_argument("--model", default=None, help="Model id from models/registry.json (default: active)")
+    candidates.add_argument(
+        "--uncensor",
+        action="store_true",
+        help="Wrap the flux model in the flux1-uncensored LoRA (missing file: warn and continue without it)",
+    )
     candidates.set_defaults(handler=generate_candidates)
 
     expand = commands.add_parser("expand", help="Expand single reference into dataset via Kontext (sequential)")
@@ -489,6 +563,11 @@ def parser() -> argparse.ArgumentParser:
     expand.add_argument("--prompt", default="", help="Override the scene rotation with one prompt (guardrail phrase enforced)")
     expand.add_argument("--negative", default="", help="Extra negative terms; canonical guardrail terms are always kept")
     expand.add_argument("--model", default=None, help="Model id from models/registry.json (default: active)")
+    expand.add_argument(
+        "--uncensor",
+        action="store_true",
+        help="Wrap the kontext model in the flux1-uncensored LoRA (missing file: warn and continue without it)",
+    )
     expand.set_defaults(handler=expand_dataset)
 
     post = commands.add_parser("post", help="Generate one folder for manual posting")
@@ -505,6 +584,17 @@ def parser() -> argparse.ArgumentParser:
         help="public → models/<id>/posts/, private → models/<id>/posts-private/",
     )
     post.add_argument("--model", default=None, help="Model id from models/registry.json (default: active)")
+    post.add_argument(
+        "--engine",
+        choices=("flux", "sdxl"),
+        default="flux",
+        help="Generation engine: flux (FLUX.1-dev FP8 + character LoRA) or sdxl (Pony Diffusion V6 XL txt2img)",
+    )
+    post.add_argument(
+        "--uncensor",
+        action="store_true",
+        help="Wrap the flux model in the flux1-uncensored LoRA (flux engine only; missing file: warn and continue)",
+    )
     post.set_defaults(handler=generate_post)
 
     group = commands.add_parser("group", help="Generate a multi-model group composite (1..5 members)")

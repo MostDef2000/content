@@ -122,6 +122,10 @@
           <input id="candCount" type="number" value="8" min="1" max="20" />
           <label>Seed</label>
           <input id="candSeed" type="number" value="17023" />
+          <label>
+            <input type="checkbox" id="candUncensor" style="width:auto">
+            uncensor LoRA
+          </label>
           <div class="row" style="margin-top:10px">
             <button data-job="candidates">Сгенерировать</button>
           </div>
@@ -137,6 +141,10 @@
           <select id="expScene"></select>
           <label>Количество</label>
           <input id="expCount" type="number" value="8" min="1" max="20" />
+          <label>
+            <input type="checkbox" id="expUncensor" style="width:auto">
+            uncensor LoRA
+          </label>
           <div id="dsThumbs" class="thumbs"><span class="empty">— датасет пуст</span></div>
           <div class="row" style="margin-top:10px">
             <button data-job="expand">Расширить датасет</button>
@@ -213,6 +221,15 @@
           <button type="button" class="segbtn" data-postmode="private">Приватный</button>
         </div>
         <p class="mode-note">папка posts-private (превью доступно)</p>
+        <label>Движок</label>
+        <div class="seg" id="postEngineSeg">
+          <button type="button" class="segbtn active" data-postengine="flux">FLUX</button>
+          <button type="button" class="segbtn" data-postengine="sdxl">Pony SDXL</button>
+        </div>
+        <label id="postUncensorRow">
+          <input type="checkbox" id="postUncensor" style="width:auto">
+          uncensor LoRA (только FLUX)
+        </label>
         <label>Сцена (из пресетов/библиотеки, режим «post»)</label>
         <select id="postScene"></select>
         <label>Prompt (необязательно — иначе соберётся из профиля и сцены)</label>
@@ -417,6 +434,7 @@
       library: [],           // сцены из /api/library
       profileScenes: {},     // рабочая копия сцен профиля (id → text)
       postMode: "public",    // режим нового поста: public | private (Фаза 2)
+      postEngine: "flux",    // движок нового поста: flux | sdxl (Фаза 4)
       dataset: [],           // записи GET /api/models/<id>/dataset: [{filename, tag}]
       datasetStats: null,    // {total, captioned} из ответа dataset-эндпоинта
       datasetFilter: "all",  // клиентский фильтр грида: all | tasteful | explicit
@@ -999,6 +1017,15 @@
       };
     });
 
+    document.querySelectorAll("#postEngineSeg .segbtn").forEach((b) => {
+      b.onclick = () => {
+        state.postEngine = b.dataset.postengine;
+        document.querySelectorAll("#postEngineSeg .segbtn").forEach((x) => x.classList.toggle("active", x === b));
+        // uncensor для SDXL — no-op на бэкенде: просто прячем чекбокс без предупреждений
+        $("postUncensorRow").hidden = state.postEngine === "sdxl";
+      };
+    });
+
     document.querySelectorAll("#postsGallerySeg .segbtn").forEach((b) => {
       b.onclick = () => {
         state.galleryTab = b.dataset.gallery;
@@ -1251,12 +1278,12 @@
         try {
           let body = {};
           if (job === "candidates") {
-            body = { count: +$("candCount").value, seed: +$("candSeed").value };
+            body = { count: +$("candCount").value, seed: +$("candSeed").value, uncensor: $("candUncensor").checked };
             if ($("candScene").value) body.scene_id = $("candScene").value;
           }
           if (job === "expand") {
             if (!$("refSelect").value) { alert("Сначала сгенерируйте и выберите эталон."); return; }
-            body = { reference: $("refSelect").value, count: +$("expCount").value };
+            body = { reference: $("refSelect").value, count: +$("expCount").value, uncensor: $("expUncensor").checked };
             if ($("expScene").value) body.scene_id = $("expScene").value;
           }
           if (job === "post") {
@@ -1269,6 +1296,8 @@
               name: $("postName").value || undefined,
               seed: +$("postSeed").value,
               lora_strength: +$("postStrength").value,
+              engine: state.postEngine, // flux (default) | sdxl
+              uncensor: state.postEngine === "flux" && $("postUncensor").checked,
             };
             if (scene) body.scene_id = scene;
             if (prompt) body.prompt = prompt;

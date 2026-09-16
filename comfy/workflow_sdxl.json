@@ -1,0 +1,59 @@
+{
+  "6": {
+    "inputs": {
+      "text": "score_9, score_8_up, score_7_up, source_photo, Photorealistic Instagram fashion photograph of Valery, one 23-year-old fictional woman, champagne-blonde hair, clear blue eyes, tall athletic fitness physique, confident contemporary fitness fashion, tasteful and non-explicit, premium editorial lighting, realistic anatomy, natural skin texture, no text, no logo, no other person.",
+      "clip": ["30", 1]
+    },
+    "class_type": "CLIPTextEncode"
+  },
+  "8": {
+    "inputs": {
+      "samples": ["31", 0],
+      "vae": ["30", 2]
+    },
+    "class_type": "VAEDecode"
+  },
+  "9": {
+    "inputs": {
+      "filename_prefix": "posts/valery",
+      "images": ["8", 0]
+    },
+    "class_type": "SaveImage"
+  },
+  "27": {
+    "inputs": {
+      "width": 1024,
+      "height": 1280,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage"
+  },
+  "30": {
+    "inputs": {
+      "ckpt_name": "ponyDiffusionV6XL.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple"
+  },
+  "31": {
+    "inputs": {
+      "seed": 27191,
+      "steps": 28,
+      "cfg": 6.5,
+      "sampler_name": "dpmpp_2m",
+      "scheduler": "karras",
+      "denoise": 1.0,
+      "model": ["30", 0],
+      "positive": ["6", 0],
+      "negative": ["33", 0],
+      "latent_image": ["27", 0]
+    },
+    "class_type": "KSampler"
+  },
+  "33": {
+    "inputs": {
+      "text": "score_6, score_5, score_4, worst quality, low quality, blurry, deformed, watermark",
+      "clip": ["30", 1]
+    },
+    "class_type": "CLIPTextEncode"
+  }
+}
