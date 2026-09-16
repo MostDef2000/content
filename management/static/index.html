@@ -161,16 +161,6 @@
           <button data-job="train">Обучить LoRA</button>
         </div>
       </div>
-
-      <div class="card">
-        <h2>Готовые посты</h2>
-        <div class="seg" id="postsGallerySeg" style="margin:6px 0">
-          <button type="button" class="segbtn active" data-gallery="public">Public</button>
-          <button type="button" class="segbtn" data-gallery="private">Private</button>
-        </div>
-        <div id="posts" class="muted">—</div>
-        <div id="postsPrivate" hidden></div>
-      </div>
     </section>
 
     <!-- ======================= ДАТАСЕТ ======================= -->
@@ -254,7 +244,16 @@
           <button data-job="post">Сгенерировать пост</button>
         </div>
       </div>
-      <p class="muted">Готовые посты — в галерее на вкладке «Пайплайн».</p>
+
+      <div class="card">
+        <h2>Готовые посты</h2>
+        <div class="seg" id="postsGallerySeg" style="margin:6px 0">
+          <button type="button" class="segbtn active" data-gallery="public">Public</button>
+          <button type="button" class="segbtn" data-gallery="private">Private</button>
+        </div>
+        <div id="posts" class="muted">—</div>
+        <div id="postsPrivate" hidden></div>
+      </div>
     </section>
 
     <!-- ======================= ГРУППОВОЙ КАДР ======================= -->
