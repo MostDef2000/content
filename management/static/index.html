@@ -18,6 +18,8 @@
     .wrap { max-width:960px; margin:0 auto; padding:20px; display:grid; gap:16px; }
     /* hidden должен побеждать inline style="display:grid" на секциях, иначе вкладки не переключаются */
     section[hidden] { display: none !important; }
+    /* то же для сеток галерей: author display:grid перебивает UA [hidden] */
+    .ds-grid[hidden] { display: none !important; }
     .card { background:var(--card); border:1px solid #262a33; border-radius:12px; padding:16px; }
     .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
     button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:9px 14px; font-size:14px; cursor:pointer; }
@@ -251,8 +253,8 @@
           <button type="button" class="segbtn active" data-gallery="public">Public</button>
           <button type="button" class="segbtn" data-gallery="private">Private</button>
         </div>
-        <div id="posts" class="muted">—</div>
-        <div id="postsPrivate" hidden></div>
+        <div id="posts" class="muted ds-grid">—</div>
+        <div id="postsPrivate" class="ds-grid" hidden></div>
       </div>
     </section>
 
@@ -438,6 +440,7 @@
       dataset: [],           // записи GET /api/models/<id>/dataset: [{filename, tag}]
       datasetStats: null,    // {total, captioned} из ответа dataset-эндпоинта
       datasetFilter: "all",  // клиентский фильтр грида: all | tasteful | explicit
+      posts: [],             // публичные посты GET /api/posts (сетка миниатюр)
       postsPrivate: [],      // метаданные + превью GET /api/posts-private
       galleryTab: "public",  // подвкладка галереи: public | private
       models: [],            // полный список GET /api/models (для чипов группового кадра)
@@ -1035,23 +1038,54 @@
       };
     });
 
-    // Приватные посты: превью включено (решение владельца 16.09) — карточки
-    // как в public-галерее: img через fileUrl("posts-private", …) + лайтбокс.
+    // Галерея постов: сетка миниатюр (ds-grid) вместо вертикальных карточек.
+    // Клик по миниатюре — лайтбокс (превью приватных включено, решение 16.09).
+    // ✕ — мягкое удаление: DELETE /api/models/<id>/posts/<name>
+    //   ?kind=<public|private>&confirm=<name>  → папка в runtime/trash/posts/.
+    function postCard(x, kind) {
+      const kindDir = kind === "private" ? "posts-private" : "posts";
+      const img = x.photo
+        ? `<img src="${fileUrl(kindDir, x.name, x.photo)}" alt="${esc(x.name)}" title="${esc(x.name)}" loading="lazy" onclick="openLightbox(this.src)" onerror="this.remove()">`
+        : "";
+      const caption = x.caption
+        ? `<div class="muted" title="${esc(x.caption)}">${esc(truncate(x.caption, 40))}</div>`
+        : "";
+      return `<div class="ds-card">${img}<div class="row" style="justify-content:space-between"><span class="ds-name" title="${esc(x.name)}">${esc(truncate(x.name, 16))}</span><button type="button" class="ghost tagbtn" data-postdel="${esc(x.name)}" title="Удалить пост">✕</button></div>${caption}</div>`;
+    }
+
+    function bindPostDeletes(box, kind) {
+      box.querySelectorAll("button[data-postdel]").forEach((b) => {
+        b.onclick = () => deletePost(b.dataset.postdel, kind);
+      });
+    }
+
+    async function deletePost(name, kind) {
+      if (!state.activeId) return;
+      if (!confirm(`Удалить пост ${name}? Перенесётся в trash`)) return;
+      try {
+        await api("DELETE", `/api/models/${encodeURIComponent(state.activeId)}/posts/${encodeURIComponent(name)}?kind=${kind}&confirm=${encodeURIComponent(name)}`);
+      } catch (e) { alert("Ошибка удаления: " + e.message); return; }
+      refresh();
+    }
+
+    function renderPostsGrid() {
+      const box = $("posts");
+      if (!box) return;
+      const items = state.posts || [];
+      box.innerHTML = items.length ? items.map((x) => postCard(x, "public")).join("") : "—";
+      bindPostDeletes(box, "public");
+    }
+
+    // Приватные посты: та же сетка миниатюр + ✕ с kind=private;
+    // img через fileUrl("posts-private", …) + лайтбокс.
     function renderPostsPrivate() {
       const box = $("postsPrivate");
       if (!box) return;
       const items = state.postsPrivate || [];
-      const cards = items.length
-        ? items.map((x) => `
-            <div class="postcard" style="margin:6px 0">
-              ${x.photo ? `<img src="${fileUrl("posts-private", x.name, x.photo)}" alt="${esc(x.name)}" loading="lazy" onclick="openLightbox(this.src)" onerror="this.remove()">` : ""}
-              📁 <b>${esc(x.name)}</b>
-              ${x.caption ? `<div class="muted" style="margin-top:4px">caption: ${esc(truncate(x.caption, 200))}</div>` : ""}
-              ${x.prompt ? `<div class="muted" style="margin-top:2px">prompt: ${esc(truncate(x.prompt, 200))}</div>` : ""}
-              ${x.created ? `<div class="muted" style="margin-top:2px">created: ${esc(x.created)}</div>` : ""}
-            </div>`).join("")
+      box.innerHTML = items.length
+        ? items.map((x) => postCard(x, "private")).join("")
         : '<span class="muted">— приватных постов нет</span>';
-      box.innerHTML = cards;
+      bindPostDeletes(box, "private");
     }
 
     // ------------------------- групповой кадр (Фаза 3 #8) -------------------------
@@ -1219,9 +1253,8 @@
 
       try {
         const p = await api("GET", "/api/posts");
-        $("posts").innerHTML = p.posts.length
-          ? p.posts.map(x => `<div class="postcard" style="margin:6px 0">${x.photo ? `<img src="${fileUrl("posts", x.name, x.photo)}" alt="${esc(x.name)}" loading="lazy" onclick="openLightbox(this.src)" onerror="this.remove()">` : ""}📁 <b>${esc(x.name)}</b>${x.caption ? "<br><span class='muted'>" + esc(x.caption) + "</span>" : ""}</div>`).join("")
-          : "—";
+        state.posts = p.posts || [];
+        renderPostsGrid();
       } catch (e) {}
 
       // Датасет активной модели (Фаза 2): manifest-записи {filename, tag} + stats

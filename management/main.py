@@ -395,6 +395,45 @@ def set_model_reference(workspace: Path, model_id: str, filename: str) -> str:
     return filename
 
 
+def _safe_post_name(value: str) -> str:
+    """A post folder name: a plain basename only. A raw value that carries a
+    path (traversal like "../x") is rejected with 400 before _safe_name could
+    neutralise it — a decorated name must never resolve to a real post."""
+    raw = str(value or "").strip()
+    if not raw or raw != os.path.basename(raw):
+        raise HTTPException(status_code=400, detail="Unsafe name")
+    return _safe_name(raw)  # dot/hidden names → 400 as well
+
+
+def delete_model_post(workspace: Path, model_id: str, name: str, kind: str) -> str:
+    """Soft-delete one post folder: models/<id>/<kind_dir>/<name>/ →
+    runtime/trash/posts/<kind>-<name>-<unixts>/ (atomic os.replace, parents
+    created, "-2"/"-3" suffix on collision). kind "public" → "posts",
+    "private" → "posts-private". Raises HTTPException(422) for an invalid
+    kind, HTTPException(400) for an unsafe/traversal name and
+    HTTPException(404) when the post folder is missing. Returns the name."""
+    kind_dir = {"public": "posts", "private": "posts-private"}.get(kind)
+    if kind_dir is None:
+        raise HTTPException(status_code=422, detail="kind must be public or private")
+    name = _safe_post_name(name)
+    post_dir = workspace / "models" / model_id / kind_dir / name
+    if not post_dir.is_dir():
+        raise HTTPException(status_code=404, detail=f"post not found: {name}")
+    trash_dir = workspace / "runtime" / "trash" / "posts"
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    base_name = f"{kind}-{name}-{int(time.time())}"
+    trash_path = trash_dir / base_name
+    attempt = 2
+    while trash_path.exists():  # collision → "-2", "-3", ...
+        trash_path = trash_dir / f"{base_name}-{attempt}"
+        attempt += 1
+    try:
+        os.replace(post_dir, trash_path)  # atomic same-filesystem move (soft delete)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not move post to trash: {exc}")
+    return name
+
+
 def _model_or_404(model_id: str) -> dict[str, Any]:
     _validate_model_id(model_id)
     model = next((m for m in _load_registry().get("models", []) if str(m.get("id")) == model_id), None)
@@ -1517,3 +1556,23 @@ async def list_posts_private() -> dict[str, Any]:
             }
         )
     return {"posts": posts}
+
+
+@app.delete("/api/models/{model_id}/posts/{post_name}")
+async def delete_post(
+    model_id: str,
+    post_name: str,
+    kind: str = "public",
+    confirm: str = "",
+) -> dict[str, Any]:
+    """Soft-delete one post (kind: public → posts/, private →
+    posts-private/): the folder moves to runtime/trash/posts/ via
+    delete_model_post. confirm must equal the post name (wipe pattern)."""
+    _model_or_404(model_id)
+    if kind not in ("public", "private"):
+        raise HTTPException(status_code=422, detail="kind must be public or private")
+    name = _safe_post_name(post_name)  # traversal/empty/dot names → 400
+    if confirm != name:
+        raise HTTPException(status_code=400, detail="confirm must equal the post name")
+    delete_model_post(WORKSPACE, model_id, name, kind)
+    return {"ok": True, "deleted": name, "kind": kind}
