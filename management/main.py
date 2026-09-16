@@ -363,6 +363,36 @@ def _load_library() -> dict[str, Any]:
     return lib
 
 
+def set_model_reference(workspace: Path, model_id: str, filename: str) -> str:
+    """Hard-persist the selected reference: set ONLY the "reference" key of
+    models/<id>/character.json (every other field is preserved) and rewrite
+    the file atomically (tempfile + os.replace, same as the other writers).
+    The file must exist on disk in the model's reference/candidates/ (the
+    source of the UI reference picker) or in dataset/images/.
+    Raises HTTPException(400) for an empty name and HTTPException(404) when
+    the file or character.json is missing."""
+    filename = str(filename or "").strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="file must be a non-empty filename")
+    filename = _safe_name(filename)  # basename only — path traversal is impossible
+    folders = (
+        workspace / "models" / model_id / "reference" / "candidates",
+        workspace / "models" / model_id / "dataset" / "images",
+    )
+    if not any(folder.is_dir() and (folder / filename).is_file() for folder in folders):
+        raise HTTPException(status_code=404, detail=f"reference file not found: {filename}")
+    character_path = workspace / "models" / model_id / "character.json"
+    try:
+        character = json.loads(character_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise HTTPException(status_code=404, detail="character.json not found for model")
+    if not isinstance(character, dict):
+        raise HTTPException(status_code=404, detail="character.json not found for model")
+    character["reference"] = filename
+    _atomic_write_json(character_path, character)
+    return filename
+
+
 def _model_or_404(model_id: str) -> dict[str, Any]:
     _validate_model_id(model_id)
     model = next((m for m in _load_registry().get("models", []) if str(m.get("id")) == model_id), None)
@@ -640,7 +670,11 @@ async def get_prompt_profile(model_id: str | None = None) -> dict[str, Any]:
     profile = _load_profile(model_id)
     return {
         "model_id": model_id,
-        "character": {"name": character.get("name"), "age": character.get("age")},
+        "character": {
+            "name": character.get("name"),
+            "age": character.get("age"),
+            "reference": character.get("reference") or None,
+        },
         "profile": {
             "face": str(profile.get("face", "")),
             "body": str(profile.get("body", "")),
@@ -689,6 +723,16 @@ async def update_prompt_profile(payload: dict[str, Any]) -> dict[str, Any]:
     }
     _atomic_write_json(_model_dir(model_id) / "prompt_profile.json", profile)
     return {"ok": True, "profile": profile}
+
+
+@app.post("/api/models/{model_id}/reference")
+async def update_model_reference(model_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Persist the selected reference portrait (pipeline step 2 picker).
+    Hard persistence: only the "reference" key of character.json is updated,
+    so the selection survives F5 and the 5s refresh (defect: client state only)."""
+    _model_or_404(model_id)
+    reference = set_model_reference(WORKSPACE, model_id, str(payload.get("file", "")))
+    return {"ok": True, "reference": reference}
 
 
 # --------------------------------------------------------------------------- #

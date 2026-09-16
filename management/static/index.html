@@ -411,7 +411,8 @@
     const state = {
       activeId: null,        // активная модель (id) — источник для /files/<id>/...
       profileFor: null,      // для какой модели загружен профиль
-      refName: "",           // выбранный эталон (переживает refresh)
+      refName: "",           // выбранный эталон (переживает refresh; жёстко персистируется в character.json)
+      refModel: null,        // модель, к которой относится выбранный эталон (сброс при смене модели)
       presets: [],           // пресеты сцен из /api/prompt-profile
       library: [],           // сцены из /api/library
       profileScenes: {},     // рабочая копия сцен профиля (id → text)
@@ -571,6 +572,13 @@
       if (id && id !== state.activeId) activateModel(id);
     };
 
+    // Выбор эталона из дропдауна — тоже жёсткая персистентность (character.json).
+    $("refSelect").onchange = () => {
+      state.refName = $("refSelect").value;
+      state.refModel = state.activeId;
+      saveReference(state.refName);
+    };
+
     // ------------------------- статус -------------------------
     async function loadStatus() {
       try {
@@ -659,6 +667,15 @@
       try {
         const p = await api("GET", "/api/prompt-profile?model_id=" + encodeURIComponent(state.activeId));
         state.presets = p.presets || [];
+        // Эталон: восстанавливаем из character.json. Обновляем state только
+        // когда поле реально пришло; при смене модели — сброс на сохранённое
+        // значение новой модели (его может не быть — тогда "").
+        if (state.refModel !== p.model_id) {
+          state.refName = p.character?.reference || "";
+          state.refModel = p.model_id;
+        } else if (p.character?.reference) {
+          state.refName = p.character.reference;
+        }
         $("profCharacter").textContent = `Персонаж: ${p.character?.name ?? "?"} (${p.character?.age ?? "?"}) · модель ${p.model_id}`;
         $("profFace").value = p.profile.face;
         $("profBody").value = p.profile.body;
@@ -1117,6 +1134,22 @@
       } catch (e) { alert("Ошибка очистки датасета: " + e.message); }
     };
 
+    // Жёсткая персистентность эталона: POST /api/models/<id>/reference →
+    // character.json (только ключ "reference"). Fire-and-forget: при ошибке
+    // только console.error — выбор в текущей сессии не теряется.
+    function saveReference(filename) {
+      if (!state.activeId || !filename) return;
+      fetch(`/api/models/${encodeURIComponent(state.activeId)}/reference`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file: filename }),
+      })
+        .then((res) => {
+          if (!res.ok) return res.text().then((t) => console.error(`reference save failed: ${res.status} ${t}`));
+        })
+        .catch((e) => console.error("reference save failed:", e));
+    }
+
     // ------------------------- превью (активная модель) -------------------------
     async function refresh() {
       await loadStatus();
@@ -1125,12 +1158,23 @@
         const r = await api("GET", "/api/references");
         const sel = $("refSelect");
         sel.innerHTML = r.references.map(n => `<option>${esc(n)}</option>`).join("");
-        if (state.refName && r.references.includes(state.refName)) sel.value = state.refName;
+        // Восстановить сохранённый эталон, только если он ещё есть среди
+        // кандидатов и относится к активной модели; иначе — дефолт (первый).
+        // Так выделение НЕ сбрасывается при refresh (5s): сохранённое значение
+        // переживает и F5 (loadProfile подтягивает его из character.json).
+        if (state.refName && state.refModel === state.activeId && r.references.includes(state.refName)) {
+          sel.value = state.refName;
+        }
         state.refName = sel.value;
         renderThumbs(
           $("refThumbs"),
           r.references.map(n => ({ name: n, url: fileUrl("reference", n), selected: n === sel.value })),
-          (it) => { sel.value = it.name; state.refName = it.name; }
+          (it) => {
+            sel.value = it.name;
+            state.refName = it.name;
+            state.refModel = state.activeId;
+            saveReference(it.name); // жёсткая персистентность (fire-and-forget)
+          }
         );
       } catch (e) {}
 
