@@ -61,6 +61,34 @@ finally:
     else:
         os.environ["WORKSPACE"] = _PREV_WORKSPACE
 
+
+# In a shared pytest process management.main's module-level paths freeze at
+# first import (first file's temp WORKSPACE). Re-point them at THIS file's
+# temp WORKSPACE before the seeds below and re-bind per module at run time.
+def _bind_paths() -> None:
+    ws = Path(_TMP_WORKSPACE.name)
+    main.WORKSPACE = ws
+    main.JOBS_DIR = ws / "runtime" / "jobs"
+    main.MODELS_DIR = ws / "models"
+    main.REGISTRY_PATH = ws / "models" / "registry.json"
+    main.LIBRARY_PATH = ws / "models" / "library.json"
+    main.LORAS_DIR = ws / "runtime" / "models" / "loras"
+    main.TRASH_DIR = ws / "runtime" / "trash"
+    main.DATASET_TRASH = main.TRASH_DIR / "dataset"
+
+
+_bind_paths()  # direct runner: single file per process
+
+try:
+    import pytest
+
+    @pytest.fixture(scope="module", autouse=True)
+    def _bind_file_paths():
+        _bind_paths()
+        yield
+except ModuleNotFoundError:  # direct runner: pytest is optional
+    pass
+
 MODEL_ID = "m1"  # satisfies ^[a-z0-9][a-z0-9-]{1,62}$
 
 
@@ -182,8 +210,12 @@ def test_default_engine_is_flux():
 
 
 def test_valid_engine_sdxl():
-    fields = main._validate_engine_fields({"engine": "sdxl", "uncensor": True}, allow_engine=True)
-    assert fields == {"engine": "sdxl", "uncensor": True}
+    # sdxl + uncensor: True → 400 with FLUX detail
+    exc = _expect_http_status({"engine": "sdxl", "uncensor": True}, 400)
+    assert "движка FLUX" in exc.detail, exc.detail
+    # sdxl + uncensor: False/absent → success
+    fields = main._validate_engine_fields({"engine": "sdxl", "uncensor": False}, allow_engine=True)
+    assert fields == {"engine": "sdxl", "uncensor": False}
 
 
 def test_invalid_engine_400():
@@ -203,7 +235,7 @@ def test_engine_field_dropped_when_not_allowed():
     assert fields == {"engine": "flux", "uncensor": True}
 
 
-def test_post_cmd_contains_engine_sdxl_and_uncensor():
+def test_post_cmd_sdxl_without_uncensor():
     spy = _LaunchSpy()
     with _with_spy(spy):
         _run(
@@ -212,7 +244,7 @@ def test_post_cmd_contains_engine_sdxl_and_uncensor():
                     "caption": "a caption",
                     "prompt": "a quiet studio shot",
                     "engine": "sdxl",
-                    "uncensor": True,
+                    "uncensor": False,
                 }
             )
         )
@@ -220,8 +252,29 @@ def test_post_cmd_contains_engine_sdxl_and_uncensor():
     assert kind == "post" and model_id == MODEL_ID
     assert "--engine" in cmd, cmd
     assert cmd[cmd.index("--engine") + 1] == "sdxl", cmd
-    assert "--uncensor" in cmd, cmd
+    assert "--uncensor" not in cmd, cmd
     assert main.jobs[job_id]["engine"] == "sdxl"
+
+def test_post_sdxl_with_uncensor_400():
+    spy = _LaunchSpy()
+    with _with_spy(spy):
+        try:
+            _run(
+                main.job_post(
+                    {
+                        "caption": "a caption",
+                        "prompt": "a quiet studio shot",
+                        "engine": "sdxl",
+                        "uncensor": True,
+                    }
+                )
+            )
+        except main.HTTPException as exc:
+            assert exc.status_code == 400, exc.status_code
+            assert "движка FLUX" in exc.detail, exc.detail
+        else:
+            raise AssertionError("HTTPException(400) expected for sdxl post with uncensor")
+    assert spy.calls == [], "no job may be launched when sdxl post is 400ed by uncensor"
 
 
 def test_group_cmd_has_no_engine_or_uncensor():

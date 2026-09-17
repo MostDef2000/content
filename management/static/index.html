@@ -614,7 +614,7 @@
         $("ram").textContent = "ram: " + (s.ram_percent ?? "?") + "%";
         $("ram").className = "badge " + (s.ram_percent > 85 ? "down" : s.ram_percent > 60 ? "busy" : "up");
         if (s.vram) {
-          const vramPct = Math.round(s.vram.used / s.vram.total * 100 * 10) / 10;
+          const vramPct = s.vram.percent;
           $("vram").textContent = "vram: " + vramPct + "% (" + s.vram.used + "/" + s.vram.total + " MiB)";
           $("vram").className = "badge " + (vramPct > 85 ? "down" : vramPct > 60 ? "busy" : "up");
         } else {

@@ -41,6 +41,34 @@ finally:
     else:
         os.environ["WORKSPACE"] = _PREV_WORKSPACE
 
+
+# In a shared pytest process management.main's module-level paths freeze at
+# first import (first file's temp WORKSPACE). Re-point them at THIS file's
+# temp WORKSPACE before the seeds below and re-bind per module at run time.
+def _bind_paths() -> None:
+    ws = Path(_TMP_WORKSPACE.name)
+    main.WORKSPACE = ws
+    main.JOBS_DIR = ws / "runtime" / "jobs"
+    main.MODELS_DIR = ws / "models"
+    main.REGISTRY_PATH = ws / "models" / "registry.json"
+    main.LIBRARY_PATH = ws / "models" / "library.json"
+    main.LORAS_DIR = ws / "runtime" / "models" / "loras"
+    main.TRASH_DIR = ws / "runtime" / "trash"
+    main.DATASET_TRASH = main.TRASH_DIR / "dataset"
+
+
+_bind_paths()  # direct runner: single file per process
+
+try:
+    import pytest
+
+    @pytest.fixture(scope="module", autouse=True)
+    def _bind_file_paths():
+        _bind_paths()
+        yield
+except ModuleNotFoundError:  # direct runner: pytest is optional
+    pass
+
 MODEL_ID = "tst01"  # satisfies ^[a-z0-9][a-z0-9-]{1,62}$
 FIXED_TS = 1767225600  # 2026-01-01T00:00:00Z — frozen time.time for the collision test
 

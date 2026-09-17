@@ -594,12 +594,12 @@ async def status() -> dict[str, Any]:
     cpu = await asyncio.to_thread(_cpu_percent)
     vram = await asyncio.to_thread(_vram_usage)
     return {
-        "comfy_up": _comfy_up(),
+        "comfy_up": await asyncio.to_thread(_comfy_up),
         "comfy_url": COMFY_URL,
         "gpu_busy": busy,
         "disk_free_gb": _disk_free_gb(),
         "cpu_percent": cpu,
-        "ram_percent": _ram_percent(),
+        "ram_percent": await asyncio.to_thread(_ram_percent),
         "vram": vram,
         "active_jobs": [j for j in jobs.values() if j.get("status") == "running"],
         "active_model": _active_model_summary(_active_model()),
@@ -1221,6 +1221,8 @@ def _validate_engine_fields(payload: dict[str, Any], *, allow_engine: bool) -> d
         engine = str(payload.get("engine") or "flux").strip().lower()
         if engine not in POST_ENGINES:
             raise HTTPException(status_code=400, detail=f"engine must be one of {list(POST_ENGINES)}")
+        if engine == "sdxl" and payload.get("uncensor"):
+            raise HTTPException(status_code=400, detail="Параметр uncensor доступен только для движка FLUX")
     else:
         engine = "flux"
     uncensor = payload.get("uncensor", False)

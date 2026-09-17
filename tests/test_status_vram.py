@@ -107,6 +107,24 @@ def test_status_vram_null_when_nvidia_smi_unavailable():
     assert isinstance(payload["ram_percent"], float)
     assert isinstance(payload["active_jobs"], list)
 
+def test_status_vram_null_on_timeout():
+    with mock.patch.object(main.subprocess, "run", side_effect=subprocess.TimeoutExpired(["nvidia-smi"], 5)):
+        payload = _run(main.status())
+    assert payload["vram"] is None
+    assert set(payload) == EXPECTED_KEYS
+
+def test_status_vram_null_on_nonzero_returncode():
+    with mock.patch.object(main.subprocess, "run", return_value=subprocess.CompletedProcess(["nvidia-smi"], 1, stdout="", stderr="error")):
+        payload = _run(main.status())
+    assert payload["vram"] is None
+    assert set(payload) == EXPECTED_KEYS
+
+def test_status_vram_null_on_garbage_output():
+    with mock.patch.object(main.subprocess, "run", return_value=_fake_smi("not,a,number", "12288")):
+        payload = _run(main.status())
+    assert payload["vram"] is None
+    assert set(payload) == EXPECTED_KEYS
+
 
 if __name__ == "__main__":
     failures = 0
