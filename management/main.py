@@ -6,6 +6,7 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import urllib.error
@@ -159,6 +160,33 @@ def _ram_percent() -> float:
     total = info.get("MemTotal", 0)
     avail = info.get("MemAvailable", 0)
     return round((total - avail) / total * 100, 1) if total else 0.0
+
+
+def _vram_usage() -> dict[str, Any] | None:
+    """VRAM used/total in MiB from nvidia-smi; None when the tool is missing,
+    times out, or emits unexpected output, so /api/status degrades gracefully."""
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    lines = (proc.stdout or "").strip().splitlines()
+    if not lines:
+        return None
+    try:
+        used_s, total_s = (part.strip() for part in lines[0].split(",")[:2])
+        used, total = int(used_s), int(total_s)
+    except ValueError:
+        return None
+    if total <= 0:
+        return None
+    return {"used": used, "total": total, "percent": round(used / total * 100, 1)}
 
 
 # --------------------------------------------------------------------------- #
@@ -564,6 +592,7 @@ _ensure_registry()
 async def status() -> dict[str, Any]:
     busy = any(j.get("status") == "running" for j in jobs.values())
     cpu = await asyncio.to_thread(_cpu_percent)
+    vram = await asyncio.to_thread(_vram_usage)
     return {
         "comfy_up": _comfy_up(),
         "comfy_url": COMFY_URL,
@@ -571,6 +600,7 @@ async def status() -> dict[str, Any]:
         "disk_free_gb": _disk_free_gb(),
         "cpu_percent": cpu,
         "ram_percent": _ram_percent(),
+        "vram": vram,
         "active_jobs": [j for j in jobs.values() if j.get("status") == "running"],
         "active_model": _active_model_summary(_active_model()),
     }
