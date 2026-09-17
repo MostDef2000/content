@@ -3,7 +3,7 @@
 # runtime/train/<model id>.yaml before launching ai-toolkit.
 job: extension
 config:
-  name: "{{MODEL_ID}}_flux_v1"
+  name: "{{MODEL_ID}}_sdxl_v1"
   process:
     - type: sd_trainer
       training_folder: ../models/{{MODEL_ID}}/lora/output
@@ -24,7 +24,7 @@ config:
           caption_dropout_rate: 0.0
           shuffle_tokens: false
           cache_latents_to_disk: true
-          resolution: [512, 768]
+          resolution: 768
       train:
         batch_size: 1
         steps: 1500
@@ -32,7 +32,7 @@ config:
         train_unet: true
         train_text_encoder: false
         gradient_checkpointing: true
-        noise_scheduler: flowmatch
+        noise_scheduler: ddpm
         optimizer: adamw8bit
         lr: 0.0001
         skip_first_sample: true
@@ -41,10 +41,9 @@ config:
           use_ema: false
         dtype: bf16
       model:
-        name_or_path: black-forest-labs/FLUX.1-dev
-        is_flux: true
-        quantize: true
-        low_vram: true
+        name_or_path: ../runtime/models/checkpoints/ponyDiffusionV6XL.safetensors
+        arch: sdxl
+        dtype: bf16
 meta:
   name: "[name]"
   version: "1.0"

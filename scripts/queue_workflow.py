@@ -327,11 +327,12 @@ def generate_post(args: argparse.Namespace) -> None:
     if profile_path.exists():
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
 
-    # Fail fast before queuing anything if the trained LoRA is not deployed.
-    # Registry lora wins; older entries may lack it — fall back to the canonical
-    # <id>.safetensors name produced by scripts/train_lora.sh deployment.
-    # flux engine only: the SDXL (Pony) graph has no LoraLoader, so the
-    # character LoRA file is irrelevant for sdxl posts.
+    # Character LoRA preflight. Registry lora wins; older entries may lack
+    # it — fall back to the canonical <id>.safetensors name produced by
+    # scripts/train_lora.sh deployment. Both engines use the character LoRA
+    # (LoraLoaderModelOnly node "40"): the flux engine fails fast on a
+    # missing file, the sdxl (Pony) engine degrades gracefully (warn +
+    # straight checkpoint wire, handled in the sdxl branch below).
     registry_lora = str(entry.get("lora") or f"{model_id}.safetensors")
     if args.engine == "flux":
         lora_path = ROOT / "runtime" / "models" / "loras" / registry_lora
@@ -361,14 +362,25 @@ def generate_post(args: argparse.Namespace) -> None:
     if args.engine == "sdxl":
         # Pony (SDXL) txt2img: the same prompt-composition principle (character
         # + scene, guardrail phrase enforced upstream), wrapped in the pony
-        # quality-score prefix; fixed pony negative. The character LoRA is
-        # flux-specific, so the SDXL graph has no LoraLoader.
+        # quality-score prefix; fixed pony negative.
         positive = f"{SDXL_POSITIVE_PREFIX}, {positive}"
         workflow = load_workflow("sdxl")
         workflow["6"]["inputs"]["text"] = positive
         workflow["31"]["inputs"]["seed"] = args.seed
         workflow["9"]["inputs"]["filename_prefix"] = f"posts/{model_id}"
         set_negative(workflow, SDXL_NEGATIVE)
+        # Character LoRA (node "40") for the Pony engine too. Unlike flux this
+        # is graceful: without a trained LoRA the post runs without identity
+        # (graph rewired straight from the checkpoint), not an error.
+        sdxl_lora_path = ROOT / "runtime" / "models" / "loras" / registry_lora
+        if sdxl_lora_path.is_file():
+            workflow["40"]["inputs"]["lora_name"] = registry_lora
+            workflow["40"]["inputs"]["strength_model"] = args.lora_strength
+        else:
+            print(f"LoRA {model_id} не найдена — пост будет без идентичности (обучи через „Обучить LoRA“)")
+            workflow["31"]["inputs"]["model"] = ["30", 0]
+            # "40" is dropped from the graph: ComfyUI validates every node of the submitted prompt.
+            workflow.pop("40", None)
     else:
         workflow = load_workflow("flux_lora")
         if args.uncensor:

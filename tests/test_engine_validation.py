@@ -5,8 +5,16 @@ invalid engine 400, non-bool uncensor 400, engine field dropped when
 allow_engine=False) and the cmd lines built by the job endpoints: post carries
 --engine sdxl (plus --uncensor when true) and the job record gains "engine",
 while group carries neither flag. Also covers the flux-LoRA gating: a missing
-LoRA file must 400 a flux post but not an sdxl post (the SDXL graph has no
- LoraLoader), and candidates/expand carry --uncensor when requested.
+LoRA file must 400 a flux post but not an sdxl post (the sdxl graph does carry
+ a LoraLoaderModelOnly "40", but the engine is graceful: without the file the
+ node is dropped from the graph), and candidates/expand carry --uncensor when
+ requested. Also covers the sdxl side of the character-LoRA story at the
+ queue_workflow level: workflow_sdxl.json wires a model-only LoraLoaderModelOnly
+ (node "40") into the KSampler, an sdxl post with a deployed LoRA file sends
+ node "40" with the registry lora name and the requested strength, and an
+ sdxl post WITHOUT a LoRA file stays graceful (graph rewired straight from the
+ checkpoint, post still produced). Plus the SDXL/Pony training template
+ (lora/train_config.template.yaml: arch sdxl + ddpm, no flux-only knobs).
 Also covers the optional post caption: an empty/absent caption no longer 400s,
 the cmd still carries --caption "" (group keeps the required caption), the job
 record stores null for an empty caption, and queue_workflow.generate_post skips
@@ -227,9 +235,9 @@ def test_group_cmd_has_no_engine_or_uncensor():
 
 
 def test_post_sdxl_no_lora_file_ok():
-    # The SDXL (Pony) graph has no LoraLoader: a missing character LoRA must
-    # not 400 an sdxl post (defect: sdxl posts were blocked until a FLUX LoRA
-    # was trained).
+    # The SDXL (Pony) engine degrades gracefully: a missing character LoRA
+    # must not 400 an sdxl post (defect: sdxl posts were blocked until a FLUX
+    # LoRA was trained).
     spy = _LaunchSpy()
     with _without_lora_stub(), _with_spy(spy):
         result = _run(
@@ -536,6 +544,158 @@ def test_generate_post_filled_caption_writes_file():
     assert result["has_photo"]
     assert result["caption_text"] == "my caption\n", result["caption_text"]
     assert result["has_prompt"]
+
+
+SDXL_MODEL_ID = "pm-sdxl"  # satisfies the registry id pattern, isolated from the flux stubs
+
+
+def _run_generate_post_sdxl(*, with_lora: bool, lora_strength: float = 0.65) -> dict:
+    """Run queue_workflow.generate_post (engine=sdxl) in a temp ROOT with a
+    stubbed queue_and_wait; return the workflow facts captured at queue time
+    plus the created post folder (snapshot taken before the temp tree is
+    cleaned up). The SDXL checkpoint preflight reads the module-level
+    SDXL_CKPT_PATH (bound to the real ROOT at import time), so it is patched
+    to a stub in the temp tree as well."""
+    import argparse
+
+    with tempfile.TemporaryDirectory(prefix="gw-post-sdxl-") as tmp:
+        root = Path(tmp) / "repo"
+        out_root = Path(tmp) / "comfy-output"
+        (root / "models" / SDXL_MODEL_ID).mkdir(parents=True)
+        (root / "models" / "registry.json").write_text(
+            json.dumps(
+                {"version": 1, "models": [{"id": SDXL_MODEL_ID, "active": True, "lora": f"{SDXL_MODEL_ID}.safetensors"}]}
+            ),
+            encoding="utf-8",
+        )
+        (root / "models" / SDXL_MODEL_ID / "character.json").write_text(
+            json.dumps({"name": "Valery", "age": 23}), encoding="utf-8"
+        )
+        loras = root / "runtime" / "models" / "loras"
+        loras.mkdir(parents=True)
+        if with_lora:
+            (loras / f"{SDXL_MODEL_ID}.safetensors").write_bytes(b"")  # existence is what matters
+        ckpt = root / "runtime" / "models" / "checkpoints" / "ponyDiffusionV6XL.safetensors"
+        ckpt.parent.mkdir(parents=True)
+        ckpt.write_bytes(b"")  # sdxl preflight: the checkpoint must exist
+        (root / "comfy").mkdir(parents=True)
+        # Minimal sdxl graph: CheckpointLoaderSimple "30" → LoraLoaderModelOnly
+        # "40" → KSampler "31"; CLIPTextEncode "6"/"33" on the checkpoint;
+        # SaveImage "9".
+        (root / "comfy" / "workflow_sdxl.json").write_text(
+            json.dumps(
+                {
+                    "30": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "ponyDiffusionV6XL.safetensors"}},
+                    "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["30", 1]}},
+                    "31": {"class_type": "KSampler", "inputs": {"seed": 0, "model": ["40", 0]}},
+                    "33": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["30", 1]}},
+                    "40": {
+                        "class_type": "LoraLoaderModelOnly",
+                        "inputs": {"lora_name": "placeholder.safetensors", "strength_model": 0.0, "model": ["30", 0]},
+                    },
+                    "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": ""}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        out_root.mkdir(parents=True)
+        (out_root / "photo.png").write_bytes(b"stub")
+
+        captured: dict = {}
+
+        def _fake_queue(url: str, workflow: dict) -> list:
+            captured["workflow"] = workflow
+            return [{"subfolder": "", "filename": "photo.png"}]
+
+        original_root = queue_workflow.ROOT
+        original_out_root = queue_workflow.OUTPUT_ROOT
+        original_queue = queue_workflow.queue_and_wait
+        original_ckpt = queue_workflow.SDXL_CKPT_PATH
+        queue_workflow.ROOT = root
+        queue_workflow.OUTPUT_ROOT = out_root
+        queue_workflow.queue_and_wait = _fake_queue
+        queue_workflow.SDXL_CKPT_PATH = ckpt
+        try:
+            queue_workflow.generate_post(
+                argparse.Namespace(
+                    model_id=SDXL_MODEL_ID,
+                    engine="sdxl",
+                    uncensor=False,
+                    prompt="",
+                    negative="",
+                    caption="",
+                    name="sdxl-post",
+                    seed=1,
+                    lora_strength=lora_strength,
+                    mode="public",
+                    url="http://127.0.0.1:9",
+                )
+            )
+            destination = root / "models" / SDXL_MODEL_ID / "posts" / "sdxl-post"
+            return {
+                "destination_exists": destination.is_dir(),
+                "has_photo": (destination / "photo.png").is_file(),
+                # The workflow dict itself outlives the temp tree (it is a
+                # plain in-memory object), so the test can inspect it directly.
+                "workflow": captured.get("workflow"),
+            }
+        finally:
+            queue_workflow.ROOT = original_root
+            queue_workflow.OUTPUT_ROOT = original_out_root
+            queue_workflow.queue_and_wait = original_queue
+            queue_workflow.SDXL_CKPT_PATH = original_ckpt
+
+
+def test_generate_post_sdxl_with_lora_wires_lora_loader():
+    # The SDXL (Pony) graph carries the character LoRA too: with the file
+    # deployed, node "40" must send the registry lora name with the requested
+    # (non-default) strength and the KSampler stays wired through it.
+    result = _run_generate_post_sdxl(with_lora=True, lora_strength=0.65)
+    assert result["destination_exists"] and result["has_photo"], result
+    workflow = result["workflow"]
+    assert workflow is not None, "queue_and_wait must have been called"
+    assert workflow["40"]["inputs"]["lora_name"] == f"{SDXL_MODEL_ID}.safetensors"
+    assert workflow["40"]["inputs"]["strength_model"] == 0.65
+    assert workflow["31"]["inputs"]["model"] == ["40", 0]
+
+
+def test_generate_post_sdxl_without_lora_rewires_to_checkpoint():
+    # No trained LoRA: the sdxl post must NOT fail (unlike flux, which is
+    # fail-fast). The graph is rewired straight from the checkpoint
+    # (KSampler ← "30"), node "40" is dropped from the graph (ComfyUI
+    # validates every node of the submitted prompt), and the post is
+    # produced without identity.
+    result = _run_generate_post_sdxl(with_lora=False)
+    assert result["destination_exists"] and result["has_photo"], "sdxl post must succeed without a LoRA"
+    workflow = result["workflow"]
+    assert workflow is not None, "queue_and_wait must have been called"
+    assert workflow["31"]["inputs"]["model"] == ["30", 0]
+    # The LoraLoader node must not reach ComfyUI at all: its lora_name would
+    # fail validation while the file is missing.
+    assert "40" not in workflow
+
+
+def test_sdxl_workflow_lora_loader_wired():
+    # comfy/workflow_sdxl.json ships the character LoRA in the model chain:
+    # CheckpointLoaderSimple "30" → LoraLoaderModelOnly "40" → KSampler "31".
+    # Model-only LoRA: the CLIP nodes ("6"/"33") stay on the checkpoint.
+    workflow = json.loads((REPO_ROOT / "comfy" / "workflow_sdxl.json").read_text(encoding="utf-8"))
+    assert workflow["40"]["class_type"] == "LoraLoaderModelOnly"
+    assert workflow["40"]["inputs"]["model"] == ["30", 0]
+    assert workflow["31"]["inputs"]["model"] == ["40", 0]
+    assert workflow["6"]["inputs"]["clip"] == ["30", 1]
+    assert workflow["33"]["inputs"]["clip"] == ["30", 1]
+
+
+def test_train_config_template_is_sdxl_pony():
+    # The training template targets the SDXL (Pony) engine (FLUX training
+    # track closed — the model does not fit the card): arch sdxl + explicit
+    # ddpm noise scheduler, and no flux-only knobs.
+    template = (REPO_ROOT / "lora" / "train_config.template.yaml").read_text(encoding="utf-8")
+    assert "arch: sdxl" in template
+    assert "noise_scheduler: ddpm" in template
+    for forbidden in ("is_flux", "quantize", "flowmatch", "low_vram"):
+        assert forbidden not in template, f"{forbidden!r} must not appear in the SDXL training template"
 
 
 def test_library_scene_texts_mode_filter_and_bad_inputs():

@@ -1286,9 +1286,11 @@ async def job_post(payload: dict[str, Any]) -> dict[str, Any]:
     model_id = str(model["id"])
     engine_fields = _validate_engine_fields(payload, allow_engine=True)
     engine = engine_fields["engine"]
-    # The character LoRA file is required only for the flux engine: the SDXL
-    # (Pony) graph has no LoraLoader, so sdxl posts must not 400 on a missing
-    # LoRA (mirrored by the preflight in scripts/queue_workflow.py).
+    # The character LoRA file is required only for the flux engine: the sdxl
+    # (Pony) graph does carry a LoraLoaderModelOnly "40", wired in only when
+    # the LoRA file exists (graceful: the node is dropped otherwise), so sdxl
+    # posts must not 400 on a missing LoRA (mirrored by the preflight in
+    # scripts/queue_workflow.py).
     if engine == "flux":
         # Registry lora wins; older entries may lack it — fall back to the
         # canonical <id>.safetensors name produced by scripts/train_lora.sh
