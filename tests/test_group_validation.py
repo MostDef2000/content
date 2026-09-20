@@ -1,7 +1,9 @@
 """Import-safe tests for management.main._validate_group_payload (feature 007,
 group-photos): the pure validation helper behind POST /api/jobs/group.
 Covers the happy path passthrough, model-count/uniqueness 422s, unknown-model
-404, missing-LoRA 400, caption rules, the prompt/scene_id XOR, layout/mode
+404, missing-FLUX-LoRA 400 (dual-arch: the group resolves each member's FLUX
+slot "lora_flux", fallback <id>-flux.safetensors), the SDXL-arch-in-FLUX-slot
+backstop 400, caption rules, the prompt/scene_id XOR, layout/mode
 allowlists, scene resolution from models/library.json and the post-name
 collision 409. pytest-compatible; pytest is not required.
 
@@ -71,7 +73,7 @@ except ModuleNotFoundError:  # direct runner: pytest is optional
     pass
 
 
-def _model_entry(model_id: str, lora: str, *, active: bool) -> dict:
+def _model_entry(model_id: str, lora: str, *, active: bool, lora_flux: str | None = None) -> dict:
     return {
         "id": model_id,
         "name": model_id,
@@ -81,21 +83,24 @@ def _model_entry(model_id: str, lora: str, *, active: bool) -> dict:
         "active": active,
         "created": "2026-01-01T00:00:00Z",
         "lora": lora,
+        "lora_flux": lora_flux,
         "groups": [],
     }
 
 
 # Fixture (written after import; main re-reads the registry/library from disk
-# on every call). m3 exists in the registry but its LoRA file is absent from
-# LORAS_DIR — that is the missing-LoRA case.
+# on every call). m1/m2 carry both LoRA slots (empty flux stubs: arch None →
+# fail-open). m3 exists in the registry with only the SDXL slot ("lora") and
+# NO "lora_flux" key at all — its FLUX-slot file (fallback name
+# m3-flux.safetensors) is absent from LORAS_DIR: the missing-FLUX-LoRA case.
 main.REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
 main.REGISTRY_PATH.write_text(
     json.dumps(
         {
             "version": 1,
             "models": [
-                _model_entry("m1", "m1.safetensors", active=True),
-                _model_entry("m2", "m2.safetensors", active=False),
+                _model_entry("m1", "m1.safetensors", active=True, lora_flux="m1-flux.safetensors"),
+                _model_entry("m2", "m2.safetensors", active=False, lora_flux="m2-flux.safetensors"),
                 _model_entry("m3", "m3.safetensors", active=False),
             ],
         },
@@ -107,6 +112,8 @@ main.REGISTRY_PATH.write_text(
 main.LORAS_DIR.mkdir(parents=True, exist_ok=True)
 (main.LORAS_DIR / "m1.safetensors").write_bytes(b"")  # empty stubs: existence is what matters
 (main.LORAS_DIR / "m2.safetensors").write_bytes(b"")
+(main.LORAS_DIR / "m1-flux.safetensors").write_bytes(b"")
+(main.LORAS_DIR / "m2-flux.safetensors").write_bytes(b"")
 SCENE_TEXT = "a quiet studio shot"
 main.LIBRARY_PATH.write_text(
     json.dumps({"version": 1, "scenes": [{"id": "sc1", "name": "Studio",
@@ -176,16 +183,44 @@ def test_unknown_model_404():
 
 
 def test_member_without_lora_file_400():
-    # m3 is in the registry but m3.safetensors is absent from LORAS_DIR
+    # m3 has only the SDXL slot ("lora") and no "lora_flux" at all: the group
+    # (FLUX-only) resolves the FLUX slot to the fallback m3-flux.safetensors,
+    # which is absent from LORAS_DIR → 400.
     exc = _expect_http_status(_valid_payload(models=["m1", "m3"]), 400)
     assert "LoRA" in exc.detail, exc.detail
+    assert "FLUX" in exc.detail, exc.detail
+
+
+def test_group_member_without_flux_lora_400():
+    # A member fine for SDXL posts (SDXL slot deployed) but without a FLUX
+    # slot: the group (FLUX-only) must 400 with the model id and "FLUX" in the
+    # detail (the fallback <id>-flux.safetensors file does not exist either).
+    seed = json.loads(main.REGISTRY_PATH.read_text(encoding="utf-8"))
+    models = [
+        {**entry, "lora_flux": None} if entry.get("id") == "m1" else entry
+        for entry in seed["models"]
+    ]
+    main.REGISTRY_PATH.write_text(json.dumps({"version": 1, "models": models}), encoding="utf-8")
+    stub = main.LORAS_DIR / "m1-flux.safetensors"
+    stub_existed = stub.is_file()
+    if stub_existed:
+        stub.unlink()
+    try:
+        exc = _expect_http_status(_valid_payload(models=["m1", "m2"]), 400)
+        assert "m1" in exc.detail, exc.detail
+        assert "FLUX" in exc.detail, exc.detail
+    finally:
+        main.REGISTRY_PATH.write_text(json.dumps(seed), encoding="utf-8")
+        if stub_existed:
+            stub.write_bytes(b"")
 
 
 def test_group_member_with_sdxl_lora_400():
-    # Group shots are FLUX-only: a member whose LoRA is SDXL-arch (unet keys
-    # in the safetensors header) must 400 with the model id and "SDXL" in the
-    # detail (empty/corrupt stubs stay fail-open → arch None → pass).
-    stub = main.LORAS_DIR / "m1.safetensors"
+    # Group shots are FLUX-only: a member whose FLUX-slot LoRA is SDXL-arch
+    # (unet keys in the safetensors header of m1-flux.safetensors) must 400
+    # with the model id and "SDXL" in the detail (empty/corrupt stubs stay
+    # fail-open → arch None → pass).
+    stub = main.LORAS_DIR / "m1-flux.safetensors"
     header = json.dumps(
         {"lora_unet_down_blocks_0_attentions_0_to_k.lora_down.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
     ).encode("utf-8")

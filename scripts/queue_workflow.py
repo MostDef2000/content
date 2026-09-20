@@ -327,20 +327,26 @@ def generate_post(args: argparse.Namespace) -> None:
     if profile_path.exists():
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
 
-    # Character LoRA preflight. Registry lora wins; older entries may lack
-    # it — fall back to the canonical <id>.safetensors name produced by
-    # scripts/train_lora.sh deployment. Both engines use the character LoRA
-    # (LoraLoaderModelOnly node "40"): the flux engine fails fast on a
-    # missing file, the sdxl (Pony) engine degrades gracefully (warn +
-    # straight checkpoint wire, handled in the sdxl branch below).
-    registry_lora = str(entry.get("lora") or f"{model_id}.safetensors")
+    # Character LoRA preflight, resolved per engine (dual-arch slots): the
+    # flux engine consumes the FLUX slot ("lora_flux", fallback the canonical
+    # <id>-flux.safetensors name), the sdxl (Pony) engine the SDXL slot
+    # ("lora", fallback <id>.safetensors) — both as produced by
+    # scripts/train_lora.sh <id> <arch> deployment. Older registry entries may
+    # lack the slot key — the fallback name applies. Both engines use the
+    # character LoRA (LoraLoaderModelOnly node "40"): the flux engine fails
+    # fast on a missing file, the sdxl (Pony) engine degrades gracefully (warn
+    # + straight checkpoint wire, handled in the sdxl branch below).
+    if args.engine == "flux":
+        registry_lora = str(entry.get("lora_flux") or f"{model_id}-flux.safetensors")
+    else:
+        registry_lora = str(entry.get("lora") or f"{model_id}.safetensors")
     if args.engine == "flux":
         lora_path = ROOT / "runtime" / "models" / "loras" / registry_lora
         if not lora_path.is_file():
             raise FileNotFoundError(
                 f"LoRA for model {model_id!r} is not available: expected {lora_path} "
-                f"(registry lora: {entry.get('lora')!r}). Train it with "
-                f"'scripts/train_lora.sh {model_id}' and copy the .safetensors into "
+                f"(registry lora_flux: {entry.get('lora_flux')!r}). Train it with "
+                f"'scripts/train_lora.sh {model_id} flux' and copy the .safetensors into "
                 "runtime/models/loras/."
             )
 
@@ -483,15 +489,16 @@ def generate_group(args: argparse.Namespace) -> None:
         profile: dict[str, Any] = {}
         if profile_path.exists():
             profile = json.loads(profile_path.read_text(encoding="utf-8"))
-        # Registry lora wins; older entries may lack it — fall back to the
-        # canonical <id>.safetensors name (same rule as generate_post).
-        registry_lora = str(entry.get("lora") or f"{member_id}.safetensors")
+        # Group shots are FLUX-only: every member consumes its FLUX slot
+        # ("lora_flux", fallback the canonical <id>-flux.safetensors name —
+        # same rule as generate_post's flux branch).
+        registry_lora = str(entry.get("lora_flux") or f"{member_id}-flux.safetensors")
         lora_path = ROOT / "runtime" / "models" / "loras" / registry_lora
         if not lora_path.is_file():
             raise FileNotFoundError(
                 f"LoRA for model {member_id!r} is not available: expected {lora_path} "
-                f"(registry lora: {entry.get('lora')!r}). Train it with "
-                f"'scripts/train_lora.sh {member_id}' and copy the .safetensors into "
+                f"(registry lora_flux: {entry.get('lora_flux')!r}). Train it with "
+                f"'scripts/train_lora.sh {member_id} flux' and copy the .safetensors into "
                 "runtime/models/loras/."
             )
         plans.append(

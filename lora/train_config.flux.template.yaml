@@ -1,0 +1,59 @@
+---
+# FLUX (dual-arch) training template: rendered by `scripts/train_lora.sh <id> flux`
+# ({{MODEL_ID}} -> <model id>) to runtime/train/<id>_flux.yaml before launching
+# ai-toolkit; the trained checkpoint is deployed to
+# runtime/models/loras/<id>-flux.safetensors (registry slot "lora_flux").
+# Low-VRAM track for the 12 GB card (FLUX.1-dev does not fit unquantized).
+job: extension
+config:
+  name: "{{MODEL_ID}}_flux_v1"
+  process:
+    - type: sd_trainer
+      training_folder: ../models/{{MODEL_ID}}/lora/output
+      device: cuda:0
+      trigger_word: "{{MODEL_ID}}"
+      network:
+        type: lora
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: float16
+        save_every: 250
+        max_step_saves_to_keep: 4
+        push_to_hub: false
+      datasets:
+        - folder_path: ../models/{{MODEL_ID}}/dataset/images
+          caption_ext: txt
+          caption_dropout_rate: 0.0
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [512, 768]
+      train:
+        batch_size: 1
+        steps: 1500
+        gradient_accumulation_steps: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: flowmatch
+        optimizer: adamw8bit
+        lr: 0.0001
+        skip_first_sample: true
+        disable_sampling: true
+        ema_config:
+          use_ema: false
+        dtype: bf16
+      model:
+        name_or_path: black-forest-labs/FLUX.1-dev
+        is_flux: true
+        # Low-VRAM block (12 GB card): quantize the base FLUX transformer to
+        # fp8. VERIFY the "fp8_base" key against the ai-toolkit source ON THE
+        # SERVER before a real run — the toolkit source is not available in
+        # this repo; an unrecognized key makes ai-toolkit fail fast at startup
+        # (which is the safe outcome: nothing is trained on a broken config).
+        fp8_base: true
+        quantize: true
+        low_vram: true
+meta:
+  name: "[name]"
+  version: "1.0"

@@ -23,7 +23,12 @@ Plus the LoRA-architecture trap (issue #2 п.15): _lora_arch sniffs the
 safetensors header (unet keys → sdxl, transformer keys → flux, else None),
 a flux post with an SDXL-arch LoRA 400s (and an sdxl post with a FLUX-arch
 LoRA), matching-arch posts launch, undetectable arch stays fail-open, and
-_active_model_summary reports the arch as the recommended "engine".
+_active_model_summary reports the deployed slot as the recommended "engine".
+Plus the dual-arch LoRA slots: the flux engine consumes the "lora_flux" slot
+(<id>-flux.safetensors) and the sdxl engine the "lora" slot (<id>.safetensors)
+— _lora_name_for_engine resolution, flux-post gating per slot, the SDXL-arch
+backstop inside the FLUX slot, the summary engine per deployed slot, and the
+train-start arch seam (default sdxl, flux cmd + registry slot, bogus 400).
 pytest-compatible; pytest is not required.
 
 Run either way:
@@ -223,6 +228,64 @@ def _without_lora_stub():
     return _patched()
 
 
+# --------------------------------------------------------------------------- #
+# Dual-arch (FLUX slot) helpers. The module seed stays single-slot (m1 with
+# "lora": <id>.safetensors, no "lora_flux") — flux-slot tests rewrite the
+# registry per test and restore the seed JSON afterwards.
+# --------------------------------------------------------------------------- #
+_SEED_REGISTRY_JSON = main.REGISTRY_PATH.read_text(encoding="utf-8")
+_FLUX_LORA = f"{MODEL_ID}-flux.safetensors"
+
+
+def _seed_entry(**overrides) -> dict:
+    """The seed registry entry for MODEL_ID with per-test overrides."""
+    entry = {
+        "id": MODEL_ID,
+        "name": "Valery",
+        "age": 23,
+        "height_cm": 178,
+        "tags": [],
+        "active": True,
+        "created": "2026-01-01T00:00:00Z",
+        "lora": f"{MODEL_ID}.safetensors",
+        "groups": [],
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _with_registry(models: list[dict]):
+    """Temporarily replace the registry with the given models list; the seed
+    JSON is restored after the block (self-sufficient tests)."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _patched():
+        main.REGISTRY_PATH.write_text(
+            json.dumps({"version": 1, "models": models}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        try:
+            yield
+        finally:
+            main.REGISTRY_PATH.write_text(_SEED_REGISTRY_JSON, encoding="utf-8")
+
+    return _patched()
+
+
+def _write_flux_stub(keys: list[str]) -> None:
+    """Write a minimal SAFETENSORS file with the given tensor keys into the
+    FLUX slot (m1-flux.safetensors)."""
+    header = json.dumps(
+        {k: {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]} for k in keys}
+    ).encode("utf-8")
+    (main.LORAS_DIR / _FLUX_LORA).write_bytes(struct.pack("<Q", len(header)) + header + b"\x00" * 4)
+
+
+def _remove_flux_stub() -> None:
+    (main.LORAS_DIR / _FLUX_LORA).unlink(missing_ok=True)
+
+
 def test_default_engine_is_flux():
     fields = main._validate_engine_fields({}, allow_engine=True)
     assert fields == {"engine": "flux", "uncensor": False}
@@ -298,15 +361,15 @@ def test_post_sdxl_with_uncensor_400():
     assert spy.calls == [], "no job may be launched when sdxl post is 400ed by uncensor"
 
 
-def test_post_flux_with_sdxl_lora_400():
-    # Engine trap (issue #2 п.15): the LoRA is trained with the SDXL
-    # architecture (unet keys) but the post defaults to FLUX — ComfyUI would
-    # silently ignore the SDXL deltas on the FLUX transformer. A flux post
-    # with an SDXL-arch LoRA must 400 and launch nothing.
+def test_post_flux_sdxl_arch_in_flux_slot_400():
+    # Engine trap (issue #2 п.15), dual-arch backstop: an SDXL-arch LoRA
+    # (unet keys) deployed into the FLUX slot must 400 a flux post — ComfyUI
+    # would silently ignore the SDXL deltas on the FLUX transformer. A flux
+    # post with it must 400 and launch nothing.
     spy = _LaunchSpy()
     try:
-        _write_lora_stub(["lora_unet_down_blocks_0_attentions_0_to_k.lora_down.weight"])
-        with _with_spy(spy):
+        _write_flux_stub(["lora_unet_down_blocks_0_attentions_0_to_k.lora_down.weight"])
+        with _with_registry([_seed_entry(lora_flux=_FLUX_LORA)]), _with_spy(spy):
             try:
                 _run(
                     main.job_post(
@@ -321,10 +384,10 @@ def test_post_flux_with_sdxl_lora_400():
                 assert exc.status_code == 400, exc.status_code
                 assert "SDXL" in exc.detail, exc.detail
             else:
-                raise AssertionError("HTTPException(400) expected for flux post with an SDXL-arch LoRA")
+                raise AssertionError("HTTPException(400) expected for flux post with an SDXL-arch LoRA in the FLUX slot")
         assert spy.calls == [], "no job may be launched when the flux post is 400ed by the LoRA arch"
     finally:
-        _reset_lora_stub()
+        _remove_flux_stub()
 
 
 def test_post_sdxl_with_flux_lora_400():
@@ -381,12 +444,12 @@ def test_post_sdxl_with_sdxl_lora_ok():
 
 
 def test_post_flux_with_flux_lora_ok():
-    # Matching arch: a FLUX-arch LoRA passes the flux post — the job launches
-    # with --engine flux.
+    # Matching arch: a FLUX-arch LoRA in the FLUX slot passes the flux post —
+    # the job launches with --engine flux.
     spy = _LaunchSpy()
     try:
-        _write_lora_stub(["lora_transformer_blocks_0_attn.to_k.lora_down.weight"])
-        with _with_spy(spy):
+        _write_flux_stub(["lora_transformer_blocks_0_attn.to_k.lora_down.weight"])
+        with _with_registry([_seed_entry(lora_flux=_FLUX_LORA)]), _with_spy(spy):
             _run(
                 main.job_post(
                     {
@@ -401,7 +464,72 @@ def test_post_flux_with_flux_lora_ok():
         assert "--engine" in cmd, cmd
         assert cmd[cmd.index("--engine") + 1] == "flux", cmd
     finally:
-        _reset_lora_stub()
+        _remove_flux_stub()
+
+
+def test_lora_name_for_engine():
+    # Pure slot resolver: sdxl → registry "lora" (fallback <id>.safetensors),
+    # flux → registry "lora_flux" (fallback <id>-flux.safetensors).
+    assert main._lora_name_for_engine({"id": MODEL_ID, "lora": "custom.safetensors"}, "sdxl") == "custom.safetensors"
+    assert main._lora_name_for_engine({"id": MODEL_ID}, "sdxl") == f"{MODEL_ID}.safetensors"
+    assert (
+        main._lora_name_for_engine({"id": MODEL_ID, "lora_flux": "custom-flux.safetensors"}, "flux")
+        == "custom-flux.safetensors"
+    )
+    assert main._lora_name_for_engine({"id": MODEL_ID}, "flux") == f"{MODEL_ID}-flux.safetensors"
+
+
+def test_post_flux_uses_flux_slot():
+    # Dual-arch: a flux post resolves the FLUX slot (registry "lora_flux"),
+    # not the SDXL slot — with ONLY the flux stub deployed (the SDXL seed
+    # stub is removed for the duration, so the old single-slot resolver
+    # would 400 on the missing m1.safetensors) the post launches.
+    spy = _LaunchSpy()
+    try:
+        (main.LORAS_DIR / _FLUX_LORA).write_bytes(b"")  # empty stub: arch None → fail-open
+        (main.LORAS_DIR / f"{MODEL_ID}.safetensors").unlink()  # SDXL slot absent
+        with _with_registry([_seed_entry(lora_flux=_FLUX_LORA)]), _with_spy(spy):
+            result = _run(
+                main.job_post(
+                    {
+                        "caption": "a caption",
+                        "prompt": "a quiet studio shot",
+                        "engine": "flux",
+                    }
+                )
+            )
+        kind, cmd, model_id, job_id = spy.calls[-1]
+        assert kind == "post" and model_id == MODEL_ID
+        assert cmd[cmd.index("--engine") + 1] == "flux", cmd
+        assert main.jobs[job_id]["engine"] == "flux"
+        assert result == {"job_id": job_id, "status": "queued"}
+    finally:
+        _reset_lora_stub()  # restore the SDXL seed stub removed above
+        _remove_flux_stub()
+
+
+def test_post_flux_missing_flux_lora_400():
+    # The registry points at the FLUX slot but the file was never copied: a
+    # flux post must 400 with the expected filename in the detail and launch
+    # nothing.
+    spy = _LaunchSpy()
+    with _with_registry([_seed_entry(lora_flux=_FLUX_LORA)]), _with_spy(spy):
+        try:
+            _run(
+                main.job_post(
+                    {
+                        "caption": "a caption",
+                        "prompt": "a quiet studio shot",
+                        "engine": "flux",
+                    }
+                )
+            )
+        except main.HTTPException as exc:
+            assert exc.status_code == 400, exc.status_code
+            assert "ожидался m1-flux.safetensors" in exc.detail, exc.detail
+        else:
+            raise AssertionError("HTTPException(400) expected for a flux post without the FLUX LoRA")
+    assert spy.calls == [], "no job may be launched when the FLUX LoRA is missing"
 
 
 def test_lora_arch_detection():
@@ -425,9 +553,11 @@ def test_lora_arch_detection():
 
 
 def test_active_model_summary_engine():
-    # _active_model_summary reports the LoRA-derived arch as "engine" (the
-    # recommended post engine): sdxl / flux per header, None for an empty
-    # stub and None when the model has no lora at all.
+    # Dual-arch: "engine" reports which LoRA slot is deployed on disk — sdxl
+    # whenever the sdxl-slot file exists (even if its header sniffs another
+    # arch or is an empty stub: the arch trap is the post/group 400 guard's
+    # business), flux only when the sdxl slot is absent but the flux slot is
+    # deployed, None when no slot file exists.
     try:
         _write_lora_stub(["lora_unet_down_blocks_0_attentions_0_to_k.lora_down.weight"])
         summary = main._active_model_summary({"id": "m1", "name": "Valery", "lora": "m1.safetensors"})
@@ -435,10 +565,10 @@ def test_active_model_summary_engine():
         assert summary["lora_file"] is True, summary
         _write_lora_stub(["lora_transformer_blocks_0_attn.to_k.lora_down.weight"])
         summary = main._active_model_summary({"id": "m1", "name": "Valery", "lora": "m1.safetensors"})
-        assert summary["engine"] == "flux", summary
+        assert summary["engine"] == "sdxl", summary
         _reset_lora_stub()
         summary = main._active_model_summary({"id": "m1", "name": "Valery", "lora": "m1.safetensors"})
-        assert summary["engine"] is None, summary
+        assert summary["engine"] == "sdxl", summary  # empty stub: the slot file exists
         summary = main._active_model_summary({"id": "m1", "name": "Valery", "lora": None})
         assert summary["engine"] is None, summary
         assert summary["lora_file"] is False, summary
@@ -446,14 +576,45 @@ def test_active_model_summary_engine():
         _reset_lora_stub()
 
 
+def test_active_model_summary_engine_dualarch():
+    # Both slots deployed → sdxl wins; only the FLUX slot deployed → flux;
+    # neither file → None.
+    try:
+        (main.LORAS_DIR / f"{MODEL_ID}.safetensors").write_bytes(b"")
+        (main.LORAS_DIR / _FLUX_LORA).write_bytes(b"")
+        summary = main._active_model_summary(
+            {"id": MODEL_ID, "name": "Valery", "lora": f"{MODEL_ID}.safetensors", "lora_flux": _FLUX_LORA}
+        )
+        assert summary["engine"] == "sdxl", summary
+        (main.LORAS_DIR / f"{MODEL_ID}.safetensors").unlink()
+        summary = main._active_model_summary(
+            {"id": MODEL_ID, "name": "Valery", "lora": f"{MODEL_ID}.safetensors", "lora_flux": _FLUX_LORA}
+        )
+        assert summary["engine"] == "flux", summary
+        _remove_flux_stub()
+        summary = main._active_model_summary(
+            {"id": MODEL_ID, "name": "Valery", "lora": f"{MODEL_ID}.safetensors", "lora_flux": _FLUX_LORA}
+        )
+        assert summary["engine"] is None, summary
+    finally:
+        _reset_lora_stub()
+        _remove_flux_stub()
+
+
 def test_group_cmd_has_no_engine_or_uncensor():
+    # The group is FLUX-only, so its preflight resolves the members' FLUX
+    # slots: the fixture gives m1 a deployed flux stub for the duration.
     spy = _LaunchSpy()
-    with _with_spy(spy):
-        _run(main.job_group({"models": [MODEL_ID], "prompt": "a shared scene", "caption": "a caption"}))
-    kind, cmd, model_id, _job_id = spy.calls[-1]
-    assert kind == "group" and model_id == MODEL_ID
-    assert "--engine" not in cmd, cmd
-    assert "--uncensor" not in cmd, cmd
+    try:
+        (main.LORAS_DIR / _FLUX_LORA).write_bytes(b"")
+        with _with_registry([_seed_entry(lora_flux=_FLUX_LORA)]), _with_spy(spy):
+            _run(main.job_group({"models": [MODEL_ID], "prompt": "a shared scene", "caption": "a caption"}))
+        kind, cmd, model_id, _job_id = spy.calls[-1]
+        assert kind == "group" and model_id == MODEL_ID
+        assert "--engine" not in cmd, cmd
+        assert "--uncensor" not in cmd, cmd
+    finally:
+        _remove_flux_stub()
 
 
 def test_post_sdxl_no_lora_file_ok():
@@ -570,21 +731,25 @@ def test_post_no_seed_gets_random_seed_in_cmd_and_job():
     # Payload without seed (UI leaves the field empty) → random seed in
     # [0, 2**31) is passed to the cmd AND stored on the job record.
     spy = _LaunchSpy()
-    with _with_spy(spy):
-        _run(
-            main.job_post(
-                {
-                    "caption": "a caption",
-                    "prompt": "a quiet studio shot",
-                }
+    try:
+        (main.LORAS_DIR / _FLUX_LORA).write_bytes(b"")
+        with _with_registry([_seed_entry(lora_flux=_FLUX_LORA)]), _with_spy(spy):
+            _run(
+                main.job_post(
+                    {
+                        "caption": "a caption",
+                        "prompt": "a quiet studio shot",
+                    }
+                )
             )
-        )
-    kind, cmd, model_id, job_id = spy.calls[-1]
-    assert kind == "post" and model_id == MODEL_ID
-    assert "--seed" in cmd, cmd
-    seed = int(cmd[cmd.index("--seed") + 1])
-    assert 0 <= seed < 2**31, seed
-    assert main.jobs[job_id]["seed"] == seed
+        kind, cmd, model_id, job_id = spy.calls[-1]
+        assert kind == "post" and model_id == MODEL_ID
+        assert "--seed" in cmd, cmd
+        seed = int(cmd[cmd.index("--seed") + 1])
+        assert 0 <= seed < 2**31, seed
+        assert main.jobs[job_id]["seed"] == seed
+    finally:
+        _remove_flux_stub()
 
 
 def test_candidates_explicit_seed_in_cmd():
@@ -603,51 +768,67 @@ def test_group_no_seed_gets_random_seed_in_cmd_and_job():
     # [0, 2**31) is passed to the cmd AND stored on the job record
     # (one seed per group run; per-member seed+i is queue_workflow's job).
     spy = _LaunchSpy()
-    with _with_spy(spy):
-        _run(main.job_group({"models": [MODEL_ID], "prompt": "a shared scene", "caption": "a caption"}))
-    kind, cmd, model_id, job_id = spy.calls[-1]
-    assert kind == "group" and model_id == MODEL_ID
-    assert "--seed" in cmd, cmd
-    seed = int(cmd[cmd.index("--seed") + 1])
-    assert 0 <= seed < 2**31, seed
-    assert main.jobs[job_id]["seed"] == seed
+    try:
+        (main.LORAS_DIR / _FLUX_LORA).write_bytes(b"")
+        with _with_registry([_seed_entry(lora_flux=_FLUX_LORA)]), _with_spy(spy):
+            _run(main.job_group({"models": [MODEL_ID], "prompt": "a shared scene", "caption": "a caption"}))
+        kind, cmd, model_id, job_id = spy.calls[-1]
+        assert kind == "group" and model_id == MODEL_ID
+        assert "--seed" in cmd, cmd
+        seed = int(cmd[cmd.index("--seed") + 1])
+        assert 0 <= seed < 2**31, seed
+        assert main.jobs[job_id]["seed"] == seed
+    finally:
+        _remove_flux_stub()
 
 
 def test_post_empty_caption_accepted_no_400():
     # Optional caption (Instagram post text): an empty/blank caption must not
     # 400; the cmd still carries --caption "" and the job record stores null.
     spy = _LaunchSpy()
-    with _with_spy(spy):
-        result = _run(main.job_post({"caption": "   ", "prompt": "a quiet studio shot"}))
-    kind, cmd, model_id, job_id = spy.calls[-1]
-    assert kind == "post" and model_id == MODEL_ID
-    assert result == {"job_id": job_id, "status": "queued"}
-    assert "--caption" in cmd, cmd
-    assert cmd[cmd.index("--caption") + 1] == "", cmd
-    assert main.jobs[job_id]["caption"] is None
+    try:
+        (main.LORAS_DIR / _FLUX_LORA).write_bytes(b"")
+        with _with_registry([_seed_entry(lora_flux=_FLUX_LORA)]), _with_spy(spy):
+            result = _run(main.job_post({"caption": "   ", "prompt": "a quiet studio shot"}))
+        kind, cmd, model_id, job_id = spy.calls[-1]
+        assert kind == "post" and model_id == MODEL_ID
+        assert result == {"job_id": job_id, "status": "queued"}
+        assert "--caption" in cmd, cmd
+        assert cmd[cmd.index("--caption") + 1] == "", cmd
+        assert main.jobs[job_id]["caption"] is None
+    finally:
+        _remove_flux_stub()
 
 
 def test_post_missing_caption_key_accepted():
     # No "caption" key in the payload at all → same contract as an empty one.
     spy = _LaunchSpy()
-    with _with_spy(spy):
-        result = _run(main.job_post({"prompt": "a quiet studio shot"}))
-    kind, cmd, model_id, job_id = spy.calls[-1]
-    assert kind == "post" and model_id == MODEL_ID
-    assert result == {"job_id": job_id, "status": "queued"}
-    assert cmd[cmd.index("--caption") + 1] == "", cmd
-    assert main.jobs[job_id]["caption"] is None
+    try:
+        (main.LORAS_DIR / _FLUX_LORA).write_bytes(b"")
+        with _with_registry([_seed_entry(lora_flux=_FLUX_LORA)]), _with_spy(spy):
+            result = _run(main.job_post({"prompt": "a quiet studio shot"}))
+        kind, cmd, model_id, job_id = spy.calls[-1]
+        assert kind == "post" and model_id == MODEL_ID
+        assert result == {"job_id": job_id, "status": "queued"}
+        assert cmd[cmd.index("--caption") + 1] == "", cmd
+        assert main.jobs[job_id]["caption"] is None
+    finally:
+        _remove_flux_stub()
 
 
 def test_post_filled_caption_unchanged():
     # A filled caption behaves exactly as before the change.
     spy = _LaunchSpy()
-    with _with_spy(spy):
-        _run(main.job_post({"caption": "hello #fitness", "prompt": "a quiet studio shot"}))
-    kind, cmd, model_id, job_id = spy.calls[-1]
-    assert kind == "post" and model_id == MODEL_ID
-    assert cmd[cmd.index("--caption") + 1] == "hello #fitness", cmd
-    assert main.jobs[job_id]["caption"] == "hello #fitness"
+    try:
+        (main.LORAS_DIR / _FLUX_LORA).write_bytes(b"")
+        with _with_registry([_seed_entry(lora_flux=_FLUX_LORA)]), _with_spy(spy):
+            _run(main.job_post({"caption": "hello #fitness", "prompt": "a quiet studio shot"}))
+        kind, cmd, model_id, job_id = spy.calls[-1]
+        assert kind == "post" and model_id == MODEL_ID
+        assert cmd[cmd.index("--caption") + 1] == "hello #fitness", cmd
+        assert main.jobs[job_id]["caption"] == "hello #fitness"
+    finally:
+        _remove_flux_stub()
 
 
 def test_post_caption_arg_optional_in_parser():
@@ -679,7 +860,19 @@ def _run_generate_post(caption: str, name: str) -> dict:
         model_id = "pm1"
         (root / "models" / model_id).mkdir(parents=True)
         (root / "models" / "registry.json").write_text(
-            json.dumps({"version": 1, "models": [{"id": model_id, "active": True, "lora": f"{model_id}.safetensors"}]}),
+            json.dumps(
+                {
+                    "version": 1,
+                    "models": [
+                        {
+                            "id": model_id,
+                            "active": True,
+                            "lora": f"{model_id}.safetensors",
+                            "lora_flux": f"{model_id}-flux.safetensors",
+                        }
+                    ],
+                }
+            ),
             encoding="utf-8",
         )
         (root / "models" / model_id / "character.json").write_text(
@@ -687,7 +880,7 @@ def _run_generate_post(caption: str, name: str) -> dict:
         )
         loras = root / "runtime" / "models" / "loras"
         loras.mkdir(parents=True)
-        (loras / f"{model_id}.safetensors").write_bytes(b"")  # flux preflight: existence matters
+        (loras / f"{model_id}-flux.safetensors").write_bytes(b"")  # flux preflight: the FLUX slot must exist
         (root / "comfy").mkdir(parents=True)
         # Minimal flux_lora graph: nodes 6/31/40/9 touched by generate_post; no "33"
         # so set_negative stays a no-op.
@@ -920,6 +1113,24 @@ def test_train_config_template_is_sdxl_pony():
         assert forbidden not in template, f"{forbidden!r} must not appear in the SDXL training template"
 
 
+def test_train_config_flux_template_is_flux():
+    # The dual-arch FLUX template (rendered by train_lora.sh <id> flux): FLUX
+    # model block with the low-VRAM fp8 knob, flowmatch scheduler, the
+    # "<id>_flux_v1" config name (which copy_lora_output searches for) and a
+    # multi-resolution latent cache; no SDXL/Pony-only knobs.
+    template = (REPO_ROOT / "lora" / "train_config.flux.template.yaml").read_text(encoding="utf-8")
+    assert 'name: "{{MODEL_ID}}_flux_v1"' in template
+    assert "name_or_path: black-forest-labs/FLUX.1-dev" in template
+    assert "is_flux: true" in template
+    assert "noise_scheduler: flowmatch" in template
+    assert "fp8_base: true" in template
+    assert "resolution: [512, 768]" in template
+    assert "cache_latents_to_disk: true" in template
+    assert "arch: sdxl" not in template
+    assert "ddpm" not in template
+    assert "ponyDiffusionV6XL" not in template
+
+
 def test_library_scene_texts_mode_filter_and_bad_inputs():
     import tempfile
 
@@ -1005,6 +1216,56 @@ def test_expand_empty_library_exits_before_network():
         finally:
             queue_workflow.ROOT = original_root
             queue_workflow.queue_and_wait = original_queue
+
+
+def test_train_start_default_arch_is_sdxl():
+    # POST /api/train/start without arch: back-compat default "sdxl" — the cmd
+    # carries "sdxl" as the second positional argument and the registry entry
+    # gains the SDXL slot name ("lora").
+    spy = _LaunchSpy()
+    with _with_registry([_seed_entry()]), _with_spy(spy):
+        result = _run(main.train_start(None))
+    kind, cmd, model_id, job_id = spy.calls[-1]
+    assert kind == "train" and model_id == MODEL_ID
+    assert cmd[:2] == ["bash", "scripts/train_lora.sh"], cmd
+    assert cmd[2] == MODEL_ID and cmd[3] == "sdxl", cmd
+    assert result == {"job_id": job_id, "status": "queued"}
+
+
+def test_train_start_arch_flux_cmd_and_registry():
+    # arch="flux": the cmd carries "flux" as the second positional argument
+    # and the registry entry gains the FLUX slot ("lora_flux"), not "lora".
+    spy = _LaunchSpy()
+    with _with_registry([_seed_entry()]), _with_spy(spy):
+        _run(main.train_start({"arch": "flux"}))
+        entry = next(
+            m for m in json.loads(main.REGISTRY_PATH.read_text(encoding="utf-8"))["models"]
+            if m["id"] == MODEL_ID
+        )
+    kind, cmd, model_id, _job_id = spy.calls[-1]
+    assert kind == "train" and model_id == MODEL_ID
+    assert cmd[2] == MODEL_ID and cmd[3] == "flux", cmd
+    assert entry.get("lora_flux") == _FLUX_LORA, entry
+    assert entry.get("lora") == f"{MODEL_ID}.safetensors", entry
+
+
+def test_train_start_arch_bogus_400():
+    # arch outside {sdxl, flux} → 400 and nothing launched.
+    spy = _LaunchSpy()
+    with _with_registry([_seed_entry()]), _with_spy(spy):
+        try:
+            _run(main.train_start({"arch": "bogus"}))
+        except main.HTTPException as exc:
+            assert exc.status_code == 400, exc.status_code
+            assert "arch" in exc.detail, exc.detail
+        else:
+            raise AssertionError("HTTPException(400) expected for a bogus train arch")
+        entry = next(
+            m for m in json.loads(main.REGISTRY_PATH.read_text(encoding="utf-8"))["models"]
+            if m["id"] == MODEL_ID
+        )
+        assert "lora_flux" not in entry, "a rejected arch must not touch the registry"
+    assert spy.calls == [], "no job may be launched when the train arch is invalid"
 
 
 def test_stream_job_strips_skip_train_from_child_env():

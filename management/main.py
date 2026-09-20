@@ -533,18 +533,33 @@ def _lora_arch(path: Path) -> str | None:
     return None
 
 
+def _lora_name_for_engine(model: dict[str, Any], engine: str) -> str:
+    """Registry lora slot per engine: sdxl → "lora" (fallback <id>.safetensors),
+    flux → "lora_flux" (fallback <id>-flux.safetensors)."""
+    model_id = str(model.get("id"))
+    if engine == "flux":
+        return str(model.get("lora_flux") or f"{model_id}-flux.safetensors")
+    return str(model.get("lora") or f"{model_id}.safetensors")
+
+
 def _active_model_summary(model: dict[str, Any] | None) -> dict[str, Any] | None:
     if not model:
         return None
     lora = model.get("lora")
     lora_file = bool(lora) and (LORAS_DIR / str(lora)).is_file()
-    arch = _lora_arch(LORAS_DIR / str(lora)) if lora_file else None
+    # Dual-arch (engine per LoRA slot): sdxl when the sdxl-slot file is
+    # deployed, else flux when the flux-slot file is, else None. Slot
+    # existence decides — a wrong-arch file in a slot is the arch guard's
+    # (400) business at post/group time, not the summary's.
+    flux_lora = model.get("lora_flux")
+    flux_file = bool(flux_lora) and (LORAS_DIR / str(flux_lora)).is_file()
+    engine = "sdxl" if lora_file else ("flux" if flux_file else None)
     return {
         "id": model.get("id"),
         "name": model.get("name"),
         "lora": lora,
         "lora_file": lora_file,
-        "engine": arch,  # recommended post engine: "sdxl" | "flux" | None (no/unknown LoRA)
+        "engine": engine,  # recommended post engine: "sdxl" | "flux" | None (no deployed LoRA)
     }
 
 
@@ -1365,10 +1380,12 @@ async def job_post(payload: dict[str, Any]) -> dict[str, Any]:
     # transformer (and vice versa), producing posts without the identity.
     # Undetectable arch (empty/corrupt stub) stays fail-open: the check is
     # skipped and the current behaviour is kept.
-    # Registry lora wins; older entries may lack it — fall back to the
-    # canonical <id>.safetensors name produced by scripts/train_lora.sh
-    # deployment.
-    lora = str(model.get("lora") or f"{model_id}.safetensors")
+    # Dual-arch slots: the FLUX engine consumes the FLUX slot ("lora_flux",
+    # fallback <id>-flux.safetensors) and the sdxl engine the SDXL slot
+    # ("lora", fallback <id>.safetensors) — both as produced by
+    # scripts/train_lora.sh <id> <arch> deployment. Older registry entries
+    # may lack the slot key — the fallback name applies.
+    lora = _lora_name_for_engine(model, engine)
     lora_path = LORAS_DIR / lora
     if engine == "flux":
         if not lora_path.is_file():
@@ -1464,17 +1481,18 @@ def _validate_group_payload(payload: dict[str, Any]) -> dict[str, Any]:
     for member_id in ids:
         entry = _model_or_404(member_id)
         entries.append(entry)
-        # Registry lora wins; fall back to the canonical <id>.safetensors name
-        # (same rule as job_post / generate_group).
-        lora = str(entry.get("lora") or f"{member_id}.safetensors")
+        # Group shots are FLUX-only: every member consumes its FLUX slot
+        # ("lora_flux", fallback <id>-flux.safetensors — same rule as the
+        # flux branch of job_post / queue_workflow.generate_group).
+        lora = _lora_name_for_engine(entry, "flux")
         if not (LORAS_DIR / lora).is_file():
             raise HTTPException(
                 status_code=400,
-                detail=f"LoRA для модели {member_id} не обучена или не скопирована в runtime/models/loras/ (ожидался {lora})",
+                detail=f"FLUX-LoRA для модели {member_id} не обучена или не скопирована в runtime/models/loras/ (ожидался {lora})",
             )
-        # Group shots are FLUX-only: an SDXL-arch LoRA member would be
-        # silently ignored by the FLUX transformer (no identity). Undetectable
-        # arch (empty/corrupt stub) stays fail-open.
+        # Backstop: a file deployed into the FLUX slot but carrying SDXL-arch
+        # deltas would be silently ignored by the FLUX transformer (no
+        # identity). Undetectable arch (empty/corrupt stub) stays fail-open.
         if _lora_arch(LORAS_DIR / lora) == "sdxl":
             raise HTTPException(
                 status_code=400,
@@ -1560,20 +1578,29 @@ async def job_group(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.post("/api/train/start")
-async def train_start() -> dict[str, Any]:
+async def train_start(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     model = _active_model_or_404()
     model_id = str(model["id"])
+    # arch selects the LoRA architecture (and thus the training template and
+    # the runtime slot the result is deployed to): "sdxl" (default) or "flux".
+    arch = str((payload or {}).get("arch") or "sdxl").strip().lower()
+    if arch not in ("sdxl", "flux"):
+        raise HTTPException(status_code=400, detail="arch must be sdxl or flux")
     # Register the LoRA filename the training produces BEFORE launching, so the
-    # UI badge and post-generation can resolve <id>.safetensors immediately.
+    # UI badge and post-generation can resolve the trained slot immediately:
+    # flux → "lora_flux" (<id>-flux.safetensors), sdxl → "lora" (<id>.safetensors).
     reg = _load_registry()
     entry = next(
         (m for m in reg.get("models", []) if isinstance(m, dict) and str(m.get("id")) == model_id),
         None,
     )
     if entry is not None:
-        entry["lora"] = f"{model_id}.safetensors"
+        if arch == "flux":
+            entry["lora_flux"] = f"{model_id}-flux.safetensors"
+        else:
+            entry["lora"] = f"{model_id}.safetensors"
         await _save_registry(reg)
-    return await _launch("train", ["bash", "scripts/train_lora.sh", model_id], model_id=model_id)
+    return await _launch("train", ["bash", "scripts/train_lora.sh", model_id, arch], model_id=model_id)
 
 
 @app.get("/api/jobs")

@@ -44,6 +44,7 @@ nginx-фронт + домен `3d.mostdef.ru`; Caddy установлен, но 
   `reference/candidates/`, `dataset/images/`, `lora/output/`, `posts/`,
   `posts-private/`). Библиотека сцен: `models/library.json`.
 - LoRA-копия для генерации — `runtime/models/loras/<id>.safetensors`.
+- FLUX-слот LoRA: runtime/models/loras/<id>-flux.safetensors (registry lora_flux) — для FLUX/uncensor постов; SDXL-слот <id>.safetensors остаётся дефолтом.
 - Удаление модели — перенос её папки в `runtime/trash/` (мягкое удаление).
 - Разовая миграция старого single-model layout —
   `scripts/migrate_to_registry.py` (идемпотентна, бэкап в `runtime/backup/`).
