@@ -9,21 +9,21 @@
 ## Архитектура
 
 ```
-[Браузер] ──HTTPS+basicauth──> [РУ 82.146.37.153: nginx (3d.mostdef.ru)] ──ZeroTier──> [GPU 10.123.239.102: manager :8000]
+[Браузер] ──HTTPS+basicauth──> [РУ-ХОСТ: nginx (3d.mostdef.ru)] ──ZeroTier──> [GPU-ХОСТ: manager :8000]
                                                                                   │ docker.sock / compose
                                                                                   ▼
                                                                           ComfyUI :8188 (flux1-dev-fp8, kontext)
                                                                           ai-toolkit venv (обучение LoRA)
 ```
 
-- **GPU-сервер** (RTX 5070 12 ГБ, драйвер 595.91, CUDA 13.2, ZeroTier 10.123.239.102): ComfyUI + `manager` (FastAPI) + ai-toolkit.
-- **РУ-хост** (82.146.37.153, ZeroTier 10.123.239.101): nginx vhost с TLS (Let's Encrypt) + `basicauth`, reverse-proxy на `10.123.239.102:8000`. Caddy установлен, но отключён (конфликт 80/443 с nginx) — `deploy/Caddyfile` хранится как референс.
+- **GPU-сервер** (RTX 5070 12 ГБ, драйвер 595.91, CUDA 13.2, ZeroTier-адрес не публикуется): ComfyUI + `manager` (FastAPI) + ai-toolkit.
+- **РУ-хост** (публичный VPS, ZeroTier-адреса не публикуются): nginx vhost с TLS (Let's Encrypt) + `basicauth`, reverse-proxy на `GPU-ХОСТ:8000` по ZeroTier. Caddy установлен, но отключён (конфликт 80/443 с nginx) — `deploy/Caddyfile` хранится как референс.
 - Публично торчит только nginx. `8188` и `8000` закрыты фаерволом (8000 разрешён только с РУ-хоста по ZeroTier).
 
 ## Требования
 
 - GPU-сервер: Docker + Compose v2, `nvidia-container-toolkit`, ZeroTier-доступен VPS.
-- РУ-хост: nginx (TLS + basicauth), домен `3d.mostdef.ru` с A-записью на 82.146.37.153.
+- РУ-хост: nginx (TLS + basicauth), домен `3d.mostdef.ru` с A-записью на публичный IP РУ-хоста.
 - ~40 ГБ диска под веса+venv (data-том `/opt/sea-speed-worker`, 623 ГБ свободно).
 - Принять лицензию https://huggingface.co/black-forest-labs/FLUX.1-dev и токен https://huggingface.co/settings/tokens.
 
