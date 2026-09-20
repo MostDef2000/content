@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -178,6 +179,23 @@ def test_member_without_lora_file_400():
     # m3 is in the registry but m3.safetensors is absent from LORAS_DIR
     exc = _expect_http_status(_valid_payload(models=["m1", "m3"]), 400)
     assert "LoRA" in exc.detail, exc.detail
+
+
+def test_group_member_with_sdxl_lora_400():
+    # Group shots are FLUX-only: a member whose LoRA is SDXL-arch (unet keys
+    # in the safetensors header) must 400 with the model id and "SDXL" in the
+    # detail (empty/corrupt stubs stay fail-open → arch None → pass).
+    stub = main.LORAS_DIR / "m1.safetensors"
+    header = json.dumps(
+        {"lora_unet_down_blocks_0_attentions_0_to_k.lora_down.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+    ).encode("utf-8")
+    stub.write_bytes(struct.pack("<Q", len(header)) + header + b"\x00" * 4)
+    try:
+        exc = _expect_http_status(_valid_payload(models=["m1", "m2"]), 400)
+        assert "m1" in exc.detail, exc.detail
+        assert "SDXL" in exc.detail, exc.detail
+    finally:
+        stub.write_bytes(b"")  # restore the empty seed stub (self-sufficient test)
 
 
 def test_empty_caption_400():

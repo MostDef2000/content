@@ -6,6 +6,7 @@ import os
 import random
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import time
@@ -499,15 +500,51 @@ def _model_stats(model_id: str, lora: str | None) -> dict[str, Any]:
     }
 
 
+def _lora_arch(path: Path) -> str | None:
+    """Detect LoRA architecture from safetensors header tensor keys.
+
+    ai-toolkit names: SDXL deltas carry "unet" (lora_unet_*), FLUX carry
+    "transformer" (lora_transformer_*). Returns "sdxl" | "flux", or None
+    when the file is missing/truncated/corrupt/ambiguous (fail-open: the
+    caller keeps current behaviour instead of a false 400).
+    """
+    try:
+        with open(path, "rb") as fh:
+            raw_len = fh.read(8)
+            if len(raw_len) < 8:
+                return None
+            header_len = struct.unpack("<Q", raw_len)[0]
+            if header_len > 10_000_000:
+                return None
+            # Read ONLY the header (8 + header_len bytes), never the whole
+            # file: trained LoRAs are hundreds of MB.
+            header = fh.read(header_len)
+        if len(header) < header_len:
+            return None  # truncated file
+        parsed = json.loads(header)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if any("unet" in key for key in parsed):
+        return "sdxl"
+    if any("transformer" in key for key in parsed):
+        return "flux"
+    return None
+
+
 def _active_model_summary(model: dict[str, Any] | None) -> dict[str, Any] | None:
     if not model:
         return None
     lora = model.get("lora")
+    lora_file = bool(lora) and (LORAS_DIR / str(lora)).is_file()
+    arch = _lora_arch(LORAS_DIR / str(lora)) if lora_file else None
     return {
         "id": model.get("id"),
         "name": model.get("name"),
         "lora": lora,
-        "lora_file": bool(lora) and (LORAS_DIR / str(lora)).is_file(),
+        "lora_file": lora_file,
+        "engine": arch,  # recommended post engine: "sdxl" | "flux" | None (no/unknown LoRA)
     }
 
 
@@ -1322,16 +1359,33 @@ async def job_post(payload: dict[str, Any]) -> dict[str, Any]:
     # (Pony) graph does carry a LoraLoaderModelOnly "40", wired in only when
     # the LoRA file exists (graceful: the node is dropped otherwise), so sdxl
     # posts must not 400 on a missing LoRA (mirrored by the preflight in
-    # scripts/queue_workflow.py).
+    # scripts/queue_workflow.py). Additionally, the safetensors header is
+    # sniffed for the architecture: a trained LoRA of the wrong arch must
+    # fail fast — ComfyUI silently ignores an SDXL LoRA on the FLUX
+    # transformer (and vice versa), producing posts without the identity.
+    # Undetectable arch (empty/corrupt stub) stays fail-open: the check is
+    # skipped and the current behaviour is kept.
+    # Registry lora wins; older entries may lack it — fall back to the
+    # canonical <id>.safetensors name produced by scripts/train_lora.sh
+    # deployment.
+    lora = str(model.get("lora") or f"{model_id}.safetensors")
+    lora_path = LORAS_DIR / lora
     if engine == "flux":
-        # Registry lora wins; older entries may lack it — fall back to the
-        # canonical <id>.safetensors name produced by scripts/train_lora.sh
-        # deployment.
-        lora = str(model.get("lora") or f"{model_id}.safetensors")
-        if not (LORAS_DIR / lora).is_file():
+        if not lora_path.is_file():
             raise HTTPException(
                 status_code=400,
                 detail=f"LoRA не обучена или не скопирована в runtime/models/loras/ (ожидался {lora})",
+            )
+        if _lora_arch(lora_path) == "sdxl":
+            raise HTTPException(
+                status_code=400,
+                detail=f"LoRA модели {model_id} — SDXL (Pony) архитектура: для FLUX-поста неприменима, выберите движок Pony SDXL",
+            )
+    elif engine == "sdxl":
+        if _lora_arch(lora_path) == "flux":
+            raise HTTPException(
+                status_code=400,
+                detail=f"LoRA модели {model_id} — FLUX архитектура: для Pony SDXL поста неприменима, выберите движок FLUX",
             )
     character = _load_character(model_id)
     profile = _load_profile(model_id)
@@ -1417,6 +1471,14 @@ def _validate_group_payload(payload: dict[str, Any]) -> dict[str, Any]:
             raise HTTPException(
                 status_code=400,
                 detail=f"LoRA для модели {member_id} не обучена или не скопирована в runtime/models/loras/ (ожидался {lora})",
+            )
+        # Group shots are FLUX-only: an SDXL-arch LoRA member would be
+        # silently ignored by the FLUX transformer (no identity). Undetectable
+        # arch (empty/corrupt stub) stays fail-open.
+        if _lora_arch(LORAS_DIR / lora) == "sdxl":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Модель {member_id}: LoRA — SDXL (Pony) архитектура; групповые кадры пока FLUX-only — уберите её из группы",
             )
 
     caption = str(payload.get("caption", "")).strip()

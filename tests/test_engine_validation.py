@@ -19,6 +19,11 @@ Also covers the optional post caption: an empty/absent caption no longer 400s,
 the cmd still carries --caption "" (group keeps the required caption), the job
 record stores null for an empty caption, and queue_workflow.generate_post skips
 caption.txt for an empty caption but writes it for a filled one.
+Plus the LoRA-architecture trap (issue #2 п.15): _lora_arch sniffs the
+safetensors header (unet keys → sdxl, transformer keys → flux, else None),
+a flux post with an SDXL-arch LoRA 400s (and an sdxl post with a FLUX-arch
+LoRA), matching-arch posts launch, undetectable arch stays fail-open, and
+_active_model_summary reports the arch as the recommended "engine".
 pytest-compatible; pytest is not required.
 
 Run either way:
@@ -38,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -134,6 +140,21 @@ _MODEL_DIR.mkdir(parents=True, exist_ok=True)
     json.dumps({"version": 1, "face": "oval face", "body": "athletic", "style": "", "negative": "", "scenes": {}}),
     encoding="utf-8",
 )
+
+
+def _write_lora_stub(keys: list[str]) -> None:
+    """Overwrite the default empty LoRA stub with a minimal SAFETENSORS file
+    whose header carries the given tensor keys (restore via _reset_lora_stub)."""
+    header = json.dumps(
+        {k: {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]} for k in keys}
+    ).encode("utf-8")
+    (main.LORAS_DIR / f"{MODEL_ID}.safetensors").write_bytes(
+        struct.pack("<Q", len(header)) + header + b"\x00" * 4
+    )
+
+
+def _reset_lora_stub() -> None:
+    (main.LORAS_DIR / f"{MODEL_ID}.safetensors").write_bytes(b"")
 
 
 def _expect_http_status(payload: dict, status: int, *, allow_engine: bool = True) -> main.HTTPException:
@@ -275,6 +296,154 @@ def test_post_sdxl_with_uncensor_400():
         else:
             raise AssertionError("HTTPException(400) expected for sdxl post with uncensor")
     assert spy.calls == [], "no job may be launched when sdxl post is 400ed by uncensor"
+
+
+def test_post_flux_with_sdxl_lora_400():
+    # Engine trap (issue #2 п.15): the LoRA is trained with the SDXL
+    # architecture (unet keys) but the post defaults to FLUX — ComfyUI would
+    # silently ignore the SDXL deltas on the FLUX transformer. A flux post
+    # with an SDXL-arch LoRA must 400 and launch nothing.
+    spy = _LaunchSpy()
+    try:
+        _write_lora_stub(["lora_unet_down_blocks_0_attentions_0_to_k.lora_down.weight"])
+        with _with_spy(spy):
+            try:
+                _run(
+                    main.job_post(
+                        {
+                            "caption": "a caption",
+                            "prompt": "a quiet studio shot",
+                            "engine": "flux",
+                        }
+                    )
+                )
+            except main.HTTPException as exc:
+                assert exc.status_code == 400, exc.status_code
+                assert "SDXL" in exc.detail, exc.detail
+            else:
+                raise AssertionError("HTTPException(400) expected for flux post with an SDXL-arch LoRA")
+        assert spy.calls == [], "no job may be launched when the flux post is 400ed by the LoRA arch"
+    finally:
+        _reset_lora_stub()
+
+
+def test_post_sdxl_with_flux_lora_400():
+    # The mirror trap: a FLUX-arch LoRA (transformer keys) cannot load on the
+    # SDXL (Pony) checkpoint — an sdxl post with it must 400 and launch
+    # nothing.
+    spy = _LaunchSpy()
+    try:
+        _write_lora_stub(["lora_transformer_blocks_0_attn.to_k.lora_down.weight"])
+        with _with_spy(spy):
+            try:
+                _run(
+                    main.job_post(
+                        {
+                            "caption": "a caption",
+                            "prompt": "a quiet studio shot",
+                            "engine": "sdxl",
+                        }
+                    )
+                )
+            except main.HTTPException as exc:
+                assert exc.status_code == 400, exc.status_code
+                assert "FLUX" in exc.detail, exc.detail
+            else:
+                raise AssertionError("HTTPException(400) expected for sdxl post with a FLUX-arch LoRA")
+        assert spy.calls == [], "no job may be launched when the sdxl post is 400ed by the LoRA arch"
+    finally:
+        _reset_lora_stub()
+
+
+def test_post_sdxl_with_sdxl_lora_ok():
+    # Matching arch: an SDXL-arch LoRA passes the sdxl post (the graph carries
+    # the LoRA loader) — the job launches with --engine sdxl, no --uncensor.
+    spy = _LaunchSpy()
+    try:
+        _write_lora_stub(["lora_unet_down_blocks_0_attentions_0_to_k.lora_down.weight"])
+        with _with_spy(spy):
+            _run(
+                main.job_post(
+                    {
+                        "caption": "a caption",
+                        "prompt": "a quiet studio shot",
+                        "engine": "sdxl",
+                    }
+                )
+            )
+        kind, cmd, model_id, _job_id = spy.calls[-1]
+        assert kind == "post" and model_id == MODEL_ID
+        assert "--engine" in cmd, cmd
+        assert cmd[cmd.index("--engine") + 1] == "sdxl", cmd
+        assert "--uncensor" not in cmd, cmd
+    finally:
+        _reset_lora_stub()
+
+
+def test_post_flux_with_flux_lora_ok():
+    # Matching arch: a FLUX-arch LoRA passes the flux post — the job launches
+    # with --engine flux.
+    spy = _LaunchSpy()
+    try:
+        _write_lora_stub(["lora_transformer_blocks_0_attn.to_k.lora_down.weight"])
+        with _with_spy(spy):
+            _run(
+                main.job_post(
+                    {
+                        "caption": "a caption",
+                        "prompt": "a quiet studio shot",
+                        "engine": "flux",
+                    }
+                )
+            )
+        kind, cmd, model_id, _job_id = spy.calls[-1]
+        assert kind == "post" and model_id == MODEL_ID
+        assert "--engine" in cmd, cmd
+        assert cmd[cmd.index("--engine") + 1] == "flux", cmd
+    finally:
+        _reset_lora_stub()
+
+
+def test_lora_arch_detection():
+    # Unit coverage of the header-sniffing helper: fail-open on missing/
+    # empty/corrupt files, correct arch on valid headers.
+    # Missing file → None.
+    assert main._lora_arch(main.LORAS_DIR / "absent.safetensors") is None
+    # Empty stub (default) → None.
+    assert main._lora_arch(main.LORAS_DIR / f"{MODEL_ID}.safetensors") is None
+    try:
+        # JSON garbage / random bytes → None (struct unpack guard or decode).
+        (main.LORAS_DIR / f"{MODEL_ID}.safetensors").write_bytes(b"\x99" * 32)
+        assert main._lora_arch(main.LORAS_DIR / f"{MODEL_ID}.safetensors") is None
+        # Valid headers → "sdxl" / "flux".
+        _write_lora_stub(["lora_unet_down_blocks_0_attentions_0_to_k.lora_down.weight"])
+        assert main._lora_arch(main.LORAS_DIR / f"{MODEL_ID}.safetensors") == "sdxl"
+        _write_lora_stub(["lora_transformer_blocks_0_attn.to_k.lora_down.weight"])
+        assert main._lora_arch(main.LORAS_DIR / f"{MODEL_ID}.safetensors") == "flux"
+    finally:
+        _reset_lora_stub()
+
+
+def test_active_model_summary_engine():
+    # _active_model_summary reports the LoRA-derived arch as "engine" (the
+    # recommended post engine): sdxl / flux per header, None for an empty
+    # stub and None when the model has no lora at all.
+    try:
+        _write_lora_stub(["lora_unet_down_blocks_0_attentions_0_to_k.lora_down.weight"])
+        summary = main._active_model_summary({"id": "m1", "name": "Valery", "lora": "m1.safetensors"})
+        assert summary["engine"] == "sdxl", summary
+        assert summary["lora_file"] is True, summary
+        _write_lora_stub(["lora_transformer_blocks_0_attn.to_k.lora_down.weight"])
+        summary = main._active_model_summary({"id": "m1", "name": "Valery", "lora": "m1.safetensors"})
+        assert summary["engine"] == "flux", summary
+        _reset_lora_stub()
+        summary = main._active_model_summary({"id": "m1", "name": "Valery", "lora": "m1.safetensors"})
+        assert summary["engine"] is None, summary
+        summary = main._active_model_summary({"id": "m1", "name": "Valery", "lora": None})
+        assert summary["engine"] is None, summary
+        assert summary["lora_file"] is False, summary
+    finally:
+        _reset_lora_stub()
 
 
 def test_group_cmd_has_no_engine_or_uncensor():

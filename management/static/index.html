@@ -438,6 +438,7 @@
       profileScenes: {},     // рабочая копия сцен профиля (id → text)
       postMode: "public",    // режим нового поста: public | private (Фаза 2)
       postEngine: "flux",    // движок нового поста: flux | sdxl (Фаза 4)
+      postEngineFor: null,   // id модели, для которой движок уже установлен (свой или дефолт)
       dataset: [],           // записи GET /api/models/<id>/dataset: [{filename, tag}]
       datasetStats: null,    // {total, captioned} из ответа dataset-эндпоинта
       datasetFilter: "all",  // клиентский фильтр грида: all | tasteful | explicit
@@ -636,6 +637,15 @@
             await loadProfile();
           } else if (state.profileFor !== state.activeId) {
             await loadProfile();
+          }
+          // Дефолт движка поста = архитектура LoRA активной модели (am.engine:
+          // "sdxl" | "flux" | null). Ручной выбор пользователя не перезаписывается
+          // поллингом, пока активная модель та же (postEngineFor === am.id); при
+          // смене модели движок переустанавливается на арх-ру новой модели.
+          // am.engine === null (нет/неизвестна LoRA) — не трогаем.
+          if (am.engine && state.postEngineFor !== am.id) {
+            setPostEngine(am.engine);
+            state.postEngineFor = am.id;
           }
         } else {
           $("activeModel").textContent = "нет активной модели";
@@ -1057,12 +1067,20 @@
       };
     });
 
+    // Движок поста: единая точка установки (клик по сегменту + дефолт по
+    // архитектуре LoRA активной модели из /api/status).
+    function setPostEngine(engine) {
+      state.postEngine = engine;
+      document.querySelectorAll("#postEngineSeg .segbtn").forEach((x) => x.classList.toggle("active", x.dataset.postengine === engine));
+      // uncensor для SDXL — no-op на бэкенде: просто прячем чекбокс без предупреждений
+      $("postUncensorRow").hidden = engine === "sdxl";
+    }
+
     document.querySelectorAll("#postEngineSeg .segbtn").forEach((b) => {
       b.onclick = () => {
-        state.postEngine = b.dataset.postengine;
-        document.querySelectorAll("#postEngineSeg .segbtn").forEach((x) => x.classList.toggle("active", x === b));
-        // uncensor для SDXL — no-op на бэкенде: просто прячем чекбокс без предупреждений
-        $("postUncensorRow").hidden = state.postEngine === "sdxl";
+        setPostEngine(b.dataset.postengine);
+        // ручной выбор принадлежит текущей активной модели
+        state.postEngineFor = state.activeId;
       };
     });
 
