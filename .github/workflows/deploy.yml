@@ -1,0 +1,190 @@
+name: deploy
+
+# Прод-деплой content-стека (ComfyUI + manager) на GPU-бокс (ZeroTier
+# 10.123.239.102). Транспорт: GitHub-hosted runner не видит ZeroTier, поэтому
+# SSH на РУ-хост (82.146.37.153), затем ProxyJump на бокс — точный проверенный
+# паттерн sea-speed/.github/workflows/deploy-ubuntu-worker.yml (шаг
+# «Configure restricted VPS ProxyJump to Ubuntu Worker», строки 152-196).
+#
+# Модель доверия (честно):
+#   * только workflow_dispatch; вход deploy_sha — точный 40-hex SHA из main.
+#   * Job gate fail-closed проверяет, что SHA — предок origin/main
+#     (git merge-base --is-ancestor по уже локальному origin/main — checkout
+#     делает fetch-depth: 0). Артфакт-конверта нет: бокс
+#     сам делает git fetch точного SHA и собирает из исходников
+#     (docker compose build) — та же pull-of-source модель, что и у
+#     sea-speed deploy-authorized.sh.
+#   * Доверенного CI-сигнала пока не требуется: ci.yml только валидирует
+#     compose/скрипты. Когда ci.yml обрастёт покрытием — добавить сюда
+#     trusted-run проверку как в stroy (.github/workflows/deploy.yml,
+#     «Select trusted ci.yml run» + «Verify every ci.yml job succeeded»).
+#   * environment: production — БЕЗ protection rules по решению владельца
+#     (2026-10-10): человеческий гейт — подтверждение в чате перед dispatch,
+#     а не required reviewer в GitHub.
+#   * Хост-ключи закреплены в repo variables (pinned), ssh-keyscan никогда
+#     не используется.
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_sha:
+        description: "Exact lowercase 40-hex commit SHA already merged to main"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: content-production
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Gate exact main SHA
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.validate.outputs.sha }}
+    steps:
+      - name: Check out gate tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate SHA format and ancestry (fail-closed)
+        id: validate
+        env:
+          DEPLOY_SHA: ${{ inputs.deploy_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "deploy_sha должен быть lowercase 40-hex SHA" >&2; exit 1; }
+          # Отдельный git fetch не нужен: checkout выше с fetch-depth: 0 уже принёс
+          # все ветки, включая refs/remotes/origin/main (peer-verified для
+          # actions/checkout v4.4.0), а с persist-credentials: false у fetch не
+          # было бы креденшелов в приватном репо.
+          git merge-base --is-ancestor "$DEPLOY_SHA" origin/main \
+            || { echo "SHA $DEPLOY_SHA не является предком origin/main" >&2; exit 1; }
+          echo "sha=$DEPLOY_SHA" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy to GPU box via ProxyJump
+    needs: gate
+    runs-on: ubuntu-latest
+    # Без protection rules по решению владельца (2026-10-10): человеческий
+    # гейт — подтверждение в чате до dispatch, не GitHub reviewer.
+    environment: production
+    # Сборка образов идёт на боксе внутри принудительной команды — может
+    # занимать десятки минут (CUDA-образ), поэтому таймаут щедрый.
+    timeout-minutes: 60
+    env:
+      DEPLOY_SHA: ${{ needs.gate.outputs.sha }}
+
+    steps:
+      - name: Require provisioned transport (fail-closed)
+        env:
+          VPS_KEY: ${{ secrets.CONTENT_VPS_SSH_PRIVATE_KEY }}
+          BOX_KEY: ${{ secrets.CONTENT_BOX_SSH_PRIVATE_KEY }}
+          VPS_HOST: ${{ secrets.CONTENT_VPS_HOST }}
+          VPS_USER: ${{ secrets.CONTENT_VPS_USER }}
+          BOX_HOST: ${{ secrets.CONTENT_BOX_HOST }}
+          BOX_USER: ${{ secrets.CONTENT_BOX_USER }}
+          VPS_KNOWN_HOSTS: ${{ vars.CONTENT_VPS_KNOWN_HOSTS }}
+          BOX_KNOWN_HOSTS: ${{ vars.CONTENT_BOX_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ -n "$VPS_KEY" ]] || { echo "Missing CONTENT_VPS_SSH_PRIVATE_KEY (RU jump host)" >&2; exit 42; }
+          [[ -n "$BOX_KEY" ]] || { echo "Missing CONTENT_BOX_SSH_PRIVATE_KEY (GPU box)" >&2; exit 42; }
+          [[ -n "$VPS_HOST" ]] || { echo "Missing CONTENT_VPS_HOST (ProxyJump)" >&2; exit 42; }
+          [[ -n "$VPS_USER" ]] || { echo "Missing CONTENT_VPS_USER (ProxyJump)" >&2; exit 42; }
+          [[ -n "$BOX_HOST" ]] || { echo "Missing CONTENT_BOX_HOST (GPU box)" >&2; exit 42; }
+          [[ -n "$BOX_USER" ]] || { echo "Missing CONTENT_BOX_USER (GPU box)" >&2; exit 42; }
+          [[ -n "$VPS_KNOWN_HOSTS" ]] || { echo "Missing var CONTENT_VPS_KNOWN_HOSTS (pinned, never ssh-keyscan)" >&2; exit 42; }
+          [[ -n "$BOX_KNOWN_HOSTS" ]] || { echo "Missing var CONTENT_BOX_KNOWN_HOSTS (pinned, never ssh-keyscan)" >&2; exit 42; }
+          echo "Content zero-touch transport capability: CONNECTOR"
+
+      # Паттерн и настройки скопированы с sea-speed
+      # .github/workflows/deploy-ubuntu-worker.yml:152-196 («Configure
+      # restricted VPS ProxyJump to Ubuntu Worker»): приватные ключи во
+      # временные IdentityFile, pinned known_hosts, два Host-алиаса с
+      # IdentitiesOnly/BatchMode/StrictHostKeyChecking/ForwardAgent no,
+      # ProxyJump с РУ-хоста на бокс, RequestTTY no + ClearAllForwardings yes.
+      - name: Configure restricted VPS ProxyJump to GPU box
+        env:
+          VPS_KEY: ${{ secrets.CONTENT_VPS_SSH_PRIVATE_KEY }}
+          BOX_KEY: ${{ secrets.CONTENT_BOX_SSH_PRIVATE_KEY }}
+          VPS_HOST: ${{ secrets.CONTENT_VPS_HOST }}
+          VPS_USER: ${{ secrets.CONTENT_VPS_USER }}
+          BOX_HOST: ${{ secrets.CONTENT_BOX_HOST }}
+          BOX_USER: ${{ secrets.CONTENT_BOX_USER }}
+          VPS_PORT: ${{ vars.CONTENT_VPS_SSH_PORT || '22' }}
+          VPS_KNOWN_HOSTS: ${{ vars.CONTENT_VPS_KNOWN_HOSTS }}
+          BOX_KNOWN_HOSTS: ${{ vars.CONTENT_BOX_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$BOX_KEY" > "$HOME/.ssh/content-gpu-deploy"
+          printf '%s\n' "$VPS_KEY" > "$HOME/.ssh/content-vps-jump"
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > "$HOME/.ssh/vps_known_hosts"
+          printf '%s\n' "$BOX_KNOWN_HOSTS" > "$HOME/.ssh/box_known_hosts"
+          chmod 0600 "$HOME/.ssh/content-gpu-deploy" "$HOME/.ssh/content-vps-jump" \
+                     "$HOME/.ssh/vps_known_hosts" "$HOME/.ssh/box_known_hosts"
+          cat > "$HOME/.ssh/content-production-config" <<EOF_CONFIG
+          Host content-vps-jump
+              HostName $VPS_HOST
+              User $VPS_USER
+              Port $VPS_PORT
+              IdentityFile $HOME/.ssh/content-vps-jump
+              IdentitiesOnly yes
+              BatchMode yes
+              StrictHostKeyChecking yes
+              UserKnownHostsFile $HOME/.ssh/vps_known_hosts
+              ForwardAgent no
+
+          Host content-gpu-box
+              HostName $BOX_HOST
+              User $BOX_USER
+              Port 22
+              IdentityFile $HOME/.ssh/content-gpu-deploy
+              IdentitiesOnly yes
+              BatchMode yes
+              StrictHostKeyChecking yes
+              UserKnownHostsFile $HOME/.ssh/box_known_hosts
+              ProxyJump content-vps-jump
+              RequestTTY no
+              ForwardAgent no
+              ClearAllForwardings yes
+          EOF_CONFIG
+          # heredoc ложится уже с нулевым отступом: YAML block scalar снимает
+          # блочный отступ (peer-verified через ssh -G — Host на колонке 0).
+          chmod 0600 "$HOME/.ssh/content-production-config"
+
+      - name: Execute forced deployment command on the box
+        run: |
+          set -euo pipefail
+          ssh -F "$HOME/.ssh/content-production-config" content-gpu-box \
+            "content-deploy-v1 $DEPLOY_SHA" 2>&1 | tee "$RUNNER_TEMP/deploy-transcript.log"
+          grep -q "^DEPLOYMENT_ACCEPTED sha=$DEPLOY_SHA" "$RUNNER_TEMP/deploy-transcript.log" \
+            || { echo "В транскрипте нет маркера DEPLOYMENT_ACCEPTED sha=$DEPLOY_SHA" >&2; exit 1; }
+
+      - name: Upload deployment transcript
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: content-deploy-transcript-${{ needs.gate.outputs.sha }}
+          path: ${{ runner.temp }}/deploy-transcript.log
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Deployment summary
+        if: ${{ always() }}
+        run: |
+          {
+            echo "### Content deploy (${{ job.status }})"
+            echo "- Commit: \`$DEPLOY_SHA\`"
+            echo "- Execution: GitHub-hosted runner -> РУ-хост (ProxyJump) -> ZeroTier -> forced command content-deploy-v1"
+            echo "- Acceptance: маркер DEPLOYMENT_ACCEPTED sha=... в транскрипте (артефакт выше)"
+            echo "- Rollback: автоматический на предыдущий SHA при любой ошибке (см. deploy/deploy-wrapper)"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,70 @@
+name: ci
+
+# Лёгкая проверочная линия для content-стека (ComfyUI + manager, docker compose).
+# Намеренно БЕЗ docker build (CUDA-образ огромен) и БЕЗ скачивания моделей:
+# рантайм-проверки выполняются на GPU-боксе во время деплоя. Целевое время —
+# заметно меньше 2 минут.
+#
+# Когда ci.yml обрастёт покрытием (сборка/тесты), добавить в gate деплойного
+# workflow доверенную проверку прогона ci.yml, как в stroy
+# (.github/workflows/deploy.yml: «Select trusted ci.yml run» + verify jobs).
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate compose and deploy tooling
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Validate compose.yaml
+        run: |
+          set -euo pipefail
+          docker compose config -q
+          echo "compose.yaml: OK"
+
+      - name: Syntax-check deploy tooling
+        run: |
+          set -euo pipefail
+          bash -n deploy/deploy-wrapper
+          echo "deploy/deploy-wrapper: OK"
+
+      - name: YAML sanity check (compose.yaml + management)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob
+          import sys
+          try:
+              import yaml
+          except ImportError:
+              print("PyYAML недоступен — проверка пропущена")
+              raise SystemExit(0)
+          files = ["compose.yaml"]
+          files += sorted(glob.glob("management/**/*.yml", recursive=True))
+          files += sorted(glob.glob("management/**/*.yaml", recursive=True))
+          if not files:
+              print("YAML-файлов не найдено — нечего проверять")
+              raise SystemExit(0)
+          failed = False
+          for path in files:
+              try:
+                  with open(path, encoding="utf-8") as fh:
+                      yaml.safe_load(fh)
+                  print(f"{path}: OK")
+              except Exception as exc:  # noqa: BLE001 — sanity check, падаем по факту
+                  print(f"{path}: PARSE ERROR: {exc}")
+                  failed = True
+          raise SystemExit(1 if failed else 0)
+          PY
