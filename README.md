@@ -108,3 +108,55 @@ curl localhost:8000/api/status        # manager
 ```bash
 docker compose down
 ```
+
+## Deploy (GitHub Actions → GPU-бокс)
+
+Обновление работающего стека на GPU-сервере — dispatch-воркфлоу
+`.github/workflows/deploy.yml` по проверенному паттерну sea-speed
+(deploy-ubuntu-worker.yml). Транспорт: GitHub-hosted runner не видит ZeroTier,
+поэтому SSH с runner на РУ-хост (82.146.37.153) и дальше ProxyJump на GPU-бокс
+(ZeroTier 10.123.239.102). Хост-ключи закреплены (pinned) в repo variables,
+`ssh-keyscan` не используется.
+
+Поток:
+
+1. Изменения смёржены в `main`; после подтверждения в чате (человеческий гейт
+   — владелец, 2026-10-10) владелец запускает Actions → `deploy` с входом
+   `deploy_sha` — точный 40-hex SHA из `main`.
+2. Job `gate` fail-closed проверяет, что SHA — предок `origin/main`
+   (`git fetch` + `git merge-base --is-ancestor`). Доверенного CI-сигнала пока
+   нет (`.github/workflows/ci.yml` только валидирует compose и скрипты); когда
+   ci.yml обрастёт покрытием, в gate добавляется проверка trusted-прогона —
+   как в stroy.
+3. Job `deploy` (environment `production`, concurrency `content-production`)
+   настраивает SSH и выполняет на боксе единственную принудительную команду:
+   `content-deploy-v1 <sha>` (forced command у deploy-пользователя).
+4. Бокс сам подтягивает исходники (`git fetch` + checkout точного SHA) и
+   собирает из них образы (`docker compose build comfyui manager` → `up -d`)
+   — без артфакт-конверта, та же pull-of-source модель, что у sea-speed.
+   Затем health-проверка ~120 с: ComfyUI `http://127.0.0.1:8188/` и manager
+   `http://127.0.0.1:8000/` (порт из `.env`, tolerant: 200/302/404 = жив).
+   Успех = маркер `DEPLOYMENT_ACCEPTED sha=... previous=...` в транскрипте;
+   транскрипт сохраняется артефактом `content-deploy-transcript-<sha>`.
+
+Rollback: при любой ошибке после записи предыдущего SHA воркфлоу-скрипт
+автоматически возвращается на него (checkout + `docker compose build` +
+`up -d`) и печатает `DEPLOY_ROLLED_BACK`. Откат пересобирает образы и поэтому
+медленнее двухслотового swap у sea-speed; кэш сборки обычно делает пересборку
+быстрой.
+
+Bootstrap (однократно, Lane B) — клон репо на бокс, `.env` с `HF_TOKEN`
+(значение живёт только на боксе), deploy-пользователь с forced command,
+список GitHub secrets/variables — в шапке `deploy/deploy-wrapper`.
+
+GitHub Secrets/Vars (имена; значения не хранятся в репозитории):
+
+- secrets: `CONTENT_VPS_SSH_PRIVATE_KEY`, `CONTENT_BOX_SSH_PRIVATE_KEY`,
+  `CONTENT_VPS_HOST`, `CONTENT_VPS_USER`, `CONTENT_BOX_HOST`, `CONTENT_BOX_USER`
+- vars: `CONTENT_VPS_SSH_PORT` (опц., default 22), `CONTENT_VPS_KNOWN_HOSTS`,
+  `CONTENT_BOX_KNOWN_HOSTS` (pinned host keys)
+
+Риски (Lane C — ревью отдельно, сейчас не меняются): manager-порт публикуется
+на всех интерфейсах (`${MANAGER_PORT:-8000}:8000`), manager монтирует
+`/var/run/docker.sock` (root-эквивалент), ufw на боксе неактивен — решения
+владельца, зафиксированы в шапке `deploy/deploy-wrapper`.

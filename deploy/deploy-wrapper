@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# =============================================================================
+# content deploy-wrapper — принудительная команда (forced command) для
+# deploy-пользователя на GPU-боксе (ZeroTier 10.123.239.102). Вызывается
+# только из .github/workflows/deploy.yml (GitHub runner -> РУ-хост
+# 82.146.37.153 -> SSH ProxyJump -> бокс), паттерн sea-speed
+# deploy-ubuntu-worker.yml / deploy-authorized.sh.
+#
+# Глаголы (первый аргумент; всё остальное — отказ, fail-closed):
+#   content-deploy-v1 <sha>  — задеплоить точный 40-hex SHA из origin/main
+#   content-status-v1        — состояние репозитория и стека (read-only)
+#
+# content-deploy-v1, по шагам (любая ошибка = откат):
+#   1. flock (non-blocking): параллельный деплой отклоняется
+#   2. git fetch origin в чекауте $CONTENT_DIR (default /opt/content)
+#   3. проверка, что SHA — предок origin/main (merge-base --is-ancestor)
+#   4. предыдущий SHA -> $CONTENT_DIR/deploy-state/previous-sha
+#   5. git checkout --detach <sha>
+#   6. docker compose build comfyui manager (сборка из исходников — долгая)
+#   7. docker compose up -d
+#   8. health-цикл ~120 c: ComfyUI http://127.0.0.1:$COMFYUI_PORT/ и manager
+#      http://127.0.0.1:$MANAGER_PORT/ (порты читаются из $CONTENT_DIR/.env
+#      так же, как их читает compose; tolerant: 200/302/404 = жив,
+#      connection refused = ещё не готов)
+#   9. deploy-state/deployment-manifest.json
+#  10. маркер DEPLOYMENT_ACCEPTED sha=<sha> previous=<prev> в stdout
+#  При ошибке после шага 4: автоматический откат на предыдущий SHA
+#  (checkout + docker compose build + up -d) и маркер DEPLOY_ROLLED_BACK.
+#  ВНИМАНИЕ: откат ПЕРЕСОБИРАЕТ образы — это заметно медленнее двухслотового
+#  swap у sea-speed (там два слота и мгновенное переключение). На практике
+#  пересборка обычно быстрая за счёт кэша слоёв Docker; ускорение через
+#  два слота — кандидат в Lane C, здесь не делается.
+#
+# Bootstrap (однократно, Lane B — вручную или через sysadmin-агента):
+#   1. Клонировать репо на бокс (read-only deploy key):
+#        git clone git@github.com:MostDef2000/content.git /opt/content
+#   2. Создать /opt/content/.env со строкой HF_TOKEN=... (значение живёт
+#      ТОЛЬКО на боксе; chmod 600; в Git/чат не попадает).
+#   3. Deploy-пользователь и права:
+#        useradd -m -s /bin/bash content-deploy
+#        usermod -aG docker content-deploy     # группа docker — допущение
+#        chown -R content-deploy:content-deploy /opt/content  # /opt/content должен быть во владении/writable у deploy-юзера: git fetch/checkout в content-deploy-v1 выполняются от его имени
+#        install -d -o content-deploy -m 0700 /opt/content/deploy-state
+#   4. Установить этот файл на бокс:
+#        install -o root -g root -m 0755 deploy/deploy-wrapper \
+#          /usr/local/bin/content-deploy-wrapper
+#   5. В authorized_keys deploy-ключа бокса одной строкой (forced command):
+#        command="/usr/local/bin/content-deploy-wrapper",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA...
+#      Путь репо переопределяется через CONTENT_DIR (env); для forced command —
+#      environment="CONTENT_DIR=/путь" в authorized_keys + PermitUserEnvironment
+#      в sshd, либо правкой дефолта в установленной копии.
+#   6. GitHub Secrets/Vars (имена — в .github/workflows/deploy.yml и README
+#      «Deploy»): secrets CONTENT_VPS_SSH_PRIVATE_KEY, CONTENT_BOX_SSH_PRIVATE_KEY,
+#      CONTENT_VPS_HOST, CONTENT_VPS_USER, CONTENT_BOX_HOST, CONTENT_BOX_USER;
+#      vars CONTENT_VPS_SSH_PORT (опц., default 22), CONTENT_VPS_KNOWN_HOSTS,
+#      CONTENT_BOX_KNOWN_HOSTS (pinned ключи хостов; ssh-keyscan не используется).
+#
+# Известные риски (Lane C — НЕ чинить здесь, compose.yaml не трогаем; фиксация
+# по решению владельца):
+#   * manager публикует порт на всех интерфейсах ("${MANAGER_PORT:-8000}:8000"),
+#     а не на 127.0.0.1 — кандидат на сужение биндинга;
+#   * manager монтирует /var/run/docker.sock — root-эквивалентный доступ;
+#   * ufw на боксе неактивен — решение владельца.
+# =============================================================================
+
+set -Eeuo pipefail
+umask 077
+
+CONTENT_DIR="${CONTENT_DIR:-/opt/content}"
+STATE_DIR="$CONTENT_DIR/deploy-state"
+PREV_FILE="$STATE_DIR/previous-sha"
+LOCK_FILE="$STATE_DIR/deploy.lock"
+MANIFEST="$STATE_DIR/deployment-manifest.json"
+HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-120}"
+HEALTH_STEP_S="${HEALTH_STEP_S:-5}"
+
+PREV_SHA=""
+
+log()  { printf '[content-deploy] %s\n' "$*"; }
+fail() { printf '[content-deploy] ERROR %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat >&2 <<'USAGE'
+usage:
+  content-deploy-v1 <40-hex-sha>   deploy exact origin/main commit
+  content-status-v1                print repo/stack status (read-only)
+USAGE
+  exit 64
+}
+
+compose() {
+  docker compose --project-directory "$CONTENT_DIR" -f "$CONTENT_DIR/compose.yaml" "$@"
+}
+
+# Порт из .env бокса (compose интерполирует ${VAR:-default}); секреты из .env
+# сюда не попадают — читаем только строку конкретного порта.
+env_port() {
+  local name="$1" default="$2" line=""
+  if [[ -f "$CONTENT_DIR/.env" ]]; then
+    line="$(grep -E "^${name}=" "$CONTENT_DIR/.env" | tail -n 1 | cut -d= -f2- || true)"
+  fi
+  [[ "$line" =~ ^[0-9]+$ ]] || line="$default"
+  printf '%s' "$line"
+}
+
+# Живость: 200/302/404 считаем нормой (FastAPI-роуты на / может не быть),
+# connection refused / таймаут — сервис ещё не готов.
+health_probe() {
+  local url="$1" code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" || true)"
+  [[ "$code" == "200" || "$code" == "302" || "$code" == "404" ]]
+}
+
+wait_for_health() {
+  local comfy_url="$1" manager_url="$2" deadline=$((SECONDS + HEALTH_TIMEOUT_S))
+  while (( SECONDS < deadline )); do
+    if health_probe "$comfy_url" && health_probe "$manager_url"; then
+      log "health OK: comfyui + manager"
+      return 0
+    fi
+    log "waiting for health... ($((deadline - SECONDS))s left)"
+    sleep "$HEALTH_STEP_S"
+  done
+  log "health не сошёлся за ${HEALTH_TIMEOUT_S}s: comfyui=$comfy_url manager=$manager_url"
+  return 1
+}
+
+write_manifest() {
+  local sha="$1" prev="$2" comfy_url="$3" manager_url="$4" ts
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  cat > "$MANIFEST.tmp" <<JSON
+{
+  "schema": "content_deployment_manifest_v1",
+  "deployed_at": "$ts",
+  "sha": "$sha",
+  "previous": "$prev",
+  "services": ["comfyui", "manager"],
+  "health": {
+    "comfyui": "$comfy_url",
+    "manager": "$manager_url"
+  }
+}
+JSON
+  mv "$MANIFEST.tmp" "$MANIFEST"
+  chmod 0600 "$MANIFEST"
+  log "DEPLOYMENT_MANIFEST path=$MANIFEST"
+}
+
+# Откат: checkout предыдущего SHA + пересборка + up -d. Пересборка медленнее
+# двухслотового swap sea-speed — осознанный компромисс, см. шапку.
+do_rollback() {
+  local prev="$1"
+  printf '[content-deploy] ERROR deployment failed, rolling back to %s\n' "$prev" >&2
+  set +eE
+  trap - ERR
+  local rc=0
+  if ! git -C "$CONTENT_DIR" -c advice.detachedHead=false checkout --quiet --detach "$prev"; then
+    printf '[content-deploy] DEPLOY_ROLLED_BACK=no checkout_failed sha=%s\n' "$prev" >&2
+    exit 1
+  fi
+  compose build comfyui manager || rc=1
+  compose up -d || rc=1
+  if (( rc == 0 )); then
+    printf 'DEPLOY_ROLLED_BACK sha=%s restored=%s\n' "${DEPLOYED_SHA:-unknown}" "$prev"
+  else
+    printf '[content-deploy] ERROR rollback compose steps failed (rc=%s)\n' "$rc" >&2
+    exit 1
+  fi
+  exit 1
+}
+
+do_deploy() {
+  local sha="$1"
+
+  command -v git    >/dev/null 2>&1 || fail "git not found on box"
+  command -v docker >/dev/null 2>&1 || fail "docker not found on box"
+  command -v curl   >/dev/null 2>&1 || fail "curl not found on box"
+  command -v flock  >/dev/null 2>&1 || fail "flock not found on box"
+  [[ -f "$CONTENT_DIR/compose.yaml" ]] || fail "нет compose.yaml в $CONTENT_DIR (CONTENT_DIR?)"
+
+  install -d -m 0700 "$STATE_DIR"
+
+  # --- до записи состояния: проверки, ничего не мутируем -------------------
+  exec 9>>"$LOCK_FILE"
+  flock -n 9 || fail "другой деплой уже выполняется (lock $LOCK_FILE)"
+
+  git -C "$CONTENT_DIR" fetch --quiet origin
+  git -C "$CONTENT_DIR" merge-base --is-ancestor "$sha" origin/main \
+    || fail "sha $sha не достижим из origin/main — отказываюсь деплоить"
+
+  local dirty
+  dirty="$(git -C "$CONTENT_DIR" status --porcelain --untracked-files=no || true)"
+  [[ -z "$dirty" ]] || log "внимание: в чекауте есть локальные правки tracked-файлов (не блокирует, но деплой может отклониться от ожиданий)"
+
+  local prev comfy_port manager_port comfy_url manager_url
+  prev="$(git -C "$CONTENT_DIR" rev-parse HEAD)"
+  PREV_SHA="$prev"
+  DEPLOYED_SHA="$sha"
+  printf '%s\n' "$prev" > "$PREV_FILE.tmp"
+  mv "$PREV_FILE.tmp" "$PREV_FILE"
+
+  # --- с этого момента любая ошибка = автоматический откат ------------------
+  trap 'do_rollback "$PREV_SHA"' ERR
+
+  log "DEPLOY_MUTATION target=$sha previous=$prev"
+  git -C "$CONTENT_DIR" -c advice.detachedHead=false checkout --quiet --detach "$sha"
+
+  comfy_port="$(env_port COMFYUI_PORT 8188)"
+  manager_port="$(env_port MANAGER_PORT 8000)"
+  comfy_url="http://127.0.0.1:${comfy_port}/"
+  manager_url="http://127.0.0.1:${manager_port}/"
+
+  log "docker compose build (comfyui + manager) — это долго"
+  compose build comfyui manager
+  log "docker compose up -d"
+  compose up -d
+
+  # Голый вызов: возврат 1 уходит в ERR trap -> do_rollback (через `|| fail`
+  # ловушка ERR не срабатывает — это и был баг отката).
+  wait_for_health "$comfy_url" "$manager_url"
+
+  write_manifest "$sha" "$prev" "$comfy_url" "$manager_url"
+
+  trap - ERR
+  printf 'DEPLOYMENT_ACCEPTED sha=%s previous=%s\n' "$sha" "$prev"
+}
+
+do_status() {
+  [[ -d "$CONTENT_DIR/.git" ]] || fail "нет репозитория в $CONTENT_DIR (CONTENT_DIR=$CONTENT_DIR)"
+  local comfy_port manager_port comfy_url manager_url code
+  log "repo=$CONTENT_DIR"
+  git -C "$CONTENT_DIR" log --oneline -n 1 || true
+  if [[ -f "$PREV_FILE" ]]; then
+    log "previous-sha=$(cat "$PREV_FILE")"
+  else
+    log "previous-sha=(нет файла состояния)"
+  fi
+  compose ps || true
+  comfy_port="$(env_port COMFYUI_PORT 8188)"
+  manager_port="$(env_port MANAGER_PORT 8000)"
+  comfy_url="http://127.0.0.1:${comfy_port}/"
+  manager_url="http://127.0.0.1:${manager_port}/"
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$comfy_url" || true)"
+  log "comfyui $comfy_url -> ${code:-000}"
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$manager_url" || true)"
+  log "manager $manager_url -> ${code:-000}"
+  # status — read-only диагностика: всегда exit 0, факты видны в логе выше.
+  exit 0
+}
+
+[[ $# -ge 1 ]] || usage
+VERB="$1"
+shift
+
+case "$VERB" in
+  content-deploy-v1)
+    [[ $# -eq 1 ]] || fail "usage: content-deploy-v1 <40-hex-sha>"
+    [[ "$1" =~ ^[0-9a-f]{40}$ ]] || fail "sha должен быть lowercase 40-hex, получено: $1"
+    do_deploy "$1"
+    ;;
+  content-status-v1)
+    [[ $# -eq 0 ]] || fail "usage: content-status-v1 (без аргументов)"
+    do_status
+    ;;
+  *)
+    usage
+    ;;
+esac
