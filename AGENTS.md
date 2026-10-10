@@ -7,14 +7,20 @@ ComfyUI + FLUX.1-dev FP8 + LoRA + веб-пульт (`manager`).
 GitHub: `MostDef2000/content` (private). Инфраструктура: GPU-сервер (ZeroTier
 `10.123.239.102`, за NAT) + РУ-хост (`82.146.37.153`, ZeroTier 10.123.239.101,
 nginx-фронт + домен `3d.mostdef.ru`; Caddy установлен, но отключён). NL-хост не
-используется. Серверные действия — только
-через сисадмин-агента (`SYSADMIN-HANDOFF v1`).
+используется. Серверные действия: рутинные деплои кода — через
+dispatch-воркфлоу (deploy lane A: подтверждение владельца в чате →
+`gh workflow run`, см. `deploy/README.md`); всё остальное (bootstrap,
+миграции, секреты, nginx, фаервол) — только через сисадмин-агента
+(`SYSADMIN-HANDOFF v1`, модель полос в AGENTS.md песочницы).
 
 ## Canonical entry points
 
 - SDD: `.specify/memory/constitution.md`, `specs/README.md`, активные
   `specs/<feature>/{spec,plan,tasks}.md`.
-- Деплой: issue #1 (canonical checklist), `AUDIT.md`, `SYSADMIN-HANDOFF.md`.
+- Деплой: `.github/workflows/deploy.yml` + `deploy/README.md` (dispatch,
+  lane A); серверная история — issue #1 (canonical checklist), `AUDIT.md`
+  (отработанные SYSADMIN-HANDOFF-экземпляры из репо удалены, аудит в
+  `AUDIT.md`).
 - Запуск и поток генерации: `README.md`.
 
 ## Source authorization
