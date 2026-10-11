@@ -6,7 +6,9 @@
 # 82.146.37.153 -> SSH ProxyJump -> бокс), паттерн sea-speed
 # deploy-ubuntu-worker.yml / deploy-authorized.sh.
 #
-# Глаголы (первый аргумент; всё остальное — отказ, fail-closed):
+# Глаголы (первое слово SSH_ORIGINAL_COMMAND; всё остальное — отказ,
+# fail-closed): forced command в authorized_keys не передаёт argv — команда
+# клиента приходит в переменной окружения SSH_ORIGINAL_COMMAND:
 #   content-deploy-v1 <sha>  — задеплоить точный 40-hex SHA из origin/main
 #   content-status-v1        — состояние репозитория и стека (read-only)
 #
@@ -248,21 +250,14 @@ do_status() {
   exit 0
 }
 
-[[ $# -ge 1 ]] || usage
-VERB="$1"
-shift
-
-case "$VERB" in
-  content-deploy-v1)
-    [[ $# -eq 1 ]] || fail "usage: content-deploy-v1 <40-hex-sha>"
-    [[ "$1" =~ ^[0-9a-f]{40}$ ]] || fail "sha должен быть lowercase 40-hex, получено: $1"
-    do_deploy "$1"
-    ;;
-  content-status-v1)
-    [[ $# -eq 0 ]] || fail "usage: content-status-v1 (без аргументов)"
-    do_status
-    ;;
-  *)
-    usage
-    ;;
-esac
+# sshd с forced command (authorized_keys) не передаёт аргументов — команда
+# клиента приходит целиком в SSH_ORIGINAL_COMMAND. Диспетчеризация — точное
+# сопоставление (allowlist), без eval, без sh -c от ввода клиента.
+cmd="${SSH_ORIGINAL_COMMAND:-}"
+if [[ "$cmd" =~ ^content-deploy-v1\ ([0-9a-f]{40})$ ]]; then
+  do_deploy "${BASH_REMATCH[1]}"
+elif [[ "$cmd" == "content-status-v1" ]]; then
+  do_status
+else
+  usage
+fi

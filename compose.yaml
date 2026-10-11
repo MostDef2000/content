@@ -1,3 +1,9 @@
+# Фиксированное имя compose-проекта = текущий работающий стек (контейнеры
+# valery-comfyui-1/valery-manager-1, образ valery-comfyui); без него
+# `docker compose up -d` из /opt/content создаст ВТОРОЙ проект "content"
+# и упадёт на конфликте портов 8188/8000 (решение 2026-10-10, транспорт lane A).
+name: valery
+
 services:
   comfyui:
     build:
