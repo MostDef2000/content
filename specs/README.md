@@ -11,7 +11,9 @@ Status: Active
 - `plan.md`: КАК, решения, отклонённые альтернативы, риски, тест-дизайн.
 - `tasks.md`: ограниченное исполнение, acceptance-трассируемость, DoD.
 - Исходный код: реализация.
-- `AUDIT.md` / `SYSADMIN-HANDOFF.md`: инфраструктурный контур и передача сисадмин-агенту.
+- `AUDIT.md` / `.github/workflows/deploy.yml`: инфраструктурный контур и
+  деплой lane A; передача сисадмин-агенту — протокол DEPLOY-HANDOFF v1 (KB
+  песочницы, `.opencode/skills/sysadmin/knowledge/DEPLOY-HANDOFF.md`).
 - Runtime-свидетельства: operational-истина, записывается обратно в активные артефакты.
 
 ## Feature identifiers
@@ -26,7 +28,7 @@ Issue + видимая область работ
 -> spec / plan / tasks
 -> реализация + проверки (py_compile / json / bash -n / compose config)
 -> push в main (в рамках принятой области)
--> деплой через SYSADMIN-HANDOFF v1 (отдельный цикл с агентом)
+-> деплой через dispatch deploy-workflow (lane A, после подтверждения владельца по DEPLOY-TRIGGER)
 -> runtime-фидбек обратно в artifacts
 ```
 
