@@ -13,25 +13,29 @@
 #   content-status-v1        — состояние репозитория и стека (read-only)
 #
 # content-deploy-v1, по шагам (любая ошибка = откат):
-#   1. flock (non-blocking): параллельный деплой отклоняется
+#   1. cross-repo lock: flock (non-blocking) на /run/gpu-box-deploy.lock —
+#      общий контракт GPU-бокса для content и sea-speed (T8a); затем
+#      внутрирепозиторный lock $STATE_DIR/deploy.lock
 #   2. git fetch origin в чекауте $CONTENT_DIR (default /opt/content)
 #   3. проверка, что SHA — предок origin/main (merge-base --is-ancestor)
 #   4. предыдущий SHA -> $CONTENT_DIR/deploy-state/previous-sha
 #   5. git checkout --detach <sha>
 #   6. docker compose build comfyui manager (сборка из исходников — долгая)
+#      + пер-ША теги образов: valery-comfyui:<sha>, valery-manager:<sha>
 #   7. docker compose up -d
-#   8. health-цикл ~120 c: ComfyUI http://127.0.0.1:$COMFYUI_PORT/ и manager
-#      http://127.0.0.1:$MANAGER_PORT/ (порты читаются из $CONTENT_DIR/.env
-#      так же, как их читает compose; tolerant: 200/302/404 = жив,
-#      connection refused = ещё не готов)
+#   8. health-цикл ~120 c, СТРОГО HTTP 200 (302/404 = не жив):
+#      ComfyUI http://127.0.0.1:$COMFYUI_PORT/system_stats и manager
+#      http://127.0.0.1:$MANAGER_PORT/api/status (порты читаются из
+#      $CONTENT_DIR/.env так же, как их читает compose; connection refused /
+#      таймаут — сервис ещё не готов)
 #   9. deploy-state/deployment-manifest.json
 #  10. маркер DEPLOYMENT_ACCEPTED sha=<sha> previous=<prev> в stdout
-#  При ошибке после шага 4: автоматический откат на предыдущий SHA
-#  (checkout + docker compose build + up -d) и маркер DEPLOY_ROLLED_BACK.
-#  ВНИМАНИЕ: откат ПЕРЕСОБИРАЕТ образы — это заметно медленнее двухслотового
-#  swap у sea-speed (там два слота и мгновенное переключение). На практике
-#  пересборка обычно быстрая за счёт кэша слоёв Docker; ускорение через
-#  два слота — кандидат в Lane C, здесь не делается.
+#  При ошибке после шага 4: автоматический откат на предыдущий SHA БЕЗ
+#  пересборки (checkout prev + возврат дефолтных тегов на образы <image>:<prev>
+#  + compose up -d --no-build), затем тот же строгий health-цикл и маркер
+#  ROLLBACK_ACCEPTED / ROLLBACK_FAILED (sha/previous). Fail-closed, если тег
+#  <image>:<prev> отсутствует (например, первый деплой после введения пер-ША
+#  тегов — образа предыдущего SHA на боксе ещё нет).
 #
 # Bootstrap (однократно, Lane B — вручную или через sysadmin-агента):
 #   1. Клонировать репо на бокс (read-only deploy key):
@@ -43,6 +47,12 @@
 #        usermod -aG docker content-deploy     # группа docker — допущение
 #        chown -R content-deploy:content-deploy /opt/content  # /opt/content должен быть во владении/writable у deploy-юзера: git fetch/checkout в content-deploy-v1 выполняются от его имени
 #        install -d -o content-deploy -m 0700 /opt/content/deploy-state
+#   3b. Cross-repo deploy lock (общий контракт content/sea-speed, T8a) —
+#       однократно от root:
+#        install -o root -g root -m 0644 /dev/null /run/gpu-box-deploy.lock
+#       Если файла нет, wrapper пытается создать его сам (0644); без прав
+#       записи в /run это невозможно — deploy уйдёт fail-closed с подсказкой
+#       команды выше.
 #   4. Установить этот файл на бокс:
 #        install -o root -g root -m 0755 deploy/deploy-wrapper \
 #          /usr/local/bin/content-deploy-wrapper
@@ -51,8 +61,9 @@
 #      Путь репо переопределяется через CONTENT_DIR (env); для forced command —
 #      environment="CONTENT_DIR=/путь" в authorized_keys + PermitUserEnvironment
 #      в sshd, либо правкой дефолта в установленной копии.
-#   6. GitHub Secrets/Vars (имена — в .github/workflows/deploy.yml и README
-#      «Deploy»): secrets CONTENT_VPS_SSH_PRIVATE_KEY, CONTENT_BOX_SSH_PRIVATE_KEY,
+#   6. GitHub Secrets/Vars (имена — в .github/workflows/deploy.yml, контракт
+#      dispatch; единая программа деплоя — specs/deploy-unification/ в репо
+#      ai-playground): secrets CONTENT_VPS_SSH_PRIVATE_KEY, CONTENT_BOX_SSH_PRIVATE_KEY,
 #      CONTENT_VPS_HOST, CONTENT_VPS_USER, CONTENT_BOX_HOST, CONTENT_BOX_USER;
 #      vars CONTENT_VPS_SSH_PORT (опц., default 22), CONTENT_VPS_KNOWN_HOSTS,
 #      CONTENT_BOX_KNOWN_HOSTS (pinned ключи хостов; ssh-keyscan не используется).
@@ -75,6 +86,19 @@ LOCK_FILE="$STATE_DIR/deploy.lock"
 MANIFEST="$STATE_DIR/deployment-manifest.json"
 HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-120}"
 HEALTH_STEP_S="${HEALTH_STEP_S:-5}"
+
+# Cross-repo deploy lock (T8a): единый путь на GPU-боксе для ВСЕХ репо,
+# деплоящих на этот бокс — content сейчас, sea-speed принимает тот же путь
+# позже (вне скоупа этой задачи). flock non-blocking в начале deploy-пути:
+# параллельный деплой другого репо отклоняется.
+GPU_BOX_LOCK_FILE="/run/gpu-box-deploy.lock"
+
+# Имена образов фиксирует compose.yaml (name: valery + сервисы comfyui/manager
+# без явных image: ключей -> <проект>-<сервис>). После build ставим пер-ША
+# теги <image>:<sha> — их использует откат БЕЗ пересборки; docker image inspect
+# ниже ловит рассинхрон с compose.yaml fail-closed, а не в момент отката.
+COMFY_IMAGE="valery-comfyui"
+MANAGER_IMAGE="valery-manager"
 
 PREV_SHA=""
 
@@ -105,12 +129,20 @@ env_port() {
   printf '%s' "$line"
 }
 
-# Живость: 200/302/404 считаем нормой (FastAPI-роуты на / может не быть),
-# connection refused / таймаут — сервис ещё не готов.
+# Живость: СТРОГО HTTP 200 (302/404 = не жив); connection refused / таймаут —
+# сервис ещё не готов. Эндпоинты выбраны по исходникам приложений:
+#   * ComfyUI: GET /system_stats — штатный API-эндпоинт ComfyUI; сам менеджер
+#     использует его как проверку живости ComfyUI (management/main.py,
+#     _comfy_up(): urlopen(f"{COMFY_URL}/system_stats") + resp.status == 200).
+#   * manager: GET /api/status — реальный FastAPI-роут (management/main.py,
+#     @app.get("/api/status")); корень / отдаёт статику и диагностическим
+#     сигналом не является. Роут не требует авторизации (basicauth только на
+#     nginx-фронте) и не зависит от ComfyUI (comfy_up деградирует в false,
+#     а не в 5xx).
 health_probe() {
   local url="$1" code
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" || true)"
-  [[ "$code" == "200" || "$code" == "302" || "$code" == "404" ]]
+  [[ "$code" == "200" ]]
 }
 
 wait_for_health() {
@@ -148,8 +180,14 @@ JSON
   log "DEPLOYMENT_MANIFEST path=$MANIFEST"
 }
 
-# Откат: checkout предыдущего SHA + пересборка + up -d. Пересборка медленнее
-# двухслотового swap sea-speed — осознанный компромисс, см. шапку.
+# Откат БЕЗ пересборки: образы предыдущего успешного деплоя лежат на боксе под
+# пер-ША тегами <image>:<prev> (ставятся на шаге 6 каждого деплоя). Порядок:
+# checkout предыдущего SHA (compose.yaml того деплоя) -> fail-closed проверка
+# тегов -> возврат дефолтных тегов (<image> = :latest) на предыдущие образы ->
+# compose up -d --no-build (compose build НЕ вызывается) -> тот же строгий
+# health-цикл -> маркер ROLLBACK_ACCEPTED / ROLLBACK_FAILED. Любой исход
+# завершается exit 1: сам деплой провален, маркер отличает «откатился и
+# здоров» от «откат не удался — нужно ручное вмешательство».
 do_rollback() {
   local prev="$1"
   printf '[content-deploy] ERROR deployment failed, rolling back to %s\n' "$prev" >&2
@@ -157,16 +195,31 @@ do_rollback() {
   trap - ERR
   local rc=0
   if ! git -C "$CONTENT_DIR" -c advice.detachedHead=false checkout --quiet --detach "$prev"; then
-    printf '[content-deploy] DEPLOY_ROLLED_BACK=no checkout_failed sha=%s\n' "$prev" >&2
+    printf '[content-deploy] ROLLBACK_FAILED reason=checkout_failed sha=%s previous=%s\n' "${DEPLOYED_SHA:-unknown}" "$prev" >&2
     exit 1
   fi
-  compose build comfyui manager || rc=1
-  compose up -d || rc=1
-  if (( rc == 0 )); then
-    printf 'DEPLOY_ROLLED_BACK sha=%s restored=%s\n' "${DEPLOYED_SHA:-unknown}" "$prev"
-  else
-    printf '[content-deploy] ERROR rollback compose steps failed (rc=%s)\n' "$rc" >&2
+  if ! docker image inspect "$COMFY_IMAGE:$prev" >/dev/null 2>&1 \
+     || ! docker image inspect "$MANAGER_IMAGE:$prev" >/dev/null 2>&1; then
+    printf '[content-deploy] ROLLBACK_FAILED reason=previous_image_tag_absent want=%s:%s+%s:%s sha=%s previous=%s (предыдущий образ недоступен — ручное вмешательство)\n' \
+      "$COMFY_IMAGE" "$prev" "$MANAGER_IMAGE" "$prev" "${DEPLOYED_SHA:-unknown}" "$prev" >&2
     exit 1
+  fi
+  docker tag "$COMFY_IMAGE:$prev" "$COMFY_IMAGE" || rc=1
+  docker tag "$MANAGER_IMAGE:$prev" "$MANAGER_IMAGE" || rc=1
+  compose up -d --no-build || rc=1
+  if (( rc != 0 )); then
+    printf '[content-deploy] ROLLBACK_FAILED reason=restore_steps_failed rc=%s sha=%s previous=%s\n' "$rc" "${DEPLOYED_SHA:-unknown}" "$prev" >&2
+    exit 1
+  fi
+  local comfy_port manager_port comfy_url manager_url
+  comfy_port="$(env_port COMFYUI_PORT 8188)"
+  manager_port="$(env_port MANAGER_PORT 8000)"
+  comfy_url="http://127.0.0.1:${comfy_port}/system_stats"
+  manager_url="http://127.0.0.1:${manager_port}/api/status"
+  if wait_for_health "$comfy_url" "$manager_url"; then
+    printf 'ROLLBACK_ACCEPTED sha=%s previous=%s\n' "${DEPLOYED_SHA:-unknown}" "$prev"
+  else
+    printf '[content-deploy] ROLLBACK_FAILED reason=health_failed sha=%s previous=%s (стек поднят на предыдущих образах, но health не сошёлся — ручное вмешательство)\n' "${DEPLOYED_SHA:-unknown}" "$prev" >&2
   fi
   exit 1
 }
@@ -183,6 +236,18 @@ do_deploy() {
   install -d -m 0700 "$STATE_DIR"
 
   # --- до записи состояния: проверки, ничего не мутируем -------------------
+  # Cross-repo lock (T8a): не даём параллельного деплоя другого репо на этом
+  # GPU-боксе. Файл создаётся 0644 при отсутствии (см. bootstrap в шапке);
+  # flock на read-only fd — ядро снимает lock при закрытии fd, а fd закрывается
+  # при любом выходе процесса (включая ERR-trap/exit) — отдельной очистки нет
+  # и ошибки trap её не портят.
+  if [[ ! -e "$GPU_BOX_LOCK_FILE" ]]; then
+    ( umask 022 && : > "$GPU_BOX_LOCK_FILE" ) 2>/dev/null \
+      || fail "нет $GPU_BOX_LOCK_FILE и создать не удалось: выполните однократно 'install -o root -g root -m 0644 /dev/null $GPU_BOX_LOCK_FILE' (bootstrap GPU-бокса)"
+  fi
+  exec 8<"$GPU_BOX_LOCK_FILE" || fail "не открыть cross-repo lock $GPU_BOX_LOCK_FILE (права?)"
+  flock -n 8 || fail "another GPU-box deploy is active (cross-repo lock: content/sea-speed)"
+
   exec 9>>"$LOCK_FILE"
   flock -n 9 || fail "другой деплой уже выполняется (lock $LOCK_FILE)"
 
@@ -209,11 +274,20 @@ do_deploy() {
 
   comfy_port="$(env_port COMFYUI_PORT 8188)"
   manager_port="$(env_port MANAGER_PORT 8000)"
-  comfy_url="http://127.0.0.1:${comfy_port}/"
-  manager_url="http://127.0.0.1:${manager_port}/"
+  comfy_url="http://127.0.0.1:${comfy_port}/system_stats"
+  manager_url="http://127.0.0.1:${manager_port}/api/status"
 
   log "docker compose build (comfyui + manager) — это долго"
   compose build comfyui manager
+  # Пер-ША теги для отката без пересборки: валидируем дефолтные имена образов
+  # и ставим <image>:<sha> (см. комментарий у COMFY_IMAGE/MANAGER_IMAGE).
+  docker image inspect "$COMFY_IMAGE" >/dev/null \
+    || fail "образ $COMFY_IMAGE не найден после compose build (изменился нейминг в compose.yaml?)"
+  docker image inspect "$MANAGER_IMAGE" >/dev/null \
+    || fail "образ $MANAGER_IMAGE не найден после compose build (изменился нейминг в compose.yaml?)"
+  docker tag "$COMFY_IMAGE" "$COMFY_IMAGE:$sha"
+  docker tag "$MANAGER_IMAGE" "$MANAGER_IMAGE:$sha"
+  log "images tagged for rollback: $COMFY_IMAGE:$sha $MANAGER_IMAGE:$sha"
   log "docker compose up -d"
   compose up -d
 
@@ -240,8 +314,8 @@ do_status() {
   compose ps || true
   comfy_port="$(env_port COMFYUI_PORT 8188)"
   manager_port="$(env_port MANAGER_PORT 8000)"
-  comfy_url="http://127.0.0.1:${comfy_port}/"
-  manager_url="http://127.0.0.1:${manager_port}/"
+  comfy_url="http://127.0.0.1:${comfy_port}/system_stats"
+  manager_url="http://127.0.0.1:${manager_port}/api/status"
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$comfy_url" || true)"
   log "comfyui $comfy_url -> ${code:-000}"
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$manager_url" || true)"
