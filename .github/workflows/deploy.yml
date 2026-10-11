@@ -14,10 +14,14 @@ name: deploy
 #     сам делает git fetch точного SHA и собирает из исходников
 #     (docker compose build) — та же pull-of-source модель, что и у
 #     sea-speed deploy-authorized.sh.
-#   * Доверенного CI-сигнала пока не требуется: ci.yml только валидирует
-#     compose/скрипты. Когда ci.yml обрастёт покрытием — добавить сюда
-#     trusted-run проверку как в stroy (.github/workflows/deploy.yml,
-#     «Select trusted ci.yml run» + «Verify every ci.yml job succeeded»).
+#   * Доверенный CI-гейт (fail-closed): деплой требует для deploy_sha
+#     завершённого успешного прогона ci.yml (event=push, status=completed,
+#     conclusion=success; все job'ы прогона — success). Прогон выбирается
+#     как в stroy (.github/workflows/deploy.yml, «Select trusted ci.yml run»
+#     + «Verify every ci.yml job succeeded»). Известное ограничение (осознанно,
+#     НЕ расширять ci.yml в этой задаче): ci.yml пока валидирует только
+#     compose/скрипты/YAML — зелёный прогон означает валидность конфига,
+#     а не рантайм-проверку CUDA-стека; рантайм проверяет health-цикл на боксе.
 #   * environment: production — БЕЗ protection rules по решению владельца
 #     (2026-10-10): человеческий гейт — подтверждение в чате перед dispatch,
 #     а не required reviewer в GitHub.
@@ -34,6 +38,8 @@ on:
 
 permissions:
   contents: read
+  # Чтение Actions API для trusted-CI гейта (прогоны и job'ы ci.yml).
+  actions: read
 
 concurrency:
   group: content-production
@@ -46,6 +52,8 @@ jobs:
     timeout-minutes: 5
     outputs:
       sha: ${{ steps.validate.outputs.sha }}
+      ci_run_id: ${{ steps.select_ci.outputs.ci_run_id }}
+      ci_run_url: ${{ steps.select_ci.outputs.ci_run_url }}
     steps:
       - name: Check out gate tooling
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -69,6 +77,103 @@ jobs:
             || { echo "SHA $DEPLOY_SHA не является предком origin/main" >&2; exit 1; }
           echo "sha=$DEPLOY_SHA" >> "$GITHUB_OUTPUT"
 
+      # Trusted-CI gate (fail-closed), паттерн stroy .github/workflows/deploy.yml
+      # («Select trusted ci.yml run» + «Verify every ci.yml job succeeded»):
+      # для deploy_sha должен существовать завершённый успешный прогон ci.yml,
+      # запущенный push-событием, иначе деплой отклоняется.
+      - name: Select trusted ci.yml run (fail-closed)
+        id: select_ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ inputs.deploy_sha }}
+        run: |
+          set -euo pipefail
+          # Фильтры API: workflow ci.yml, event=push, status=completed,
+          # head_sha=deploy_sha, branch=main (доверенная ветка, как в stroy
+          # TRUSTED_BRANCH="main"). conclusion=success фильтруем на клиенте —
+          # список прогонов не фильтрует по conclusion (как в stroy).
+          gh api \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${DEPLOY_SHA}&event=push&status=completed&branch=main&per_page=100" \
+            > "$RUNNER_TEMP/ci-runs.json"
+          python3 - "$RUNNER_TEMP/ci-runs.json" > "$RUNNER_TEMP/ci-selected.json" <<'PY'
+          import json
+          import os
+          import sys
+
+          sha = os.environ["DEPLOY_SHA"]
+          with open(sys.argv[1], encoding="utf-8") as fh:
+              data = json.load(fh)
+          runs = data.get("workflow_runs")
+          if not isinstance(runs, list) or not runs:
+              sys.exit(f"нет прогонов ci.yml (event=push, completed) для sha {sha} — деплой отклонён")
+          total = data.get("total_count")
+          if isinstance(total, int) and not isinstance(total, bool) and total > len(runs):
+              sys.exit(f"пагинация неполная: получено {len(runs)} из {total} прогонов — деплой отклонён")
+          eligible = [
+              run for run in runs
+              if isinstance(run, dict)
+              and run.get("head_sha") == sha
+              and run.get("event") == "push"
+              and run.get("head_branch") == "main"
+              and run.get("status") == "completed"
+              and run.get("conclusion") == "success"
+          ]
+          if not eligible:
+              sys.exit(
+                  f"нет успешного push-прогона ci.yml для sha {sha} — деплой отклонён "
+                  "(dispatch только после зелёного CI на этом SHA)"
+              )
+
+          def _key(run):
+              return (str(run.get("created_at") or ""), int(run.get("id") or 0))
+
+          run = max(eligible, key=_key)
+          print(json.dumps({"id": run["id"], "url": run.get("html_url", "")}))
+          PY
+          CI_RUN_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$RUNNER_TEMP/ci-selected.json")"
+          CI_RUN_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["url"])' "$RUNNER_TEMP/ci-selected.json")"
+          echo "ci_run_id=$CI_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "ci_run_url=$CI_RUN_URL" >> "$GITHUB_OUTPUT"
+          echo "trusted ci.yml run: $CI_RUN_URL"
+
+      - name: Verify every ci.yml job succeeded (fail-closed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_RUN_ID: ${{ steps.select_ci.outputs.ci_run_id }}
+        run: |
+          set -euo pipefail
+          # per_page=100 + проверка total_count/incomplete: усечённая пагинация
+          # или пустой/битый payload = отказ деплоя (fail-closed).
+          gh api \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}/jobs?filter=latest&per_page=100" \
+            > "$RUNNER_TEMP/ci-jobs.json"
+          python3 - "$RUNNER_TEMP/ci-jobs.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as fh:
+              data = json.load(fh)
+          if data.get("incomplete") is True:
+              sys.exit("payload jobs помечен incomplete (пагинация) — деплой отклонён")
+          jobs = data.get("jobs")
+          if not isinstance(jobs, list) or not jobs:
+              sys.exit("прогон ci.yml не содержит job'ов — деплой отклонён")
+          total = data.get("total_count")
+          if isinstance(total, int) and not isinstance(total, bool) and total > len(jobs):
+              sys.exit(f"пагинация неполная: получено {len(jobs)} из {total} job'ов — деплой отклонён")
+          for job in jobs:
+              if not isinstance(job, dict) or not job.get("name"):
+                  sys.exit("повреждённая запись job в прогоне ci.yml — деплой отклонён")
+              if job.get("conclusion") != "success":
+                  sys.exit(
+                      f"job {job['name']!r}: conclusion={job.get('conclusion')!r} "
+                      "(ожидается success) — деплой отклонён"
+                  )
+          print("trusted ci.yml run: все job'ы успешны")
+          PY
+
   deploy:
     name: Deploy to GPU box via ProxyJump
     needs: gate
@@ -81,6 +186,7 @@ jobs:
     timeout-minutes: 60
     env:
       DEPLOY_SHA: ${{ needs.gate.outputs.sha }}
+      CI_RUN_URL: ${{ needs.gate.outputs.ci_run_url }}
 
     steps:
       - name: Require provisioned transport (fail-closed)
@@ -184,6 +290,7 @@ jobs:
           {
             echo "### Content deploy (${{ job.status }})"
             echo "- Commit: \`$DEPLOY_SHA\`"
+            echo "- Trusted CI: $CI_RUN_URL (прогон ci.yml для SHA, все job'ы success)"
             echo "- Execution: GitHub-hosted runner -> РУ-хост (ProxyJump) -> ZeroTier -> forced command content-deploy-v1"
             echo "- Acceptance: маркер DEPLOYMENT_ACCEPTED sha=... в транскрипте (артефакт выше)"
             echo "- Rollback: автоматический на предыдущий SHA при любой ошибке (см. deploy/deploy-wrapper)"
