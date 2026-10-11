@@ -13,8 +13,9 @@
 #   content-status-v1        — состояние репозитория и стека (read-only)
 #
 # content-deploy-v1, по шагам (любая ошибка = откат):
-#   1. cross-repo lock: flock (non-blocking) на /run/gpu-box-deploy.lock —
-#      общий контракт GPU-бокса для content и sea-speed (T8a); затем
+#   1. cross-repo lock: flock (non-blocking) на /var/tmp/gpu-box-deploy.lock —
+#      общий контракт GPU-бокса для content и sea-speed (T8a; ранее /run —
+#      миграция на персистентный self-heal путь, см. шапку 3b); затем
 #      внутрирепозиторный lock $STATE_DIR/deploy.lock
 #   2. git fetch origin в чекауте $CONTENT_DIR (default /opt/content)
 #   3. проверка, что SHA — предок origin/main (merge-base --is-ancestor)
@@ -48,11 +49,23 @@
 #        chown -R content-deploy:content-deploy /opt/content  # /opt/content должен быть во владении/writable у deploy-юзера: git fetch/checkout в content-deploy-v1 выполняются от его имени
 #        install -d -o content-deploy -m 0700 /opt/content/deploy-state
 #   3b. Cross-repo deploy lock (общий контракт content/sea-speed, T8a) —
-#       однократно от root:
-#        install -o root -g root -m 0644 /dev/null /run/gpu-box-deploy.lock
-#       Если файла нет, wrapper пытается создать его сам (0644); без прав
-#       записи в /run это невозможно — deploy уйдёт fail-closed с подсказкой
-#       команды выше.
+#       root-bootstrap НЕ нужен (self-heal): /var/tmp/gpu-box-deploy.lock
+#       wrapper создаёт сам при отсутствии. /var/tmp выбран вместо /run:
+#       персистентен (переживает reboot — /run это tmpfs, лок умирал при
+#       каждой перезагрузке) и на стандартной Ubuntu имеет режим 1777, так
+#       что deploy-пользователь может создать файл сам. Режим файла —
+#       umask-независимые 0666: flock/чтение работают и на 0644 (fd
+#       открывается read-only), а 0666 нужен, чтобы deploy-пользователь
+#       другого репо (sea-speed, T8b) мог touch'ить файл — обновлять mtime
+#       против tmpfiles-clean; чужой 0644-файл без права touch со временем
+#       был бы вычищен.
+#       systemd-tmpfiles-clean удаляет из /var/tmp файлы, неактивные >30
+#       дней (usr/lib/tmpfiles.d/tmp.conf): wrapper делает touch файла при
+#       каждом деплое — пока деплои идут, файл не стареет; после простоя
+#       >30 дней следующий деплой пересоздаёт его автоматически (self-heal,
+#       по-прежнему без root). Если на боксе остался старый root-файл
+#       /run/gpu-box-deploy.lock — он больше не используется и может быть
+#       удалён (в tmpfs и так исчезнет при reboot).
 #   4. Установить этот файл на бокс:
 #        install -o root -g root -m 0755 deploy/deploy-wrapper \
 #          /usr/local/bin/content-deploy-wrapper
@@ -89,9 +102,17 @@ HEALTH_STEP_S="${HEALTH_STEP_S:-5}"
 
 # Cross-repo deploy lock (T8a): единый путь на GPU-боксе для ВСЕХ репо,
 # деплоящих на этот бокс — content сейчас, sea-speed принимает тот же путь
-# позже (вне скоупа этой задачи). flock non-blocking в начале deploy-пути:
-# параллельный деплой другого репо отклоняется.
-GPU_BOX_LOCK_FILE="/run/gpu-box-deploy.lock"
+# позже (T8b). flock non-blocking в начале deploy-пути: параллельный деплой
+# другого репо отклоняется. Путь в /var/tmp, а не /run: /var/tmp персистентен
+# (переживает reboot) и на стандартной Ubuntu имеет режим 1777 — файл
+# создаётся самим wrapper'ом (self-heal, root-bootstrap не нужен), режим
+# 0666 umask-независимо — flock/read-only fd работают и без записи; 0666
+# нужен, чтобы deploy-юзер другого репо мог touch'ить файл (обновлять
+# mtime); touch при каждом деплое держит mtime свежим против
+# systemd-tmpfiles-clean (удаляет неактивные >30 дней) — см. шапку 3b.
+# Старый путь /run/gpu-box-deploy.lock больше не используется: остаточный
+# root-файл там можно удалить.
+GPU_BOX_LOCK_FILE="/var/tmp/gpu-box-deploy.lock"
 
 # Имена образов фиксирует compose.yaml (name: valery + сервисы comfyui/manager
 # без явных image: ключей -> <проект>-<сервис>). После build ставим пер-ША
@@ -237,15 +258,28 @@ do_deploy() {
 
   # --- до записи состояния: проверки, ничего не мутируем -------------------
   # Cross-repo lock (T8a): не даём параллельного деплоя другого репо на этом
-  # GPU-боксе. Файл создаётся 0644 при отсутствии (см. bootstrap в шапке);
+  # GPU-боксе. Self-heal, root-bootstrap не нужен: touch создаёт файл при
+  # отсутствии (/var/tmp на стандартной Ubuntu имеет режим 1777) и обновляет
+  # mtime при каждом деплое — systemd-tmpfiles-clean удаляет из /var/tmp
+  # файлы, неактивные >30 дней (см. шапку 3b). Режим создаваемого файла —
+  # umask-независимые 0666 (umask 000 внутри subshell): open+flock работает
+  # и на 0644 (read-only fd), 0666 нужен, чтобы deploy-юзер другого репо
+  # (sea-speed) мог touch'ить файл — обновлять mtime.
   # flock на read-only fd — ядро снимает lock при закрытии fd, а fd закрывается
   # при любом выходе процесса (включая ERR-trap/exit) — отдельной очистки нет
   # и ошибки trap её не портят.
-  if [[ ! -e "$GPU_BOX_LOCK_FILE" ]]; then
-    ( umask 022 && : > "$GPU_BOX_LOCK_FILE" ) 2>/dev/null \
-      || fail "нет $GPU_BOX_LOCK_FILE и создать не удалось: выполните однократно 'install -o root -g root -m 0644 /dev/null $GPU_BOX_LOCK_FILE' (bootstrap GPU-бокса)"
+  if ! ( umask 000 && touch "$GPU_BOX_LOCK_FILE" ) 2>/dev/null; then
+    # Не фатально: например, файл создан вручную/root как 0644 (файл другого
+    # deploy-юзера тут был бы 0666 — touch прошёл бы). Решает open+flock
+    # ниже — если файл непригоден, там fail-closed.
+    log "внимание: touch cross-repo lock не прошёл ($GPU_BOX_LOCK_FILE) — продолжаю, решит open+flock ниже"
   fi
-  exec 8<"$GPU_BOX_LOCK_FILE" || fail "не открыть cross-repo lock $GPU_BOX_LOCK_FILE (права?)"
+  # Belt-and-suspenders: выровнять режим на 0666. chmod чужого файла падает
+  # с EPERM — это НЕ фатально ТОЛЬКО при условии, что fd ниже открывается и
+  # лочится; если файл создать/открыть/залочить нельзя — fail-closed ниже.
+  chmod 0666 "$GPU_BOX_LOCK_FILE" 2>/dev/null || true
+  exec 8<"$GPU_BOX_LOCK_FILE" \
+    || fail "не открыть cross-repo lock $GPU_BOX_LOCK_FILE (self-heal не смог: нет прав на файл/каталог? — удалите файл от root, при следующем деплое он будет создан заново)"
   flock -n 8 || fail "another GPU-box deploy is active (cross-repo lock: content/sea-speed)"
 
   exec 9>>"$LOCK_FILE"
