@@ -9,7 +9,7 @@ GitHub: `MostDef2000/content` (private). Инфраструктура: GPU-се�
 nginx-фронт + домен `3d.mostdef.ru`; Caddy установлен, но отключён). NL-хост не
 используется. Серверные действия: рутинные деплои кода — через
 dispatch-воркфлоу (deploy lane A: подтверждение владельца в чате →
-`gh workflow run`, см. `deploy/README.md`); всё остальное (bootstrap,
+`gh workflow run`, см. `.github/workflows/deploy.yml`); всё остальное (bootstrap,
 миграции, секреты, nginx, фаервол) — только через сисадмин-агента
 (`SYSADMIN-HANDOFF v1`, модель полос в AGENTS.md песочницы).
 
@@ -17,7 +17,7 @@ dispatch-воркфлоу (deploy lane A: подтверждение владе�
 
 - SDD: `.specify/memory/constitution.md`, `specs/README.md`, активные
   `specs/<feature>/{spec,plan,tasks}.md`.
-- Деплой: `.github/workflows/deploy.yml` + `deploy/README.md` (dispatch,
+- Деплой: `.github/workflows/deploy.yml` + `deploy/deploy-wrapper` (dispatch,
   lane A); серверная история — issue #1 (canonical checklist), `AUDIT.md`
   (отработанные SYSADMIN-HANDOFF-экземпляры из репо удалены, аудит в
   `AUDIT.md`).
@@ -28,8 +28,12 @@ dispatch-воркфлоу (deploy lane A: подтверждение владе�
 Полная видимая область работ (scope) предъявляется в сообщении ассистента;
 авторизация — точная фраза `commit approved` в **следующем** сообщении
 пользователя. Приём возобновляет только ту же самую принятую область и не
-создаёт новой. Серверные мутации (compose up, скачивание моделей, Caddy,
-фаервол) выполняются через handoff-цикл, не через source authorization.
+создаёт новой. Серверные мутации выполняются не через source authorization:
+деплой, исполняемый GitHub deploy-workflow репозитория (dispatch по
+протоколу DEPLOY-TRIGGER после подтверждения владельца — lane A),
+handoff-цикла не требует; ручные серверные изменения вне воркфлоу (SSH:
+compose up руками, скачивание моделей, Caddy, фаервол) — только через
+SYSADMIN-HANDOFF.
 
 ## Hard rules
 
