@@ -18,7 +18,7 @@ services:
       HF_TOKEN: ${HF_TOKEN:-}
       PYTORCH_CUDA_ALLOC_CONF: backend:cudaMallocAsync
     volumes:
-      - ./runtime/models:/opt/ComfyUI/models
+      - /opt/sea-speed-worker/valery/runtime/models:/opt/ComfyUI/models
       - ./runtime/input:/opt/ComfyUI/input
       - ./runtime/output:/opt/ComfyUI/output
       - ./runtime/user:/opt/ComfyUI/user
