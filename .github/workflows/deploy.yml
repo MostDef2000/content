@@ -18,10 +18,10 @@ name: deploy
 #     завершённого успешного прогона ci.yml (event=push, status=completed,
 #     conclusion=success; все job'ы прогона — success). Прогон выбирается
 #     как в stroy (.github/workflows/deploy.yml, «Select trusted ci.yml run»
-#     + «Verify every ci.yml job succeeded»). Известное ограничение (осознанно,
-#     НЕ расширять ci.yml в этой задаче): ci.yml пока валидирует только
-#     compose/скрипты/YAML — зелёный прогон означает валидность конфига,
-#     а не рантайм-проверку CUDA-стека; рантайм проверяет health-цикл на боксе.
+#     + «Verify every ci.yml job succeeded»). Состав ci.yml: jobs validate
+#     (compose, deploy-тулинг, YAML/JSON-санити) + test (pytest-юнитки) —
+#     зелёный прогон означает валидность конфига и юнит-тесты,
+#     но не рантайм-проверку CUDA-стека; рантайм проверяет health-цикл на боксе.
 #   * environment: production — БЕЗ protection rules по решению владельца
 #     (2026-10-10): человеческий гейт — подтверждение в чате перед dispatch,
 #     а не required reviewer в GitHub.

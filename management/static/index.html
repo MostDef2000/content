@@ -216,6 +216,8 @@
           <button type="button" class="segbtn" data-postmode="private">Приватный</button>
         </div>
         <p class="mode-note">папка posts-private (превью доступно)</p>
+        <label>Модель поста (привязывает только этот пост, активная не меняется)</label>
+        <select id="postModel"></select>
         <label>Движок</label>
         <div class="seg" id="postEngineSeg">
           <button type="button" class="segbtn active" data-postengine="flux">FLUX</button>
@@ -229,8 +231,6 @@
         <select id="postScene"></select>
         <label>Prompt (необязательно — иначе соберётся из профиля и сцены)</label>
         <textarea id="postPrompt" rows="3" placeholder="оставьте пустым, чтобы использовать промт-профиль + сцену"></textarea>
-        <label>Caption (для Instagram, необязательно)</label>
-        <textarea id="postCaption" rows="2" placeholder="Текст поста для Instagram — можно оставить пустым"></textarea>
         <div class="grid2">
           <div>
             <label>Имя папки (необязательно)</label>
@@ -439,6 +439,7 @@
       postMode: "public",    // режим нового поста: public | private (Фаза 2)
       postEngine: "flux",    // движок нового поста: flux | sdxl (Фаза 4)
       postEngineFor: null,   // id модели, для которой движок уже установлен (свой или дефолт)
+      postModel: "",         // привязка поста к модели (issue #2 п.14): "" = активная
       dataset: [],           // записи GET /api/models/<id>/dataset: [{filename, tag}]
       datasetStats: null,    // {total, captioned} из ответа dataset-эндпоинта
       datasetFilter: "all",  // клиентский фильтр грида: all | tasteful | explicit
@@ -521,10 +522,52 @@
       $("modelSelect").innerHTML = models
         .map((m) => `<option value="${esc(m.id)}">${esc(m.name)} · ${esc(m.id)}${m.active ? " ★" : ""}</option>`).join("");
       if (state.activeId) $("modelSelect").value = state.activeId;
-      state.models = models; // нужно чипам группового кадра (stats.lora_file)
+      state.models = models; // нужно чипам группового кадра (stats.lora_file) + селектору поста (engine)
+      fillPostModelSelect();
       renderModelsList(models);
       renderGroupChips();
     }
+
+    // Селектор «Модель поста» (issue #2 п.14): привязывает только пост,
+    // активная модель не меняется. "" = «по умолчанию — активная».
+    // Значение переживает refresh (5s), как и остальные селекторы.
+    function fillPostModelSelect() {
+      const sel = $("postModel");
+      if (!sel) return;
+      const prev = state.postModel;
+      const active = (state.models || []).find((m) => m.id === state.activeId);
+      sel.innerHTML = '<option value="">по умолчанию — активная' +
+        (active ? ` (${esc(active.name)})` : "") +
+        '</option>' +
+        (state.models || [])
+          .map((m) => `<option value="${esc(m.id)}">${esc(m.name)} · ${esc(m.id)}${m.engine ? " · " + esc(m.engine) : ""}</option>`)
+          .join("");
+      if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+      else { sel.value = ""; state.postModel = ""; }
+    }
+
+    // Эффективная модель вкладки «Пост»: селектор или активная.
+    function postModelId() {
+      return state.postModel || state.activeId;
+    }
+
+    // Дефолт движка поста = архитектура LoRA эффективной модели
+    // (engine из /api/models; issue #2 п.14 + семантика п.15). Ручной выбор
+    // не перезаписывается, пока эффективная модель та же (postEngineFor);
+    // при смене модели движок переустанавливается на арх-ру новой.
+    // engine === null (нет/неизвестна LoRA) — не трогаем.
+    function applyPostEngineDefault() {
+      const m = (state.models || []).find((x) => x.id === postModelId());
+      if (m && m.engine && state.postEngineFor !== m.id) {
+        setPostEngine(m.engine);
+        state.postEngineFor = m.id;
+      }
+    }
+
+    $("postModel").onchange = () => {
+      state.postModel = $("postModel").value;
+      applyPostEngineDefault(); // движок перещёлкивается на арх-ру выбранной модели
+    };
 
     function renderModelsList(models) {
       const list = $("modelsList");
@@ -638,15 +681,11 @@
           } else if (state.profileFor !== state.activeId) {
             await loadProfile();
           }
-          // Дефолт движка поста = архитектура LoRA активной модели (am.engine:
-          // "sdxl" | "flux" | null). Ручной выбор пользователя не перезаписывается
-          // поллингом, пока активная модель та же (postEngineFor === am.id); при
-          // смене модели движок переустанавливается на арх-ру новой модели.
-          // am.engine === null (нет/неизвестна LoRA) — не трогаем.
-          if (am.engine && state.postEngineFor !== am.id) {
-            setPostEngine(am.engine);
-            state.postEngineFor = am.id;
-          }
+          // Дефолт движка поста = архитектура LoRA эффективной модели
+          // (селектор поста или активная; issue #2 п.14). Ручной выбор
+          // не перезаписывается поллингом, пока модель та же (postEngineFor);
+          // при смене модели движок переустанавливается на арх-ру новой.
+          applyPostEngineDefault();
         } else {
           $("activeModel").textContent = "нет активной модели";
           $("activeModel").className = "badge down";
@@ -1079,8 +1118,8 @@
     document.querySelectorAll("#postEngineSeg .segbtn").forEach((b) => {
       b.onclick = () => {
         setPostEngine(b.dataset.postengine);
-        // ручной выбор принадлежит текущей активной модели
-        state.postEngineFor = state.activeId;
+        // ручной выбор принадлежит эффективной модели поста (селектор или активная)
+        state.postEngineFor = postModelId();
       };
     });
 
@@ -1097,6 +1136,9 @@
     // Клик по миниатюре — лайтбокс (превью приватных включено, решение 16.09).
     // ✕ — мягкое удаление: DELETE /api/models/<id>/posts/<name>
     //   ?kind=<public|private>&confirm=<name>  → папка в runtime/trash/posts/.
+    // Под фото — сцена из post.json (issue #2 п.11): клик по имени открывает
+    // редактор сцены в библиотеке (только если сцена ещё существует);
+    // ↻ — «сгенерировать заново» по сохранённой сцене (seed — авто).
     function postCard(x, kind) {
       const kindDir = kind === "private" ? "posts-private" : "posts";
       const img = x.photo
@@ -1105,13 +1147,65 @@
       const caption = x.caption
         ? `<div class="muted" title="${esc(x.caption)}">${esc(truncate(x.caption, 40))}</div>`
         : "";
-      return `<div class="ds-card">${img}<div class="row" style="justify-content:space-between"><span class="ds-name" title="${esc(x.name)}">${esc(truncate(x.name, 16))}</span><button type="button" class="ghost tagbtn" data-postdel="${esc(x.name)}" title="Удалить пост">✕</button></div>${caption}</div>`;
+      let sceneRow = "";
+      if (x.scene_name || x.scene_id) {
+        const inLibrary = state.library.some((s) => s.id === x.scene_id);
+        sceneRow = inLibrary
+          ? `<div class="ds-name post-scene" data-sceneopen="${esc(x.scene_id)}" title="Открыть сцену в библиотеке">🎬 ${esc(truncate(sceneLabel(x), 22))}</div>`
+          : `<div class="ds-name" title="${esc(x.scene_name || x.scene_id)}">🎬 ${esc(truncate(sceneLabel(x), 22))}</div>`;
+      }
+      const rerun = x.scene_id
+        ? `<button type="button" class="ghost tagbtn" data-postrerun="${esc(x.name)}" title="Сгенерировать заново по этой сцене">↻</button>`
+        : "";
+      return `<div class="ds-card">${img}<div class="row" style="justify-content:space-between"><span class="ds-name" title="${esc(x.name)}">${esc(truncate(x.name, 16))}</span><span class="row">${rerun}<button type="button" class="ghost tagbtn" data-postdel="${esc(x.name)}" title="Удалить пост">✕</button></span></div>${sceneRow}${caption}</div>`;
+    }
+
+    // Подпись сцены на карточке: meta-имя, при его отсутствии — id.
+    function sceneLabel(x) {
+      return x.scene_name || x.scene_id || "";
     }
 
     function bindPostDeletes(box, kind) {
       box.querySelectorAll("button[data-postdel]").forEach((b) => {
         b.onclick = () => deletePost(b.dataset.postdel, kind);
       });
+      box.querySelectorAll(".post-scene").forEach((el) => {
+        el.onclick = () => openSceneFromPost(el.dataset.sceneopen);
+      });
+      box.querySelectorAll("button[data-postrerun]").forEach((b) => {
+        b.onclick = () => rerunPost(b.dataset.postrerun, kind);
+      });
+    }
+
+    // Клик по имени сцены на карточке → вкладка «Библиотека сцен» и тот же
+    // inline-редактор (openLibraryEdit). Сцена удалена → не открываем ничего:
+    // имя на карточке остаётся из post.json (meta), это отдельная ветка рендера.
+    function openSceneFromPost(sceneId) {
+      const idx = state.library.findIndex((s) => s.id === sceneId);
+      if (idx < 0) return;
+      document.querySelector('.tab[data-tab="library"]').click();
+      renderLibrary();
+      const card = document.querySelectorAll("#libList .lib-item")[idx];
+      openLibraryEdit(card, idx);
+    }
+
+    // «Сгенерировать заново» (issue #2 п.11): POST /api/jobs/post из сохранённого
+    // post.json — {scene_id, model_id, engine, mode}; seed не передаём (авто).
+    // Старый пост без meta (или без model_id) → бэкенд берёт активную модель.
+    async function rerunPost(name, kind) {
+      const list = kind === "private" ? state.postsPrivate : state.posts;
+      const post = (list || []).find((p) => p.name === name);
+      if (!post || !post.scene_id) { alert("У поста нет метаданных сцены — перезапуск недоступен."); return; }
+      try {
+        const body = {
+          scene_id: post.scene_id,
+          engine: post.engine || "flux",
+          mode: post.mode || kind,
+        };
+        if (post.model_id) body.model_id = post.model_id;
+        await api("POST", "/api/jobs/post", body);
+        refresh();
+      } catch (e) { alert("Ошибка перезапуска: " + e.message); }
     }
 
     async function deletePost(name, kind) {
@@ -1381,12 +1475,14 @@
             const prompt = $("postPrompt").value.trim();
             if (!scene && !prompt) { alert("Выберите сцену или введите prompt."); return; }
             body = {
-              caption: $("postCaption").value.trim(),
               name: $("postName").value || undefined,
               lora_strength: +$("postStrength").value,
               engine: state.postEngine, // flux (default) | sdxl
               uncensor: state.postEngine === "flux" && $("postUncensor").checked,
             };
+            // Привязка к модели (issue #2 п.14): только явный выбор в селекторе;
+            // пустое значение = активная модель (back-compat, model_id не шлём).
+            if (state.postModel) body.model_id = state.postModel;
             if ($("postSeed").value) body.seed = +$("postSeed").value; // пустое поле → seed не отправляем (бэкенд берёт случайный)
             if (scene) body.scene_id = scene;
             if (prompt) body.prompt = prompt;

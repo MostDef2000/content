@@ -542,24 +542,33 @@ def _lora_name_for_engine(model: dict[str, Any], engine: str) -> str:
     return str(model.get("lora") or f"{model_id}.safetensors")
 
 
+def _model_engine(model: dict[str, Any]) -> str | None:
+    """Recommended post engine by deployed LoRA slots (dual-arch): sdxl when
+    the sdxl-slot file is deployed, else flux when the flux-slot file is,
+    else None. Slot existence decides — a wrong-arch file in a slot is the
+    arch guard's (400) business at post/group time, not the engine default's.
+    Shared by _active_model_summary (/api/status) and list_models (/api/models,
+    per-model engine default for the post-tab selector, issue #2 п.14)."""
+    lora = model.get("lora")
+    if lora and (LORAS_DIR / str(lora)).is_file():
+        return "sdxl"
+    flux_lora = model.get("lora_flux")
+    if flux_lora and (LORAS_DIR / str(flux_lora)).is_file():
+        return "flux"
+    return None
+
+
 def _active_model_summary(model: dict[str, Any] | None) -> dict[str, Any] | None:
     if not model:
         return None
     lora = model.get("lora")
     lora_file = bool(lora) and (LORAS_DIR / str(lora)).is_file()
-    # Dual-arch (engine per LoRA slot): sdxl when the sdxl-slot file is
-    # deployed, else flux when the flux-slot file is, else None. Slot
-    # existence decides — a wrong-arch file in a slot is the arch guard's
-    # (400) business at post/group time, not the summary's.
-    flux_lora = model.get("lora_flux")
-    flux_file = bool(flux_lora) and (LORAS_DIR / str(flux_lora)).is_file()
-    engine = "sdxl" if lora_file else ("flux" if flux_file else None)
     return {
         "id": model.get("id"),
         "name": model.get("name"),
         "lora": lora,
         "lora_file": lora_file,
-        "engine": engine,  # recommended post engine: "sdxl" | "flux" | None (no deployed LoRA)
+        "engine": _model_engine(model),  # recommended post engine: "sdxl" | "flux" | None
     }
 
 
@@ -572,6 +581,17 @@ def _resolve_scene_text(model_id: str, scene_id: str) -> str:
     if isinstance(profile_scenes, dict) and profile_scenes.get(scene_id):
         return str(profile_scenes[scene_id]).strip()
     raise HTTPException(status_code=404, detail=f"scene not found: {scene_id}")
+
+
+def _scene_name(model_id: str, scene_id: str) -> str | None:
+    """Scene display name by id from the shared library (empty name → the id;
+    None when the id is not a library scene — e.g. a per-model profile scene).
+    Recorded into post.json so the card keeps the name even after the scene
+    is deleted from the library (issue #2 п.11)."""
+    for scene in _load_library().get("scenes", []):
+        if isinstance(scene, dict) and str(scene.get("id", "")) == scene_id:
+            return str(scene.get("name") or "").strip() or scene_id
+    return None
 
 
 def _build_model_prompt(
@@ -672,7 +692,7 @@ async def list_models() -> dict[str, Any]:
         model_id = str(model.get("id", "")).strip()
         if not model_id:
             continue
-        models.append({**model, "stats": _model_stats(model_id, model.get("lora"))})
+        models.append({**model, "stats": _model_stats(model_id, model.get("lora")), "engine": _model_engine(model)})
     return {"active_id": active.get("id") if active else None, "models": models}
 
 
@@ -1366,7 +1386,24 @@ async def job_expand(payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/api/jobs/post")
 async def job_post(payload: dict[str, Any]) -> dict[str, Any]:
-    model = _active_model_or_404()
+    # Per-post model binding (issue #2 п.14): an explicit payload.model_id
+    # binds ONLY this post — prompt profile, LoRA slots, guardrail age and
+    # the destination folder all resolve from that model. Empty/absent keeps
+    # the back-compat behaviour (the active model). The registry active flag
+    # is never touched: dataset/candidates/train keep following the active
+    # model (/api/status reports it unchanged).
+    requested_id = str(payload.get("model_id") or "").strip()
+    if requested_id:
+        try:
+            model = _model_or_404(requested_id)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                raise HTTPException(
+                    status_code=404, detail=f"модель не найдена: {requested_id}"
+                ) from exc
+            raise
+    else:
+        model = _active_model_or_404()
     model_id = str(model["id"])
     engine_fields = _validate_engine_fields(payload, allow_engine=True)
     engine = engine_fields["engine"]
@@ -1416,6 +1453,10 @@ async def job_post(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail="mode must be public or private")
     scene_id = str(payload.get("scene_id") or payload.get("scene") or "").strip()
     scene_text = _resolve_scene_text(model_id, scene_id) if scene_id else ""
+    # Scene meta for post.json (issue #2 п.11): the display name is resolved
+    # once here (library lookup, fallback the id) and passed through the CLI,
+    # so the post folder keeps the name even if the scene is deleted later.
+    scene_name = _scene_name(model_id, scene_id) if scene_id else None
 
     raw = str(payload.get("prompt", "")).strip()
     if raw:
@@ -1451,6 +1492,9 @@ async def job_post(payload: dict[str, Any]) -> dict[str, Any]:
     # --engine is a post-only flag (candidates/expand are flux-only);
     # --uncensor is added only when requested (flux paths only, no-op for sdxl).
     cmd += ["--engine", engine]
+    # Scene meta for post.json (issue #2 п.11): the id/name resolved above are
+    # recorded verbatim by generate_post (no second library lookup in the CLI).
+    cmd += ["--scene-id", scene_id, "--scene-name", scene_name or ""]
     if engine_fields["uncensor"]:
         cmd += ["--uncensor"]
     result = await _launch("post", cmd, model_id=model_id)
@@ -1637,6 +1681,29 @@ async def list_dataset() -> dict[str, Any]:
     return {"images": files}
 
 
+def _read_post_meta(post: Path) -> dict[str, Any]:
+    """Best-effort post.json meta (scene binding, issue #2 п.11): a missing,
+    unreadable or corrupt file — and a non-object payload — yield {}, so
+    legacy posts simply report scene_name None (the card shows «—»)."""
+    try:
+        meta = json.loads((post / "post.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _post_meta_fields(meta: dict[str, Any]) -> dict[str, Any]:
+    """The card-facing subset of post.json meta (None when absent)."""
+    return {
+        "scene_id": str(meta.get("scene_id") or "") or None,
+        "scene_name": str(meta.get("scene_name") or "") or None,
+        "model_id": str(meta.get("model_id") or "") or None,
+        "engine": str(meta.get("engine") or "") or None,
+        "mode": str(meta.get("mode") or "") or None,
+        "seed": meta.get("seed") if isinstance(meta.get("seed"), int) else None,
+    }
+
+
 @app.get("/api/posts")
 async def list_posts() -> dict[str, Any]:
     folder = _active_model_dir("posts")
@@ -1653,6 +1720,7 @@ async def list_posts() -> dict[str, Any]:
                 "name": post.name,
                 "photo": photo.name if photo else None,
                 "caption": caption.read_text(encoding="utf-8").strip() if caption.exists() else None,
+                **_post_meta_fields(_read_post_meta(post)),
             }
         )
     return {"posts": posts}
@@ -1680,6 +1748,7 @@ async def list_posts_private() -> dict[str, Any]:
                 "caption": caption.read_text(encoding="utf-8").strip() if caption.exists() else None,
                 "prompt": prompt.read_text(encoding="utf-8").strip() if prompt.exists() else None,
                 "created": datetime.fromtimestamp(post.stat().st_mtime, tz=timezone.utc).isoformat(),
+                **_post_meta_fields(_read_post_meta(post)),
             }
         )
     return {"posts": posts}

@@ -12,7 +12,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -417,6 +417,24 @@ def generate_post(args: argparse.Namespace) -> None:
         if args.caption.strip():
             (destination / "caption.txt").write_text(args.caption.strip() + "\n", encoding="utf-8")
         (destination / "prompt.txt").write_text(positive.strip() + "\n", encoding="utf-8")
+        # Scene meta (issue #2 п.11): a light post.json for the manager card —
+        # scene name stays on the card even after the scene leaves the library,
+        # and "generate again" replays {scene_id, model_id, engine, mode}.
+        # getattr: older direct callers (tests, ad-hoc scripts) pass a
+        # Namespace without the scene flags — meta simply omits the scene.
+        # Written inside the try: a failure rolls the whole folder back.
+        meta = {
+            "scene_id": str(getattr(args, "scene_id", "") or "").strip() or None,
+            "scene_name": str(getattr(args, "scene_name", "") or "").strip() or None,
+            "model_id": model_id,
+            "engine": args.engine,
+            "mode": args.mode,
+            "seed": args.seed,
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        (destination / "post.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
     except Exception:
         shutil.rmtree(destination, ignore_errors=True)
         raise
@@ -639,6 +657,16 @@ def parser() -> argparse.ArgumentParser:
         help="public → models/<id>/posts/, private → models/<id>/posts-private/",
     )
     post.add_argument("--model", default=None, help="Model id from models/registry.json (default: active)")
+    post.add_argument(
+        "--scene-id",
+        default="",
+        help="Scene id of the post (recorded in post.json; resolved by the manager)",
+    )
+    post.add_argument(
+        "--scene-name",
+        default="",
+        help="Scene display name (recorded in post.json; survives library deletion)",
+    )
     post.add_argument(
         "--engine",
         choices=("flux", "sdxl"),
