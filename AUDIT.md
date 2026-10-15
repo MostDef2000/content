@@ -41,17 +41,17 @@
 
 ## 5. Чек-лист для агента
 **GPU-сервер:**
-- [ ] `nvidia-smi` видит 5070 12 ГБ; `docker run --rm --gpus all nvidia/cuda:13.0.1-base-ubuntu24.04 nvidia-smi` работает.
+- [x] `nvidia-smi` видит 5070 12 ГБ; `docker run --rm --gpus all nvidia/cuda:13.0.1-base-ubuntu24.04 nvidia-smi` работает (см. §8, §10).
 - [ ] UFW: разрешить `22` (SSH, key-only), разрешить `8000` только с IP VPS; запретить `8188` и `8000` для остальных.
-- [ ] Клонировать `MostDef2000/content`; `cp .env.example .env`, вписать `HF_TOKEN`.
-- [ ] `bash scripts/prepare_server.sh` → `bash scripts/download_models.sh` → `docker compose up -d`.
-- [ ] Проверить: `curl localhost:8188/system_stats` и `curl localhost:8000/api/status`.
+- [x] Клонировать `MostDef2000/content`; `cp .env.example .env`, вписать `HF_TOKEN` (см. §10).
+- [x] `bash scripts/prepare_server.sh` → `bash scripts/download_models.sh` → `docker compose up -d` (см. §10).
+- [x] Проверить: `curl localhost:8188/system_stats` и `curl localhost:8000/api/status` (см. §10).
 - [ ] SSH: отключить пароль-логин, fail2ban.
 
 **РУ-хост (82.146.37.153):**
 - [x] nginx vhost с TLS (Let's Encrypt) + `basicauth` на `3d.mostdef.ru`; `proxy_pass http://10.123.239.102:8000` (Caddy отключён из-за конфликта 80/443 — см. §10).
-- [ ] Прямой доступ на `GPU:8000`/`:8188` из интернета запрещён.
-- [ ] (Опц.) rate-limit / fail2ban на Caddy.
+- [x] Прямой доступ на `GPU:8000`/`:8188` из интернета запрещён (см. §10 — шаг 5).
+- [ ] (Опц., решение владельца) rate-limit / fail2ban на фронте (nginx на РУ; Caddy удалён — см. §11).
 
 ## 6. Харденинг
 - Только nginx с `basicauth`+HTTPS снаружи (на РУ).

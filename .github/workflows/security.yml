@@ -1,0 +1,40 @@
+name: security
+
+# Секрет-скан репозитория (gitleaks) — issue #10, шаг 1. Живёт отдельным
+# workflow рядом с ci.yml: деплойный гейт (deploy.yml «Select trusted
+# ci.yml run») слушает только ci.yml, а секрет-скан должен прогоняться
+# независимо от него.
+#
+# Actions пинуются по полному commit-SHA, а не по тегу — конвенция репо
+# (см. ci.yml/deploy.yml): тег и major-тег подвижны и могут быть переписаны,
+# SHA — нет; это защита от подмены стороннего action.
+#
+# pip-audit / trivy сознательно отложены (issue #10, шаг 3): manager-сервис
+# живёт в Docker на GPU-боксе, аудит зависимостей — отдельное решение,
+# не в этом минимальном скоупе.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets-scan:
+    name: Gitleaks secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # gitleaks сканирует всю историю коммитов — нужна полная история
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

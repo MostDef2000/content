@@ -5,9 +5,11 @@ name: ci
 # рантайм-проверки выполняются на GPU-боксе во время деплоя. Целевое время —
 # заметно меньше 2 минут.
 #
-# Когда ci.yml обрастёт покрытием (сборка/тесты), добавить в gate деплойного
-# workflow доверенную проверку прогона ci.yml, как в stroy
-# (.github/workflows/deploy.yml: «Select trusted ci.yml run» + verify jobs).
+# Jobs: validate (compose, deploy-тулинг, YAML/JSON-санити) + test (pytest).
+# Деплойный workflow УЖЕ гейтит на зелёный прогон ci.yml
+# (.github/workflows/deploy.yml: «Select trusted ci.yml run» + verify jobs),
+# поэтому состав и зелёность ci.yml влияют на деплой. Секрет-скан (gitleaks)
+# живёт отдельно в .github/workflows/security.yml.
 
 on:
   push:
@@ -68,3 +70,58 @@ jobs:
                   failed = True
           raise SystemExit(1 if failed else 0)
           PY
+
+      - name: JSON sanity check (models registry + library)
+        run: |
+          set -euo pipefail
+          # issue #10, шаг 2: модели-реестр должны быть валидным JSON.
+          # Оба файла трекаются; SKIP-ветка — защита на случай, если
+          # registry.json когда-нибудь перестанет трекаться.
+          # Битый JSON = фейл (SystemExit 1).
+          python3 - <<'PY'
+          import json
+          import os
+
+          failed = False
+          for path in ("models/registry.json", "models/library.json"):
+              if not os.path.isfile(path):
+                  print(f"{path}: SKIP (файл отсутствует)")
+                  continue
+              try:
+                  with open(path, encoding="utf-8") as fh:
+                      json.load(fh)
+                  print(f"{path}: OK")
+              except Exception as exc:  # noqa: BLE001 — sanity check, падаем по факту
+                  print(f"{path}: PARSE ERROR: {exc}")
+                  failed = True
+          raise SystemExit(1 if failed else 0)
+          PY
+
+  test:
+    name: Unit tests (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          pip install -r management/requirements.txt
+          # пин мажора: job гейтит деплой (fail-closed), неожиданный релиз pytest
+          # не должен ломать деплойную линию
+          pip install "pytest>=8,<9"
+
+      - name: Run unit tests
+        run: |
+          set -euo pipefail
+          python3 -m pytest tests/ -q
