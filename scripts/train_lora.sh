@@ -6,6 +6,11 @@ TOOLKIT="${ROOT}/ai-toolkit"
 # kohya sd-scripts checkout for the FLUX trainer (spec 010): bind-mounted at
 # /workspace/kohya in the manager container (compose manager volumes).
 KOHYA="${ROOT}/kohya"
+# kohya venv lives OUTSIDE the checkout, on the persistent rw runtime mount:
+# the kohya clone ships a HOST uv-venv (venv/) that is broken inside the
+# container, and the checkout itself is host-owned — so the self-healing
+# bootstrap needs a writable, persistent location of its own (spec 010).
+KOHYA_VENV="${ROOT}/runtime/kohya-venv"
 
 # Copy the newest *.safetensors checkpoint of the given arch from
 # models/<model id>/lora/output/<model id>_<arch>_v1/ into the runtime slot
@@ -269,16 +274,24 @@ if [[ "${ARCH}" == "flux" ]]; then
     exit 0
   fi
 
-  # First flux run only: the host uv-venv shipped with the kohya clone does
-  # not work inside the container (interpreter symlink points at the host),
-  # so a fresh venv is bootstrapped from the container python3. ORDER MATTERS:
-  # install the cu124 torch wheels FIRST, then requirements.txt — a plain
-  # "pip install -r requirements.txt" first would pull a non-CUDA torch build.
-  if ! "${KOHYA}/venv/bin/python" -c "import torch, torchvision" >/dev/null 2>&1; then
-    echo "Bootstrapping kohya venv at ${KOHYA}/venv (first flux run only; expect 10-20 minutes)..." >&2
-    python3 -m venv "${KOHYA}/venv"
-    "${KOHYA}/venv/bin/python" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-    "${KOHYA}/venv/bin/python" -m pip install -r "${KOHYA}/requirements.txt"
+  # Venv bootstrap (first flux run, and self-heal on every broken state): the
+  # host uv-venv shipped with the kohya clone does not work inside the
+  # container (interpreter symlinks point at the host), so the venv is
+  # (re)created from the container python3 at runtime/kohya-venv — NOT inside
+  # the host-owned kohya checkout. ORDER MATTERS: install the cu124 torch
+  # wheels FIRST, then requirements.txt — a plain "pip install -r
+  # requirements.txt" first would pull a non-CUDA torch build.
+  # rm -rf before venv --clear is the self-heal: `python3 -m venv` alone dies
+  # with "Error: [Errno 2] No such file or directory" on a dir whose
+  # bin/python3 is a broken symlink (the host uv-venv case, repro
+  # train-1792131743); rm is fine because the container user writes to the
+  # runtime mount, and --clear makes even a leftover partial venv harmless.
+  if ! "${KOHYA_VENV}/bin/python3" -c "import torch, torchvision" >/dev/null 2>&1; then
+    echo "Bootstrapping kohya venv at ${KOHYA_VENV} (first flux run only; expect 10-20 minutes)..." >&2
+    rm -rf "${KOHYA_VENV}"
+    python3 -m venv --clear "${KOHYA_VENV}"
+    "${KOHYA_VENV}/bin/python" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+    "${KOHYA_VENV}/bin/python" -m pip install -r "${KOHYA}/requirements.txt"
   fi
 
   # Shared HF cache (FLUX.1-dev is pre-cached; CLIP/T5 tokenizer files download
@@ -288,7 +301,7 @@ if [[ "${ARCH}" == "flux" ]]; then
 
   cd "${KOHYA}"
   train_rc=0
-  "${KOHYA}/venv/bin/accelerate" launch \
+  "${KOHYA_VENV}/bin/accelerate" launch \
     --num_processes 1 \
     --num_machines 1 \
     --mixed_precision bf16 \

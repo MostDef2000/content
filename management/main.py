@@ -1260,7 +1260,9 @@ async def _ensure_comfy() -> str | None:
 async def _launch(kind: str, cmd: list[str], *, model_id: str | None = None) -> dict[str, Any]:
     if any(j.get("status") == "running" for j in jobs.values()):
         raise HTTPException(status_code=409, detail="GPU is busy with another job")
-    err = await _ensure_comfy()
+    # train must not wake ComfyUI: training does not use it, and per spec 010
+    # ComfyUI is stopped for the duration of a train run (shared 12 GB card).
+    err = None if kind == "train" else await _ensure_comfy()
     if err:
         raise HTTPException(status_code=503, detail=err)
     job_id = f"{kind}-{int(time.time())}"

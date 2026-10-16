@@ -38,6 +38,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import tomllib
 from pathlib import Path
@@ -141,6 +142,62 @@ def _run_deploy(root: Path) -> subprocess.CompletedProcess:
     return subprocess.run(["bash", str(driver)], capture_output=True, text=True, cwd=root)
 
 
+# Emulates `python3 -m venv` for the bootstrap test: a dangling-interpreter
+# venv dir fails exactly like the real CPython repro (Errno 2 on
+# bin/python3) unless --clear is passed; otherwise an executable stub
+# interpreter is created that logs every invocation (guard -c checks and
+# both pip installs) to the shim log. Anything not `-m venv` passes through
+# to the real interpreter. Placeholders __LOG__/__REAL_PYTHON__ are
+# substituted when the shim is written.
+_PYTHON3_VENV_SHIM = """#!/usr/bin/env bash
+log="__LOG__"
+echo "python3 $*" >> "$log"
+if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
+  shift 2
+  dir=""
+  clear=0
+  for a in "$@"; do
+    case "$a" in
+      --clear) clear=1 ;;
+      -*) ;;
+      *) dir="$a" ;;
+    esac
+  done
+  if [ -n "$dir" ]; then
+    if [ "$clear" -eq 0 ]; then
+      for exe in python3 python; do
+        if [ -L "$dir/bin/$exe" ] && [ ! -e "$dir/bin/$exe" ]; then
+          echo "Error: [Errno 2] No such file or directory: '$dir/bin/python3'" >&2
+          exit 1
+        fi
+      done
+    else
+      rm -rf "$dir"
+    fi
+    mkdir -p "$dir/bin"
+    printf '#!/bin/sh\\necho "venv-python $*" >> "%s"\\nexit 0\\n' "$log" > "$dir/bin/python3"
+    chmod 755 "$dir/bin/python3"
+    ln -sf python3 "$dir/bin/python"
+    exit 0
+  fi
+fi
+exec "__REAL_PYTHON__" "$@"
+"""
+
+
+def _install_python3_venv_shim(root: Path) -> tuple[Path, Path]:
+    """Put the venv-emulating `python3` shim first on PATH; returns
+    (shim bin dir, log file)."""
+    shim_dir = root / "fixture-bin"
+    shim_dir.mkdir()
+    log = root / "shim.log"
+    script = _PYTHON3_VENV_SHIM.replace("__LOG__", str(log)).replace("__REAL_PYTHON__", sys.executable)
+    shim = shim_dir / "python3"
+    shim.write_text(script, encoding="utf-8")
+    shim.chmod(0o755)
+    return shim_dir, log
+
+
 # ---------------------------------------------------------------------------
 # 1. text contract of scripts/train_lora.sh
 # ---------------------------------------------------------------------------
@@ -165,9 +222,12 @@ def test_flux_launches_accelerate_with_config_and_dataset_files():
     # sd-scripts consumes TWO rendered files: --config_file (script args) and
     # --dataset_config (strict voluptuous schema) — one merged file cannot
     # serve both, so both flags must be on the accelerate launch invocation.
+    # The venv bin dir is matched as ${ANY_VAR}/bin/accelerate: the bootstrap
+    # self-heal fix may relocate the venv off the host-owned kohya checkout;
+    # the contract pinned here is the launch call shape, not its location.
     text = _script_text()
     launch = re.search(
-        r'\$\{KOHYA\}/venv/bin/accelerate"\s+launch(?P<body>.*?)\|\|\s+train_rc',
+        r'\$\{[A-Za-z_]+\}[^\s"]*/bin/accelerate"\s+launch(?P<body>.*?)\|\|\s+train_rc',
         text,
         re.DOTALL,
     )
@@ -388,6 +448,55 @@ def test_sdxl_skip_train_path_unregressed_without_kohya():
         assert rendered.is_file()
         assert MODEL_ID in rendered.read_text(encoding="utf-8")
         assert not (root / "runtime" / "train" / f"{MODEL_ID}_flux_kohya.toml").exists()
+    finally:
+        _cleanup(root)
+
+
+def test_flux_bootstrap_self_heals_broken_host_venv():
+    # Prod bug (smoke train-1792131743): the kohya clone ships a HOST uv-venv
+    # whose bin/python{,3} are dangling symlinks into the host filesystem.
+    # `python3 -m venv ${KOHYA}/venv` then dies with the real CPython repro
+    # "Error: [Errno 2] No such file or directory: '<dir>/bin/python3'" and
+    # set -e kills the whole flux run BEFORE training starts. The bootstrap
+    # must self-heal (rm -rf / venv --clear; venv off the host-owned
+    # checkout): the run has to get PAST the venv step and reach the trainer
+    # launch. SKIP_TRAIN=1 cannot cover this (the seam fires before the
+    # bootstrap), so the run goes all the way with a PATH-shimmed python3:
+    # the shim emulates `python3 -m venv` and the stub interpreter logs the
+    # pip installs; the run is then expected to fail ONLY at the missing
+    # accelerate binary inside the stub venv (no network, no GPU touched).
+    root = _build_root()
+    try:
+        venv = root / "kohya" / "venv"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "pyvenv.cfg").write_text("home = /host/nonexistent/uv-python\n", encoding="utf-8")
+        for exe in ("python", "python3"):
+            os.symlink("/host/nonexistent/uv-python/bin/python3.12", venv / "bin" / exe)
+        (root / "kohya" / "requirements.txt").write_text("torch\n", encoding="utf-8")
+        shim_dir, log = _install_python3_venv_shim(root)
+        result = _run_script(
+            root,
+            MODEL_ID,
+            "flux",
+            STEPS=STEPS_SMOKE,
+            PATH=f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
+        )
+        log_text = log.read_text(encoding="utf-8") if log.exists() else ""
+        # 1) the venv step must no longer die on the broken host interpreter.
+        assert "Errno 2" not in result.stderr, (result.returncode, result.stderr, log_text)
+        # 2) the run must reach the trainer launch: the stub venv ships no
+        #    accelerate binary, so the script's own launch-failure marker is
+        #    the proof of arrival (and rc != 0 — the run must not fake success).
+        assert "flux_train_network.py exited with code" in result.stderr, (result.returncode, result.stderr, log_text)
+        assert result.returncode != 0
+        # 3) the bootstrap really ran through the shimmed python3 -m venv and
+        #    then BOTH pip installs on the stub interpreter, in the required
+        #    order (cu124 torch wheels first, then requirements.txt).
+        assert "-m venv" in log_text, log_text
+        pip_lines = [line for line in log_text.splitlines() if "-m pip install" in line]
+        assert len(pip_lines) == 2, log_text
+        assert "torch" in pip_lines[0] and "cu124" in pip_lines[0], pip_lines
+        assert "requirements.txt" in pip_lines[1], pip_lines
     finally:
         _cleanup(root)
 

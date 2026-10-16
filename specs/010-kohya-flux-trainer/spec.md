@@ -26,6 +26,11 @@ FLUX-LoRA-тренинг (`train_lora.sh <id> flux`) реально работа
    Выход тренера: `models/<id>/lora/output/<id>_flux_v1/`.
 4. **Первый запуск самодостаточен**: venv бутстрапится внутри контейнера
    (хостовый uv-venv не работает — symlink на хостовый интерпретатор);
+   venv живёт на персистентном rw-маунте `runtime/kohya-venv` (вне
+   хост-владельческого чекаута kohya) и самолечится: `rm -rf` +
+   `python3 -m venv --clear` при проваленной probe-пробе
+   (`import torch, torchvision`; прод-кейс train-1792131743 — Errno 2 на
+   битом venv);
    4 файла базовых моделей резолвятся из общего ComfyUI-runtime
    (раскладка `scripts/download_models.sh`); HF-кэш — общий
    `/workspace/runtime/hf-cache`, токен — из `.env` существующим механизмом.
