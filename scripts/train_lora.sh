@@ -286,12 +286,21 @@ if [[ "${ARCH}" == "flux" ]]; then
   # bin/python3 is a broken symlink (the host uv-venv case, repro
   # train-1792131743); rm is fine because the container user writes to the
   # runtime mount, and --clear makes even a leftover partial venv harmless.
-  if ! "${KOHYA_VENV}/bin/python3" -c "import torch, torchvision" >/dev/null 2>&1; then
+  # The probe is torch import + the accelerate binary (the final artifact of
+  # the requirements install): a venv with torch but a half-finished
+  # requirements step would otherwise skip the bootstrap and die on the
+  # missing trainer binary instead of healing (partial-bootstrap, F1).
+  if ! "${KOHYA_VENV}/bin/python3" -c "import torch, torchvision" >/dev/null 2>&1 || [[ ! -x "${KOHYA_VENV}/bin/accelerate" ]]; then
     echo "Bootstrapping kohya venv at ${KOHYA_VENV} (first flux run only; expect 10-20 minutes)..." >&2
     rm -rf "${KOHYA_VENV}"
     python3 -m venv --clear "${KOHYA_VENV}"
     "${KOHYA_VENV}/bin/python" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-    "${KOHYA_VENV}/bin/python" -m pip install -r "${KOHYA}/requirements.txt"
+    # requirements.txt carries a relative editable install of sd-scripts
+    # itself ("-e ."); pip resolves it against the CURRENT WORKING DIRECTORY,
+    # so the install must run from inside the checkout — from the manager
+    # cwd it fails with "Obtaining file:///workspace ... neither 'setup.py'
+    # nor 'pyproject.toml' found" (prod case train-1792134096).
+    ( cd "${KOHYA}" && "${KOHYA_VENV}/bin/python" -m pip install -r "${KOHYA}/requirements.txt" )
   fi
 
   # Shared HF cache (FLUX.1-dev is pre-cached; CLIP/T5 tokenizer files download

@@ -142,12 +142,18 @@ def _run_deploy(root: Path) -> subprocess.CompletedProcess:
     return subprocess.run(["bash", str(driver)], capture_output=True, text=True, cwd=root)
 
 
-# Emulates `python3 -m venv` for the bootstrap test: a dangling-interpreter
+# Emulates `python3 -m venv` for the bootstrap tests: a dangling-interpreter
 # venv dir fails exactly like the real CPython repro (Errno 2 on
 # bin/python3) unless --clear is passed; otherwise an executable stub
 # interpreter is created that logs every invocation (guard -c checks and
-# both pip installs) to the shim log. Anything not `-m venv` passes through
-# to the real interpreter. Placeholders __LOG__/__REAL_PYTHON__ are
+# both pip installs) WITH ITS CWD to the shim log. Anything not `-m venv`
+# passes through to the real interpreter. The stub models pip semantics for
+# the two bootstrap installs: `pip install -r *requirements.txt` reads the
+# mode file — "fail" reproduces train-1792134096 (requirements die
+# mid-install: exit 1, no trainer binary), "ok" succeeds and creates a
+# bin/accelerate stub (exit 7 — a "real" trainer launch that fails without
+# faking training success), so a completed bootstrap always reaches the
+# launch stage. Placeholders __LOG__/__MODEFILE__/__REAL_PYTHON__ are
 # substituted when the shim is written.
 _PYTHON3_VENV_SHIM = """#!/usr/bin/env bash
 log="__LOG__"
@@ -175,7 +181,31 @@ if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
       rm -rf "$dir"
     fi
     mkdir -p "$dir/bin"
-    printf '#!/bin/sh\\necho "venv-python $*" >> "%s"\\nexit 0\\n' "$log" > "$dir/bin/python3"
+    cat > "$dir/bin/python3" <<STUB
+#!/bin/sh
+echo "venv-python cwd=\\$PWD \\$*" >> "$log"
+mode="\\$(cat "__MODEFILE__" 2>/dev/null || echo ok)"
+has_r=0
+has_req=0
+for a in "\\$@"; do
+  case "\\$a" in
+    -r) has_r=1 ;;
+    *requirements.txt) has_req=1 ;;
+  esac
+done
+if [ "\\$has_r" -eq 1 ] && [ "\\$has_req" -eq 1 ]; then
+  if [ "\\$mode" = fail ]; then
+    echo "pip-requirements FAILED cwd=\\$PWD" >> "$log"
+    exit 1
+  fi
+  bin_dir="\\$(dirname "\\$0")"
+  printf '#!/bin/sh\\necho "accelerate \\$*" >> "%s"\\nexit 7\\n' "$log" > "\\$bin_dir/accelerate"
+  chmod 755 "\\$bin_dir/accelerate"
+  echo "pip-requirements OK cwd=\\$PWD" >> "$log"
+  exit 0
+fi
+exit 0
+STUB
     chmod 755 "$dir/bin/python3"
     ln -sf python3 "$dir/bin/python"
     exit 0
@@ -185,17 +215,25 @@ exec "__REAL_PYTHON__" "$@"
 """
 
 
-def _install_python3_venv_shim(root: Path) -> tuple[Path, Path]:
+def _install_python3_venv_shim(root: Path) -> tuple[Path, Path, Path]:
     """Put the venv-emulating `python3` shim first on PATH; returns
-    (shim bin dir, log file)."""
+    (shim bin dir, log file, mode file). The mode file content selects the
+    requirements-pip behaviour: "ok" (default) or "fail" (requirements die
+    mid-install). Flip it between runs to script multi-run scenarios."""
     shim_dir = root / "fixture-bin"
     shim_dir.mkdir()
     log = root / "shim.log"
-    script = _PYTHON3_VENV_SHIM.replace("__LOG__", str(log)).replace("__REAL_PYTHON__", sys.executable)
+    mode = root / "shim.mode"
+    mode.write_text("ok", encoding="utf-8")
+    script = (
+        _PYTHON3_VENV_SHIM.replace("__LOG__", str(log))
+        .replace("__MODEFILE__", str(mode))
+        .replace("__REAL_PYTHON__", sys.executable)
+    )
     shim = shim_dir / "python3"
     shim.write_text(script, encoding="utf-8")
     shim.chmod(0o755)
-    return shim_dir, log
+    return shim_dir, log, mode
 
 
 # ---------------------------------------------------------------------------
@@ -455,16 +493,18 @@ def test_sdxl_skip_train_path_unregressed_without_kohya():
 def test_flux_bootstrap_self_heals_broken_host_venv():
     # Prod bug (smoke train-1792131743): the kohya clone ships a HOST uv-venv
     # whose bin/python{,3} are dangling symlinks into the host filesystem.
-    # `python3 -m venv ${KOHYA}/venv` then dies with the real CPython repro
-    # "Error: [Errno 2] No such file or directory: '<dir>/bin/python3'" and
-    # set -e kills the whole flux run BEFORE training starts. The bootstrap
-    # must self-heal (rm -rf / venv --clear; venv off the host-owned
-    # checkout): the run has to get PAST the venv step and reach the trainer
-    # launch. SKIP_TRAIN=1 cannot cover this (the seam fires before the
-    # bootstrap), so the run goes all the way with a PATH-shimmed python3:
-    # the shim emulates `python3 -m venv` and the stub interpreter logs the
-    # pip installs; the run is then expected to fail ONLY at the missing
-    # accelerate binary inside the stub venv (no network, no GPU touched).
+    # `python3 -m venv` then dies with the real CPython repro "Error: [Errno
+    # 2] No such file or directory: '<dir>/bin/python3'" and set -e kills the
+    # whole flux run BEFORE training starts. The bootstrap must self-heal
+    # (rm -rf / venv --clear; venv off the host-owned checkout): the run has
+    # to get PAST the venv step and reach the trainer launch. SKIP_TRAIN=1
+    # cannot cover this (the seam fires before the bootstrap), so the run
+    # goes all the way with a PATH-shimmed python3: the shim emulates
+    # `python3 -m venv`, the stub interpreter logs the pip installs and the
+    # successful requirements install creates a bin/accelerate stub exiting
+    # 7 — the canonical full-bootstrap signature is the launch of THAT stub
+    # ("flux_train_network.py exited with code 7"), not the earlier
+    # "accelerate binary missing" (rc 127) shape.
     root = _build_root()
     try:
         venv = root / "kohya" / "venv"
@@ -472,8 +512,8 @@ def test_flux_bootstrap_self_heals_broken_host_venv():
         (venv / "pyvenv.cfg").write_text("home = /host/nonexistent/uv-python\n", encoding="utf-8")
         for exe in ("python", "python3"):
             os.symlink("/host/nonexistent/uv-python/bin/python3.12", venv / "bin" / exe)
-        (root / "kohya" / "requirements.txt").write_text("torch\n", encoding="utf-8")
-        shim_dir, log = _install_python3_venv_shim(root)
+        (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
+        shim_dir, log, _mode = _install_python3_venv_shim(root)
         result = _run_script(
             root,
             MODEL_ID,
@@ -484,11 +524,10 @@ def test_flux_bootstrap_self_heals_broken_host_venv():
         log_text = log.read_text(encoding="utf-8") if log.exists() else ""
         # 1) the venv step must no longer die on the broken host interpreter.
         assert "Errno 2" not in result.stderr, (result.returncode, result.stderr, log_text)
-        # 2) the run must reach the trainer launch: the stub venv ships no
-        #    accelerate binary, so the script's own launch-failure marker is
-        #    the proof of arrival (and rc != 0 — the run must not fake success).
-        assert "flux_train_network.py exited with code" in result.stderr, (result.returncode, result.stderr, log_text)
-        assert result.returncode != 0
+        # 2) the run reached the trainer launch and ran the trainer binary
+        #    (the stub exits 7 — a real failure, no faked success).
+        assert "flux_train_network.py exited with code 7" in result.stderr, (result.returncode, result.stderr, log_text)
+        assert result.returncode == 7
         # 3) the bootstrap really ran through the shimmed python3 -m venv and
         #    then BOTH pip installs on the stub interpreter, in the required
         #    order (cu124 torch wheels first, then requirements.txt).
@@ -497,6 +536,102 @@ def test_flux_bootstrap_self_heals_broken_host_venv():
         assert len(pip_lines) == 2, log_text
         assert "torch" in pip_lines[0] and "cu124" in pip_lines[0], pip_lines
         assert "requirements.txt" in pip_lines[1], pip_lines
+    finally:
+        _cleanup(root)
+
+
+def test_flux_pip_requirements_runs_with_cwd_inside_kohya_checkout():
+    # Prod bug (smoke train-1792134096): kohya's requirements.txt carries a
+    # relative editable install of sd-scripts itself (line 58: "-e ."), and
+    # pip resolves it against the CURRENT WORKING DIRECTORY — the job log
+    # shows "Obtaining file:///workspace (from -r /workspace/kohya/
+    # requirements.txt (line 58))" then "neither 'setup.py' nor
+    # 'pyproject.toml' found". The script installs requirements BEFORE its
+    # `cd "${KOHYA}"`, so the manager's cwd (/workspace) is used. The
+    # requirements pip install must run with CWD = the kohya checkout.
+    # The stub interpreter logs the CWD of every call; the red assertion
+    # today is the logged cwd of the `-m pip install -r` line.
+    root = _build_root()
+    try:
+        (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
+        # the checkout really is a python project (pip's -e . target)
+        (root / "kohya" / "pyproject.toml").write_text('[project]\nname = "sd-scripts"\n', encoding="utf-8")
+        shim_dir, log, _mode = _install_python3_venv_shim(root)
+        result = _run_script(
+            root,
+            MODEL_ID,
+            "flux",
+            STEPS=STEPS_SMOKE,
+            PATH=f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
+        )
+        log_text = log.read_text(encoding="utf-8") if log.exists() else ""
+        req_lines = [line for line in log_text.splitlines() if "-m pip install -r" in line]
+        assert len(req_lines) == 1, log_text
+        assert f"cwd={root / 'kohya'} " in req_lines[0], (
+            "pip install -r requirements.txt must run with CWD = the kohya "
+            f"checkout so the relative '-e .' resolves; the stub was invoked "
+            f"from here instead: {req_lines[0]!r}"
+        )
+        # the run otherwise completes the bootstrap and launches the trainer
+        # stub (exit 7) — the fix must not break the success path.
+        assert "flux_train_network.py exited with code 7" in result.stderr, (result.returncode, result.stderr, log_text)
+        assert result.returncode == 7
+    finally:
+        _cleanup(root)
+
+
+def test_flux_guard_rebootstraps_after_partial_bootstrap():
+    # Prod trap found on the same job (F1 gate): the bootstrap guard probes
+    # only `import torch` inside the venv. When the cu124 wheels landed but
+    # the requirements install died mid-way, the venv is HALF-BUILT (torch
+    # importable, no bin/accelerate) — the next run skips the bootstrap and
+    # fails on the missing trainer binary instead of healing. The guard must
+    # also require ${KOHYA_VENV}/bin/accelerate so a partial bootstrap is
+    # rebuilt from scratch.
+    # Scenario: run 1 with the shim's requirements-pip in "fail" mode
+    # (cu124 OK, requirements FAILED — the train-1792134096 shape); run 2
+    # against the SAME venv dir with requirements now succeeding must re-run
+    # the whole bootstrap (fresh venv + both pip installs) and launch the
+    # trainer stub. Today run 2 skips the bootstrap (torch-only guard) and
+    # dies on the missing accelerate — no venv/pip lines in its log and the
+    # launch marker shows rc 127, not the trainer stub's 7.
+    root = _build_root()
+    try:
+        (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
+        (root / "kohya" / "pyproject.toml").write_text('[project]\nname = "sd-scripts"\n', encoding="utf-8")
+        shim_dir, log, mode = _install_python3_venv_shim(root)
+        path_env = f"{shim_dir}{os.pathsep}{os.environ['PATH']}"
+
+        # (a) run 1: requirements die mid-install → no launch at all.
+        mode.write_text("fail", encoding="utf-8")
+        r1 = _run_script(root, MODEL_ID, "flux", STEPS=STEPS_SMOKE, PATH=path_env)
+        log1 = log.read_text(encoding="utf-8") if log.exists() else ""
+        assert r1.returncode != 0, (r1.returncode, r1.stderr)
+        assert any("cu124" in line for line in log1.splitlines()), log1
+        assert "pip-requirements FAILED" in log1, log1
+        assert "flux_train_network.py exited with code" not in r1.stderr, r1.stderr
+        # locate the venv the script created (location-agnostic: it is the
+        # dir argument of the logged `python3 -m venv` call)
+        venv_lines = [line for line in log1.splitlines() if line.startswith("python3 -m venv")]
+        assert venv_lines, log1
+        venv_dir = Path(venv_lines[-1].rsplit(None, 1)[-1])
+        assert (venv_dir / "bin" / "python3").is_file(), venv_dir
+        assert not (venv_dir / "bin" / "accelerate").exists(), "half-built venv must lack the trainer binary"
+
+        # (b) run 2, same venv dir, requirements now succeed: the guard must
+        #     notice the half-built venv and re-run the whole bootstrap.
+        mode.write_text("ok", encoding="utf-8")
+        log.unlink()
+        r2 = _run_script(root, MODEL_ID, "flux", STEPS=STEPS_SMOKE, PATH=path_env)
+        log2 = log.read_text(encoding="utf-8") if log.exists() else ""
+        assert "-m venv" in log2, (
+            "run 2 skipped the bootstrap on a half-built venv (torch-only "
+            f"guard): no fresh venv creation in the log.\nlog2:\n{log2}\nstderr:\n{r2.stderr}"
+        )
+        pip2 = [line for line in log2.splitlines() if "-m pip install" in line]
+        assert len(pip2) == 2, log2
+        assert "flux_train_network.py exited with code 7" in r2.stderr, (r2.returncode, r2.stderr, log2)
+        assert r2.returncode == 7
     finally:
         _cleanup(root)
 
