@@ -3,6 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOOLKIT="${ROOT}/ai-toolkit"
+# kohya sd-scripts checkout for the FLUX trainer (spec 010): bind-mounted at
+# /workspace/kohya in the manager container (compose manager volumes).
+KOHYA="${ROOT}/kohya"
 
 # Copy the newest *.safetensors checkpoint of the given arch from
 # models/<model id>/lora/output/<model id>_<arch>_v1/ into the runtime slot
@@ -37,6 +40,82 @@ copy_lora_output() {
   echo "LoRA ready (${arch}): ${newest} -> ${dest}"
 }
 
+# ---- FLUX (kohya) helpers (spec 010) --------------------------------------
+
+# resolve_existing CANDIDATE...: print the first candidate that exists as a
+# regular file, non-zero exit when none does (callers fail fast with a
+# per-component actionable message).
+resolve_existing() {
+  local cand
+  for cand in "$@"; do
+    if [[ -f "${cand}" ]]; then
+      printf '%s\n' "${cand}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# require_flux_int NAME VALUE: numeric placeholders render as bare integers
+# (the templates keep them quoted so the templates themselves stay valid
+# TOML); reject anything non-numeric before the render.
+require_flux_int() {
+  local name="$1" value="$2"
+  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+    echo "Invalid ${name} '${value}': must be a non-negative integer." >&2
+    exit 2
+  fi
+}
+
+# render_kohya_toml TEMPLATE DEST: render a flux kohya TOML template. String
+# placeholders keep their quotes; the quoted numeric placeholders ("{{STEPS}}",
+# "{{SEED}}", "{{RESOLUTION}}", "{{BATCH}}") are replaced together with the
+# quotes because sd-scripts expects bare integers there.
+render_kohya_toml() {
+  sed \
+    -e "s/{{MODEL_ID}}/${MODEL_ID}/g" \
+    -e "s|{{OUTPUT_DIR}}|${FLUX_OUTPUT_DIR}|g" \
+    -e "s|{{DATASET_DIR}}|${DATASET_DIR}|g" \
+    -e "s/\"{{STEPS}}\"/${FLUX_STEPS}/g" \
+    -e "s/\"{{SEED}}\"/${FLUX_SEED}/g" \
+    -e "s/\"{{RESOLUTION}}\"/${FLUX_RESOLUTION}/g" \
+    -e "s/\"{{BATCH}}\"/${FLUX_BATCH}/g" \
+    -e "s|{{FLUX_DIT}}|${FLUX_DIT}|g" \
+    -e "s|{{FLUX_AE}}|${FLUX_AE}|g" \
+    -e "s|{{FLUX_CLIP_L}}|${FLUX_CLIP_L}|g" \
+    -e "s|{{FLUX_T5XXL}}|${FLUX_T5XXL}|g" \
+    "$1" > "$2"
+}
+
+# Deploy the newest FLUX kohya checkpoint to the registry FLUX slot:
+#   runtime/models/loras/<model id>-flux.safetensors
+# The DASH form is the contract of management/main.py `_lora_name_for_engine`
+# (registry slot "lora_flux") — do NOT switch to underscores. tmp + mv keeps
+# the copy atomic so a concurrent ComfyUI load never sees a partial file.
+# Args:
+#   deploy_flux_lora MODEL_ID [ROOT]
+deploy_flux_lora() {
+  local model_id="$1"
+  local root="${2:-${ROOT}}"
+  local out_dir="${root}/models/${model_id}/lora/output/${model_id}_flux_v1"
+  local dest
+  dest="${root}/runtime/models/loras/${model_id}-flux.safetensors"
+  local newest tmp
+  newest="$(find "${out_dir}" -type f -name '*.safetensors' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2- || true)"
+  if [[ -z "${newest}" ]]; then
+    echo "Training finished but no flux *.safetensors checkpoint found under ${out_dir}; nothing to copy to ${dest}." >&2
+    return 3
+  fi
+  mkdir -p "$(dirname "${dest}")"
+  tmp="$(mktemp "$(dirname "${dest}")/.${model_id}-flux.tmp.XXXXXX")"
+  cp -f "${newest}" "${tmp}"
+  # mktemp creates 0600 files; restore the usual 0644 so non-root readers on
+  # the shared runtime mount are not locked out.
+  chmod 644 "${tmp}"
+  mv -f "${tmp}" "${dest}"
+  echo "LoRA ready (flux): ${newest} -> ${dest}"
+}
+
 if [[ ! -x "${TOOLKIT}/venv/bin/python" ]]; then
   echo "Run scripts/install_trainer.sh first." >&2
   exit 2
@@ -69,8 +148,14 @@ fi
 # back-compat. Selects the training template and the runtime LoRA slot:
 #   sdxl → lora/train_config.template.yaml      → runtime/train/<id>.yaml
 #         → runtime/models/loras/<id>.safetensors
-#   flux → lora/train_config.flux.template.yaml → runtime/train/<id>_flux.yaml
+#   flux → lora/train_config_flux_kohya{,_dataset}.template.toml
+#         → runtime/train/<id>_flux_kohya{,_dataset}.toml
 #         → runtime/models/loras/<id>-flux.safetensors
+# The flux branch renders TWO config files because of how sd-scripts consumes
+# them: --config_file (script arguments; every TOML section is flattened into
+# the argparse namespace) and --dataset_config (validated strictly by a
+# voluptuous schema that rejects any non-dataset keys), so one merged file
+# cannot serve both options (spec 010).
 if [[ $# -ge 2 ]]; then
   ARCH="$2"
 else
@@ -86,8 +171,10 @@ if [[ "${ARCH}" != "sdxl" && "${ARCH}" != "flux" ]]; then
 fi
 
 if [[ "${ARCH}" == "flux" ]]; then
-  TEMPLATE="${ROOT}/lora/train_config.flux.template.yaml"
-  RENDERED="${ROOT}/runtime/train/${MODEL_ID}_flux.yaml"
+  TEMPLATE="${ROOT}/lora/train_config_flux_kohya.template.toml"
+  TEMPLATE_DATASET="${ROOT}/lora/train_config_flux_kohya_dataset.template.toml"
+  RENDERED="${ROOT}/runtime/train/${MODEL_ID}_flux_kohya.toml"
+  RENDERED_DATASET="${ROOT}/runtime/train/${MODEL_ID}_flux_kohya_dataset.toml"
 else
   TEMPLATE="${ROOT}/lora/train_config.template.yaml"
   RENDERED="${ROOT}/runtime/train/${MODEL_ID}.yaml"
@@ -112,6 +199,109 @@ fi
 if [[ ! -f "${TEMPLATE}" ]]; then
   echo "Missing config template: ${TEMPLATE}" >&2
   exit 2
+fi
+
+# ---- FLUX (kohya) branch (spec 010) -----------------------------------------
+# Self-contained: preflight, dual render, SKIP_TRAIN seam, venv bootstrap,
+# launch, deploy. Success ends with exit 0 and every failure path exits with
+# its own code, so the untouched SDXL path below only ever runs for sdxl.
+if [[ "${ARCH}" == "flux" ]]; then
+  # Fail fast on a missing trainer checkout (same discipline as the
+  # ai-toolkit guard): /workspace/kohya must be bind-mounted in the container.
+  if [[ ! -f "${KOHYA}/flux_train_network.py" ]]; then
+    echo "kohya sd-scripts not found at ${KOHYA} (flux_train_network.py missing); check the /workspace/kohya bind mount in compose.yaml." >&2
+    exit 2
+  fi
+  if [[ ! -f "${TEMPLATE_DATASET}" ]]; then
+    echo "Missing config template: ${TEMPLATE_DATASET}" >&2
+    exit 2
+  fi
+
+  # Numeric render overrides ({{STEPS}}/{{SEED}}/{{RESOLUTION}}/{{BATCH}}):
+  # the templates quote them to stay valid TOML, so the render must only ever
+  # write bare integers — validate the env overrides before rendering.
+  # Defaults target the 12 GB card; STEPS=20 makes a usable smoke run.
+  FLUX_STEPS="${STEPS:-1500}"
+  FLUX_SEED="${SEED:-1}"
+  FLUX_RESOLUTION="${RESOLUTION:-768}"
+  FLUX_BATCH="${BATCH:-1}"
+  require_flux_int "STEPS" "${FLUX_STEPS}"
+  require_flux_int "SEED" "${FLUX_SEED}"
+  require_flux_int "RESOLUTION" "${FLUX_RESOLUTION}"
+  require_flux_int "BATCH" "${FLUX_BATCH}"
+
+  # The FLUX trainer loads four LOCAL single-file checkpoints (no HF
+  # auto-download in sd-scripts), resolved from the shared ComfyUI runtime
+  # layout that scripts/download_models.sh fills. Fail fast with the fix.
+  MODELS_DIR="${ROOT}/runtime/models"
+  FLUX_DIT="$(resolve_existing \
+    "${MODELS_DIR}/checkpoints/flux1-dev-fp8.safetensors" \
+    "${MODELS_DIR}/checkpoints/flux1-dev.safetensors")" || {
+    echo "FLUX base checkpoint (DiT) not found: expected ${MODELS_DIR}/checkpoints/flux1-dev-fp8.safetensors (or flux1-dev.safetensors); run scripts/download_models.sh on the server first." >&2
+    exit 2
+  }
+  FLUX_AE="$(resolve_existing "${MODELS_DIR}/vae/ae.safetensors")" || {
+    echo "FLUX AutoEncoder not found: expected ${MODELS_DIR}/vae/ae.safetensors; run scripts/download_models.sh on the server first." >&2
+    exit 2
+  }
+  FLUX_CLIP_L="$(resolve_existing "${MODELS_DIR}/text_encoders/clip_l.safetensors")" || {
+    echo "CLIP-L text encoder not found: expected ${MODELS_DIR}/text_encoders/clip_l.safetensors; run scripts/download_models.sh on the server first." >&2
+    exit 2
+  }
+  FLUX_T5XXL="$(resolve_existing \
+    "${MODELS_DIR}/text_encoders/t5xxl_fp8_e4m3fn_scaled.safetensors" \
+    "${MODELS_DIR}/text_encoders/t5xxl_fp16.safetensors" \
+    "${MODELS_DIR}/text_encoders/t5xxl_fp8_e4m3fn.safetensors")" || {
+    echo "T5-XXL text encoder not found: expected ${MODELS_DIR}/text_encoders/t5xxl_fp8_e4m3fn_scaled.safetensors (or t5xxl_fp16.safetensors); run scripts/download_models.sh on the server first." >&2
+    exit 2
+  }
+
+  FLUX_OUTPUT_DIR="${ROOT}/models/${MODEL_ID}/lora/output/${MODEL_ID}_flux_v1"
+
+  mkdir -p "${FLUX_OUTPUT_DIR}" "$(dirname "${RENDERED}")"
+  render_kohya_toml "${TEMPLATE}" "${RENDERED}"
+  render_kohya_toml "${TEMPLATE_DATASET}" "${RENDERED_DATASET}"
+
+  # Test seam: SKIP_TRAIN=1 stops right after rendering without running
+  # training (same contract as the SDXL seam below). Never set in production.
+  if [[ "${SKIP_TRAIN:-}" == "1" ]]; then
+    echo "SKIP_TRAIN=1: rendered ${RENDERED}; not running training."
+    exit 0
+  fi
+
+  # First flux run only: the host uv-venv shipped with the kohya clone does
+  # not work inside the container (interpreter symlink points at the host),
+  # so a fresh venv is bootstrapped from the container python3. ORDER MATTERS:
+  # install the cu124 torch wheels FIRST, then requirements.txt — a plain
+  # "pip install -r requirements.txt" first would pull a non-CUDA torch build.
+  if ! "${KOHYA}/venv/bin/python" -c "import torch, torchvision" >/dev/null 2>&1; then
+    echo "Bootstrapping kohya venv at ${KOHYA}/venv (first flux run only; expect 10-20 minutes)..." >&2
+    python3 -m venv "${KOHYA}/venv"
+    "${KOHYA}/venv/bin/python" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+    "${KOHYA}/venv/bin/python" -m pip install -r "${KOHYA}/requirements.txt"
+  fi
+
+  # Shared HF cache (FLUX.1-dev is pre-cached; CLIP/T5 tokenizer files download
+  # on first run). HF_TOKEN is exported by the .env source block above.
+  export HF_HOME="${ROOT}/runtime/hf-cache"
+  mkdir -p "${HF_HOME}"
+
+  cd "${KOHYA}"
+  train_rc=0
+  "${KOHYA}/venv/bin/accelerate" launch \
+    --num_processes 1 \
+    --num_machines 1 \
+    --mixed_precision bf16 \
+    flux_train_network.py \
+    --config_file "${RENDERED}" \
+    --dataset_config "${RENDERED_DATASET}" || train_rc=$?
+  if [[ "${train_rc}" -ne 0 ]]; then
+    echo "Training '${MODEL_ID}' failed: flux_train_network.py exited with code ${train_rc}." >&2
+    exit "${train_rc}"
+  fi
+
+  deploy_flux_lora "${MODEL_ID}"
+  exit 0
 fi
 
 mkdir -p "$(dirname "${RENDERED}")"

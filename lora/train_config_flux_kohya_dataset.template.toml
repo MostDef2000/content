@@ -1,0 +1,32 @@
+# Dataset section of the FLUX (dual-arch) kohya training config, rendered by
+# `scripts/train_lora.sh <id> flux` to runtime/train/<id>_flux_kohya_dataset.toml
+# and passed to flux_train_network.py via --dataset_config. The script args
+# live in train_config_flux_kohya.template.toml (passed via --config_file):
+# sd-scripts validates THIS file with a strict voluptuous schema and rejects
+# any non-dataset keys in it (config_README: [general]/[[datasets]]/
+# [[datasets.subsets]] only), so the two files must not be merged.
+#
+# Flat captioned dataset (one .txt caption per image, no N_class subdirs —
+# DreamBooth-style subset with images directly in image_dir). enable_bucket
+# packs images into aspect-ratio buckets at the target resolution.
+# Numeric placeholders are quoted here (keeps this template valid TOML);
+# the render step replaces "..." values with bare numbers.
+
+[general]
+caption_extension = ".txt"
+# shuffle_caption must stay false: with the 12 GB low-VRAM profile the text
+# encoder outputs are cached (cache_text_encoder_outputs_to_disk in the main
+# TOML), and sd-scripts @690ea7f9 flux_train_network.py:70-73 forbids
+# shuffle_caption / caption_dropout / token_warmup together with that cache —
+# caching wins, caption shuffling is sacrificed.
+shuffle_caption = false
+enable_bucket = true
+bucket_no_upscale = true
+
+[[datasets]]
+resolution = "{{RESOLUTION}}"
+batch_size = "{{BATCH}}"
+
+  [[datasets.subsets]]
+  image_dir = "{{DATASET_DIR}}"
+  num_repeats = 1

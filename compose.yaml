@@ -51,6 +51,7 @@ services:
       - /opt/sea-speed-worker/valery/models/valery23/reference:/workspace/models/valery23/reference
       - /opt/sea-speed-worker/valery/models/valery23/lora/output:/workspace/models/valery23/lora/output
       - /opt/sea-speed-worker/valery/ai-toolkit:/workspace/ai-toolkit
+      - /opt/sea-speed-worker/valery/kohya:/workspace/kohya
       - /var/run/docker.sock:/var/run/docker.sock
     shm_size: "8gb"
     restart: unless-stopped

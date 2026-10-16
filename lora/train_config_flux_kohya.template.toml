@@ -1,0 +1,72 @@
+# FLUX (dual-arch) training template for kohya sd-scripts, rendered by
+# `scripts/train_lora.sh <id> flux` to runtime/train/<id>_flux_kohya.toml and
+# passed to flux_train_network.py via --config_file (sd-scripts flattens every
+# section into the argparse namespace, so key names == long CLI option names).
+# The dataset is described in train_config_flux_kohya_dataset.template.toml
+# (rendered next to this file, passed via --dataset_config) — sd-scripts
+# validates that file strictly and rejects any non-dataset keys in it.
+#
+# Low-VRAM track for the 12 GB card: ai-toolkit OOMs deterministically on the
+# FLUX transformer, so the trainer is kohya sd-scripts (spec 010) with the
+# economical block below: fp8 base, CPU block swap, text-encoder outputs and
+# latents cached to disk. FLUX_* model paths are resolved by train_lora.sh
+# from the shared ComfyUI runtime model dir (scripts/download_models.sh layout).
+#
+# Numeric placeholders are quoted here (keeps this template valid TOML);
+# the render step replaces "..." values with bare numbers.
+
+# Base model: BFL-format single-file checkpoints. An fp8 checkpoint is loaded
+# as-is when fp8_base is set, so the ComfyUI fp8 file doubles as the trainer
+# base; --pretrained_model_name_or_path is what selects FLUX (no --flux flag).
+pretrained_model_name_or_path = "{{FLUX_DIT}}"
+ae = "{{FLUX_AE}}"
+clip_l = "{{FLUX_CLIP_L}}"
+t5xxl = "{{FLUX_T5XXL}}"
+
+# Output: trained checkpoint lands in models/<id>/lora/output/<id>_flux_v1/
+# (train_lora.sh deploys the newest *.safetensors from there to the registry
+# slot runtime/models/loras/<id>-flux.safetensors).
+output_dir = "{{OUTPUT_DIR}}"
+output_name = "{{MODEL_ID}}_flux_v1"
+save_model_as = "safetensors"
+save_every_n_steps = "{{STEPS}}"
+
+# LoRA network (FLUX-specific module; dim 32 / alpha 16 default for a
+# character LoRA on a 12 GB card).
+network_module = "networks.lora_flux"
+network_dim = 32
+network_alpha = 16
+network_train_unet_only = true
+
+# Training schedule (lr 1e-4 constant + AdamW8bit — same budget as the SDXL
+# template; STEPS also drives the single intermediate save).
+max_train_steps = "{{STEPS}}"
+seed = "{{SEED}}"
+learning_rate = 1e-4
+lr_scheduler = "constant"
+optimizer_type = "AdamW8bit"
+mixed_precision = "bf16"
+gradient_checkpointing = true
+sdpa = true
+max_data_loader_n_workers = 2
+persistent_data_loader_workers = true
+
+# FLUX-specific: guidance 1.0 disables the guidance-distilled branch during
+# training (recommended for dev); "shift" sampling with the standard
+# discrete_flow_shift. No sample generation: sample_prompts is not set, so
+# the trainer never spends VRAM on preview images.
+guidance_scale = 1.0
+timestep_sampling = "shift"
+discrete_flow_shift = 3.1582
+
+# 12 GB card block: quantize the base models to fp8 and swap 20 transformer
+# blocks to CPU RAM (block swap slows steps down but keeps VRAM inside the
+# card; ai-toolkit could not train this model even with fp8 alone).
+fp8_base = true
+blocks_to_swap = 20
+# Text encoders (CLIP-L + T5-XXL) are inference-only here (unet-only LoRA), so
+# their outputs are cached once to disk; cache_latents_to_disk implies
+# cache_latents (sd-scripts enables the pair automatically).
+cache_text_encoder_outputs = true
+cache_text_encoder_outputs_to_disk = true
+cache_latents_to_disk = true

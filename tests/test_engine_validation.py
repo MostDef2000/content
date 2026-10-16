@@ -48,9 +48,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent  # content/
@@ -1113,22 +1115,73 @@ def test_train_config_template_is_sdxl_pony():
         assert forbidden not in template, f"{forbidden!r} must not appear in the SDXL training template"
 
 
-def test_train_config_flux_template_is_flux():
-    # The dual-arch FLUX template (rendered by train_lora.sh <id> flux): FLUX
-    # model block with the low-VRAM fp8 knob, flowmatch scheduler, the
-    # "<id>_flux_v1" config name (which copy_lora_output searches for) and a
-    # multi-resolution latent cache; no SDXL/Pony-only knobs.
-    template = (REPO_ROOT / "lora" / "train_config.flux.template.yaml").read_text(encoding="utf-8")
-    assert 'name: "{{MODEL_ID}}_flux_v1"' in template
-    assert "name_or_path: black-forest-labs/FLUX.1-dev" in template
-    assert "is_flux: true" in template
-    assert "noise_scheduler: flowmatch" in template
-    assert "fp8_base: true" in template
-    assert "resolution: [512, 768]" in template
-    assert "cache_latents_to_disk: true" in template
-    assert "arch: sdxl" not in template
-    assert "ddpm" not in template
-    assert "ponyDiffusionV6XL" not in template
+def test_train_config_flux_kohya_templates_are_valid_toml_as_is():
+    # The dual-arch FLUX templates (spec 010, kohya sd-scripts; rendered by
+    # train_lora.sh <id> flux) must parse with tomllib WITHOUT rendering:
+    # numeric placeholders are kept QUOTED ("{{STEPS}}" etc.) precisely so the
+    # templates stay valid TOML as committed — that quoting is the invariant
+    # this test pins. The render step swaps the quoted numeric placeholders
+    # for bare integers (sd-scripts requires bare ints there).
+    main_tpl = tomllib.loads(
+        (REPO_ROOT / "lora" / "train_config_flux_kohya.template.toml").read_text(encoding="utf-8")
+    )
+    ds_tpl = tomllib.loads(
+        (REPO_ROOT / "lora" / "train_config_flux_kohya_dataset.template.toml").read_text(encoding="utf-8")
+    )
+    # Quoted placeholders parse as strings — the templates are unrendered.
+    assert main_tpl["max_train_steps"] == "{{STEPS}}"
+    assert main_tpl["seed"] == "{{SEED}}"
+    assert main_tpl["save_every_n_steps"] == "{{STEPS}}"
+    assert main_tpl["output_name"] == "{{MODEL_ID}}_flux_v1"
+    assert main_tpl["output_dir"] == "{{OUTPUT_DIR}}"
+    for key in ("pretrained_model_name_or_path", "ae", "clip_l", "t5xxl"):
+        assert main_tpl[key].startswith("{{") and main_tpl[key].endswith("}}"), key
+    assert ds_tpl["datasets"][0]["resolution"] == "{{RESOLUTION}}"
+    assert ds_tpl["datasets"][0]["batch_size"] == "{{BATCH}}"
+    assert ds_tpl["datasets"][0]["subsets"][0]["image_dir"] == "{{DATASET_DIR}}"
+
+
+def test_train_config_flux_kohya_template_low_vram_flags():
+    # The 12 GB economical profile the spec mandates (the whole reason the flux
+    # branch moved from ai-toolkit to kohya sd-scripts): fp8 base + CPU block
+    # swap + disk caches, the FLUX network module, the FLUX sampler/guidance
+    # knobs and the "<id>_flux_v1" output name that deploy_flux_lora searches.
+    main_tpl = tomllib.loads(
+        (REPO_ROOT / "lora" / "train_config_flux_kohya.template.toml").read_text(encoding="utf-8")
+    )
+    assert main_tpl["fp8_base"] is True
+    assert main_tpl["blocks_to_swap"] == 20
+    assert main_tpl["cache_text_encoder_outputs"] is True
+    assert main_tpl["cache_text_encoder_outputs_to_disk"] is True
+    assert main_tpl["cache_latents_to_disk"] is True
+    assert main_tpl["network_module"] == "networks.lora_flux"
+    assert main_tpl["network_dim"] == 32
+    assert main_tpl["network_alpha"] == 16
+    assert main_tpl["timestep_sampling"] == "shift"
+    assert main_tpl["guidance_scale"] == 1.0
+    assert main_tpl["output_name"] == "{{MODEL_ID}}_flux_v1"
+
+
+def test_train_config_flux_kohya_dataset_template_sections_exact():
+    # sd-scripts validates --dataset_config with a strict voluptuous schema
+    # that REJECTS any non-dataset key/section, so the dataset template may
+    # contain exactly [general] / [[datasets]] / [[datasets.subsets]] and
+    # nothing else (a merged script-args + dataset file cannot serve both
+    # options — hence the second template).
+    raw = (REPO_ROOT / "lora" / "train_config_flux_kohya_dataset.template.toml").read_text(encoding="utf-8")
+    headers = re.findall(r"^\s*\[+[A-Za-z_.]+\]+\s*$", raw, re.MULTILINE)
+    assert sorted(h.strip() for h in headers) == sorted(
+        ["[general]", "[[datasets]]", "[[datasets.subsets]]"]
+    ), f"unexpected section headers: {headers}"
+    ds_tpl = tomllib.loads(raw)
+    assert set(ds_tpl) == {"general", "datasets"}, "only [general] + [[datasets]] at top level"
+    assert len(ds_tpl["datasets"]) == 1
+    assert set(ds_tpl["datasets"][0]) == {"resolution", "batch_size", "subsets"}
+    assert len(ds_tpl["datasets"][0]["subsets"]) == 1
+    assert set(ds_tpl["datasets"][0]["subsets"][0]) == {"image_dir", "num_repeats"}
+    # No script-args keys leaked into the dataset file (would abort the run).
+    for forbidden in ("pretrained_model_name_or_path", "max_train_steps", "network_module", "fp8_base"):
+        assert forbidden not in ds_tpl, f"{forbidden!r} must not appear in the dataset template"
 
 
 def test_library_scene_texts_mode_filter_and_bad_inputs():
