@@ -19,9 +19,9 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: backend:cudaMallocAsync
     volumes:
       - /opt/sea-speed-worker/valery/runtime/models:/opt/ComfyUI/models
-      - ./runtime/input:/opt/ComfyUI/input
-      - ./runtime/output:/opt/ComfyUI/output
-      - ./runtime/user:/opt/ComfyUI/user
+      - /opt/sea-speed-worker/valery/runtime/input:/opt/ComfyUI/input
+      - /opt/sea-speed-worker/valery/runtime/output:/opt/ComfyUI/output
+      - /opt/sea-speed-worker/valery/runtime/user:/opt/ComfyUI/user
       - ./comfy:/workspace/workflows:ro
     shm_size: "8gb"
     restart: unless-stopped
@@ -36,8 +36,21 @@ services:
     environment:
       COMFY_URL: http://comfyui:8188
       WORKSPACE: /workspace
+    # Issue #16: runtime- и per-model данные gitignored — свежий клон lane-A
+    # (/opt/content) их не содержит, менеджер «слеп» к рабочим данным; биндим
+    # каталоги сервера напрямую. Per-model маунты — временно, до #17 (DATA_ROOT).
+    # До #17 операционные запреты (см. issue #16, комментарий 6206133465):
+    # новые модели НЕ создавать (данные уйдут в эфемерный чекаут), удаление
+    # моделей не выполнять (os.replace в trash = кросс-fs EXDEV).
     volumes:
       - .:/workspace
+      - /opt/sea-speed-worker/valery/runtime:/workspace/runtime
+      - /opt/sea-speed-worker/valery/models/valery23/dataset:/workspace/models/valery23/dataset
+      - /opt/sea-speed-worker/valery/models/valery23/posts:/workspace/models/valery23/posts
+      - /opt/sea-speed-worker/valery/models/valery23/posts-private:/workspace/models/valery23/posts-private
+      - /opt/sea-speed-worker/valery/models/valery23/reference:/workspace/models/valery23/reference
+      - /opt/sea-speed-worker/valery/models/valery23/lora/output:/workspace/models/valery23/lora/output
+      - /opt/sea-speed-worker/valery/ai-toolkit:/workspace/ai-toolkit
       - /var/run/docker.sock:/var/run/docker.sock
     shm_size: "8gb"
     restart: unless-stopped
