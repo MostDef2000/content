@@ -16,10 +16,19 @@ imported (the module resolves WORKSPACE and mounts /static at import time),
 so the tests never depend on the real /workspace layout. The registry, LoRA
 stubs and scene library are written into the temp WORKSPACE after import —
 main reads registry.json/library.json from disk on every call.
+
+Also covers the GET /api/jobs log_lines query parameter (spec 010 follow-up:
+the hard-coded lines[-40:] tail hides the trainer's root-cause lines): the
+40-line default stays back-compatible, an explicit size returns exactly that
+many LAST lines, the upper bound is 2000 (clamp or 422 — both accepted), and
+garbage/negative values 422 FastAPI-natively. These run through a minimal
+stdlib ASGI GET harness against the real app (no httpx/TestClient in the CI
+deps, and Query() validation only exists at the request layer).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import struct
@@ -273,6 +282,179 @@ def test_name_collision_409():
     (main.MODELS_DIR / "m1" / "posts" / "grp2").mkdir(parents=True)
     exc = _expect_http_status(_valid_payload(name="grp2", mode="public"), 409)
     assert exc.detail == "post name already exists", exc.detail
+
+
+# ---------------------------------------------------------------------------
+# GET /api/jobs log_lines (tail-window query parameter)
+# ---------------------------------------------------------------------------
+# The endpoint accepts log_lines: int = Query(default=40, ge=1, le=2000)
+# (spec 010 follow-up: the trainer's root error sits ABOVE the fixed 40-line
+# tail): the default stays 40 for back-compat, an explicit size returns
+# exactly that many LAST lines, and anything outside 1..2000 — garbage,
+# zero/negative, or above the upper bound — is a FastAPI-native 422 raised
+# before the handler runs. No TestClient/httpx in the CI deps, so a minimal
+# stdlib ASGI GET harness drives the REAL app: that validation only exists
+# at the request layer, calling the coroutine directly cannot pin it.
+
+LOG_JOB_ID = "loglines-job"
+
+
+def _seed_log_job(line_count: int) -> None:
+    main.JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    log = main.JOBS_DIR / f"{LOG_JOB_ID}.log"
+    log.write_text("".join(f"line {i:05d}\n" for i in range(1, line_count + 1)), encoding="utf-8")
+    main.jobs[LOG_JOB_ID] = {
+        "id": LOG_JOB_ID,
+        "kind": "train",
+        "model_id": "m1",
+        "status": "failed",
+        "log_path": str(log),
+    }
+
+
+def _drop_log_job() -> None:
+    main.jobs.pop(LOG_JOB_ID, None)
+    (main.JOBS_DIR / f"{LOG_JOB_ID}.log").unlink(missing_ok=True)
+
+
+async def _api_get(path: str, query: str = "") -> tuple[int, str]:
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("utf-8"),
+        "query_string": query.encode("utf-8"),
+        "root_path": "",
+        "headers": [(b"host", b"testserver")],
+        "client": ("test", 1234),
+        "server": ("testserver", 80),
+    }
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    status: list[int] = []
+    body: list[bytes] = []
+
+    async def send(message: dict) -> None:
+        if message["type"] == "http.response.start":
+            status.append(message["status"])
+        elif message["type"] == "http.response.body":
+            body.append(message.get("body", b""))
+
+    await main.app(scope, receive, send)
+    assert status, f"ASGI harness got no response for GET {path}?{query}"
+    return status[0], b"".join(body).decode("utf-8", errors="replace")
+
+
+def _jobs_tail(query: str = "") -> tuple[int, list[str] | None, str]:
+    """GET /api/jobs?<query>; returns (status, seeded job's log_tail or None,
+    raw body)."""
+    status, raw = asyncio.run(_api_get("/api/jobs", query))
+    tail = None
+    if status == 200:
+        entry = next((j for j in json.loads(raw)["jobs"] if j["id"] == LOG_JOB_ID), None)
+        tail = entry.get("log_tail") if entry is not None else None
+    return status, tail, raw
+
+
+def test_jobs_log_tail_default_is_at_most_40_last_lines():
+    # Back-compat pin (green today, must stay green after the fix): with no
+    # query parameter the response keeps the existing hard-coded tail window
+    # — at most 40 lines, the LAST ones in file order.
+    _seed_log_job(500)
+    try:
+        status, tail, raw = _jobs_tail()
+        assert status == 200, raw
+        assert tail is not None, raw
+        assert len(tail) <= 40, f"default tail grew beyond the compat window: {len(tail)} lines"
+        assert tail == [f"line {i:05d}" for i in range(500 - len(tail) + 1, 501)]
+    finally:
+        _drop_log_job()
+
+
+def test_jobs_log_lines_120_returns_exactly_the_last_120():
+    # An accepted in-range size returns EXACTLY that many last lines (was:
+    # the parameter ignored → hard-coded 40-line tail).
+    _seed_log_job(500)
+    try:
+        status, tail, raw = _jobs_tail("log_lines=120")
+        assert status == 200, raw
+        assert tail is not None, raw
+        assert len(tail) == 120, f"log_lines=120 must return exactly 120 lines, got {len(tail)}"
+        assert tail == [f"line {i:05d}" for i in range(381, 501)], "must be the LAST 120 lines"
+    finally:
+        _drop_log_job()
+
+
+def test_jobs_log_lines_huge_clamps_to_2000_or_rejects():
+    # Upper bound 2000 for log_lines=99999, accepting either shape: manual
+    # clamp (200 with exactly 2000 lines on a 2500-line log) or FastAPI
+    # le=2000 (422 naming log_lines — the committed implementation; the
+    # 2000/2001 edge is pinned exactly by the boundary tests below).
+    # Reading MORE than the bound, or silently ignoring it, must fail here.
+    _seed_log_job(2500)
+    try:
+        status, tail, raw = _jobs_tail("log_lines=99999")
+        if status == 422:
+            assert "log_lines" in raw, raw
+            return
+        assert status == 200, raw
+        assert tail is not None, raw
+        assert len(tail) == 2000, f"log_lines=99999 must clamp to the 2000 upper bound, got {len(tail)}"
+        assert tail[-1] == "line 02500", tail[-1]
+    finally:
+        _drop_log_job()
+
+
+def test_jobs_log_lines_garbage_or_negative_422():
+    # FastAPI-native semantics pinned per the work order: Query(int, ge=1,
+    # le=2000) rejects a non-integer and a below-1 value with 422 naming
+    # log_lines (was: unknown query params silently ignored → 200).
+    _seed_log_job(50)
+    try:
+        for query in ("log_lines=abc", "log_lines=-5"):
+            status, _tail, raw = _jobs_tail(query)
+            assert status == 422, (query, status, raw[:400])
+            assert "log_lines" in raw, (query, raw[:400])
+    finally:
+        _drop_log_job()
+
+
+def test_jobs_log_lines_upper_bound_2000_ok_2001_rejected():
+    # N1 pin of the le=2000 edge from both sides: 2000 is the LAST accepted
+    # value (200 with exactly 2000 lines on a 2500-line log — the tail must
+    # be the last 2000, not the whole file), 2001 is the FIRST rejected one
+    # (422 naming log_lines, before the handler runs).
+    _seed_log_job(2500)
+    try:
+        status, tail, raw = _jobs_tail("log_lines=2000")
+        assert status == 200, raw
+        assert tail is not None, raw
+        assert len(tail) == 2000, f"log_lines=2000 must return exactly 2000 lines, got {len(tail)}"
+        assert tail[0] == "line 00501" and tail[-1] == "line 02500", (tail[0], tail[-1])
+
+        status, _tail, raw = _jobs_tail("log_lines=2001")
+        assert status == 422, (status, raw[:400])
+        assert "log_lines" in raw, raw[:400]
+    finally:
+        _drop_log_job()
+
+
+def test_jobs_log_lines_zero_rejected_by_ge_1():
+    # N1 pin of the lower edge: ge=1 accepts 1 (covered by the default-40
+    # and 120-line tests) but rejects 0 with a 422 naming log_lines — a
+    # zero window would silently return an empty tail instead of erroring.
+    _seed_log_job(50)
+    try:
+        status, _tail, raw = _jobs_tail("log_lines=0")
+        assert status == 422, (status, raw[:400])
+        assert "log_lines" in raw, raw[:400]
+    finally:
+        _drop_log_job()
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List
 
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -1649,15 +1649,20 @@ async def train_start(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     return await _launch("train", ["bash", "scripts/train_lora.sh", model_id, arch], model_id=model_id)
 
 
+# log_lines tail-window query parameter (spec 010 follow-up): the trainer's
+# root error usually sits ABOVE the fixed 40-line tail, so a prod failure was
+# undiagnosable without SSH-ing to the server to read the full log file.
+# Default stays 40 for back-compat; ge=1/le=2000 bound the window (FastAPI
+# answers 422 for garbage/negative/huge values before the handler runs).
 @app.get("/api/jobs")
-async def list_jobs() -> dict[str, Any]:
+async def list_jobs(log_lines: int = Query(default=40, ge=1, le=2000)) -> dict[str, Any]:
     out = []
     for job in sorted(jobs.values(), key=lambda j: j.get("id", ""), reverse=True):
         entry = {k: v for k, v in job.items() if k != "log_path"}
         log_path = job.get("log_path")
         if log_path and Path(log_path).exists():
             lines = Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines()
-            entry["log_tail"] = lines[-40:]
+            entry["log_tail"] = lines[-log_lines:]
         out.append(entry)
     return {"jobs": out}
 
