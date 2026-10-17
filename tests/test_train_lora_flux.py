@@ -48,6 +48,11 @@ SCRIPT = REPO_ROOT / "scripts" / "train_lora.sh"
 
 MODEL_ID = "tst01"  # satisfies ^[A-Za-z0-9][A-Za-z0-9_-]*$
 STEPS_SMOKE = "20"  # render override used by the happy-path fixtures
+# Fixture stand-in for scripts/kohya_compat_shim.py (spec 010 prod-crash fix):
+# _build_root always drops it so the bootstrap's shim-install lines can run in
+# EVERY fixture test; the install test asserts the site-packages copy equals
+# this exact content, pinning the copy source to ${ROOT}/scripts/.
+SHIM_PLACEHOLDER = "# fixture placeholder for kohya_compat_shim\n"
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +80,7 @@ def _build_root(
     root = Path(tempfile.mkdtemp(prefix="train-lora-flux-"))
     (root / "scripts").mkdir(parents=True)
     shutil.copy(SCRIPT, root / "scripts" / "train_lora.sh")
+    (root / "scripts" / "kohya_compat_shim.py").write_text(SHIM_PLACEHOLDER, encoding="utf-8")
     (root / "lora").mkdir()
     for name in (
         "train_config_flux_kohya.template.toml",
@@ -174,7 +180,8 @@ if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
     else
       rm -rf "$dir"
     fi
-    mkdir -p "$dir/bin"
+    mkdir -p "$dir/bin" "$dir/lib/python3.12/site-packages"
+    printf 'home = /usr/bin\nversion = 3.12\n' > "$dir/pyvenv.cfg"
     cat "__STUBTEMPLATE__" > "$dir/bin/python3"
     chmod 755 "$dir/bin/python3"
     ln -sf python3 "$dir/bin/python"
@@ -271,12 +278,14 @@ def _install_python3_venv_shim(root: Path) -> tuple[Path, Path, Path]:
 def _seed_flavored_venv(root: Path, *, flavor: str | None = None, with_accelerate: bool = True) -> Path:
     """Pre-build a COMPLETE-looking kohya venv at the location the script
     guards (runtime/kohya-venv): stub interpreter (torch imports fine),
-    executable accelerate stub and — when flavor is given — a .torch-flavor
-    marker with that index slug. The fixture for the flavor-marker guard
-    tests: a matching marker must make the bootstrap skip, a missing or
-    stale one must force a full rebuild. Returns the venv dir."""
+    executable accelerate stub, the site-packages dir a real venv always
+    has — and — when flavor is given — a .torch-flavor marker with that
+    index slug. The fixture for the flavor-marker guard tests: a matching
+    marker must make the bootstrap skip, a missing or stale one must force
+    a full rebuild. Returns the venv dir."""
     venv = root / "runtime" / "kohya-venv"
     (venv / "bin").mkdir(parents=True)
+    (venv / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
     stub = venv / "bin" / "python3"
     stub.write_text(_stub_text(root), encoding="utf-8")
     stub.chmod(0o755)
@@ -396,6 +405,36 @@ def test_flux_script_writes_torch_flavor_marker_line():
         'index slug it installed from (echo "${TORCH_INDEX_SLUG}" > '
         '"${KOHYA_VENV}/.torch-flavor"), otherwise the flavor guard never '
         "finds a matching marker and rebuilds on every run"
+    )
+
+
+def test_flux_bootstrap_installs_compat_shim_text_contract():
+    # Prod crash (spec 010, corrected D-006 wording): Comfy-Org
+    # flux1-dev-fp8 carries the scaled_fp8 marker EARLY in key order — not
+    # first (keys[0] is prefixed) — so upstream's strip loop (library/
+    # flux_utils.py load_flow_model) breaks MID-DICT: the prefixed keys
+    # after the marker stay unrenamed -> partially meta model ->
+    # NotImplementedError at unet.to("cpu"); the ostris scaled-fp8 T5 also
+    # needs its per-tensor .scale_weight pairs applied. The flux branch
+    # must install scripts/kohya_compat_shim.py into the venv's
+    # site-packages and drop an ACTIVATING sitecustomize, with a grep -q
+    # gate so the write is idempotent.
+    # Validator condition 1 (migration path) moved the install to EVERY-RUN
+    # scope: a healthy cu130 venv predating the shim must still get it.
+    # That PLACEMENT is pinned behaviorally (and much more precisely) by
+    # test_flux_healthy_venv_still_gets_compat_shim_installed — the earlier
+    # "inside the rebuild region" ordering pin contradicted the corrected
+    # contract and is deliberately gone; here we keep only the mechanism
+    # parts no behavioral test can see.
+    text = _script_text()
+    assert "kohya_compat_shim.py" in text, (
+        "the flux branch must copy scripts/kohya_compat_shim.py into the venv"
+    )
+    assert "site-packages" in text, "the install must target lib/python3.*/site-packages"
+    assert "sitecustomize" in text, "bootstrap must write a sitecustomize.py"
+    assert re.search(r'grep -q[^\n]*(sitecustomize|kohya_compat_shim)', text), (
+        "the sitecustomize write must be guarded by grep -q so a re-run does "
+        "not duplicate the shim activation"
     )
 
 
@@ -837,6 +876,221 @@ def test_flux_second_run_skips_bootstrap_via_marker_written_by_script():
         assert not any("-m pip install" in line for line in log2.splitlines()), log2
         assert "flux_train_network.py exited with code 7" in r2.stderr, (r2.returncode, r2.stderr, log2)
         assert r2.returncode == 7
+    finally:
+        _cleanup(root)
+
+
+def _site_packages(venv_root: Path) -> Path:
+    """The single site-packages dir of a stub venv (glob python3.*)."""
+    matches = sorted((venv_root / "lib").glob("python3.*/site-packages"))
+    assert matches, f"no site-packages under {venv_root}/lib"
+    return matches[0]
+
+
+def _activation_probe(sp: Path) -> int:
+    """F1 activation probe: run a fresh interpreter with the stub
+    site-packages on PYTHONPATH — CPython auto-imports sitecustomize at
+    startup, exactly like every venv python process — and count the
+    library.flux_utils finders the shim registered. Isolated subprocess:
+    the pytest process' sys.meta_path is never touched."""
+    probe = (
+        "import sys\n"
+        "hits = [f for f in sys.meta_path\n"
+        "        if getattr(type(f), '__module__', '') == 'kohya_compat_shim'\n"
+        "        or getattr(f, 'target', None) == 'library.flux_utils']\n"
+        "print(len(hits))\n"
+    )
+    env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
+    env["PYTHONPATH"] = str(sp)
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, f"sitecustomize execution crashed: {proc.stderr}"
+    assert proc.stdout.strip().isdigit(), f"probe printed {proc.stdout!r} / {proc.stderr!r}"
+    return int(proc.stdout.strip())
+
+
+def test_flux_bootstrap_installs_compat_shim_into_site_packages():
+    # Behavioral half of the compat-shim install: after a full bootstrap the
+    # venv's site-packages holds kohya_compat_shim.py — copied verbatim from
+    # the repo file — plus a sitecustomize.py that ACTIVATES it. F1 (review
+    # block): a sitecustomize that merely imports the module never calls
+    # install(), sys.meta_path stays clean and the prod contract is dead.
+    # Activation is pinned on the OBSERVABLE prod path — a python process
+    # whose startup auto-imports the written sitecustomize must end up with
+    # EXACTLY ONE library.flux_utils finder — regardless of which layer
+    # (module-level install() in the shim, or an install() call line in the
+    # sitecustomize) the fix chooses. Uses the REAL shim content in the
+    # fixture scripts/ dir so the executed pair is the real production one.
+    root = _build_root()
+    try:
+        real_shim = (REPO_ROOT / "scripts" / "kohya_compat_shim.py").read_text(encoding="utf-8")
+        (root / "scripts" / "kohya_compat_shim.py").write_text(real_shim, encoding="utf-8")
+        (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
+        (root / "kohya" / "pyproject.toml").write_text('[project]\nname = "sd-scripts"\n', encoding="utf-8")
+        shim_dir, log, _mode = _install_python3_venv_shim(root)
+        result = _run_script(
+            root,
+            MODEL_ID,
+            "flux",
+            STEPS=STEPS_SMOKE,
+            PATH=f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
+        )
+        log_text = log.read_text(encoding="utf-8") if log.exists() else ""
+        # the bootstrap must complete (launch stub reached) even with the
+        # install lines in place — a failing cp must not be swallowed.
+        assert "flux_train_network.py exited with code 7" in result.stderr, (result.returncode, result.stderr, log_text)
+        sp = _site_packages(root / "runtime" / "kohya-venv")
+        installed = sp / "kohya_compat_shim.py"
+        assert installed.is_file(), f"bootstrap did not install the compat shim into {sp}"
+        assert installed.read_text(encoding="utf-8") == real_shim, (
+            "the installed shim must be a verbatim copy of scripts/kohya_compat_shim.py"
+        )
+        sitecustomize = sp / "sitecustomize.py"
+        assert sitecustomize.is_file(), f"no sitecustomize.py in {sp}"
+        assert "import kohya_compat_shim" in sitecustomize.read_text(encoding="utf-8")
+
+        found = _activation_probe(sp)
+        assert found == 1, (
+            f"executing the bootstrap-written sitecustomize must activate the shim "
+            f"(exactly one library.flux_utils finder); got {found}. sitecustomize: "
+            f"{sitecustomize.read_text(encoding='utf-8')!r}"
+        )
+    finally:
+        _cleanup(root)
+
+
+def test_flux_healthy_venv_still_gets_compat_shim_installed():
+    # Validator condition 1 (migration path): W3f put the shim install and
+    # the sitecustomize write INSIDE the rebuild branch. The exact prod
+    # state after W3d is a HEALTHY cu130 venv built before the shim existed
+    # — torch imports, accelerate is executable, the marker says cu130 — so
+    # the flavor guard passes, the branch is skipped and the fix NEVER
+    # LANDS ON THE BOX. Corrected contract: the shim install must run on
+    # EVERY flux run (fresh AND healthy venv), the written sitecustomize
+    # must carry BOTH the import and the install() activation line, and the
+    # activation probe must find exactly one finder — while the healthy
+    # venv is still NOT rebuilt (the guard's skip path must stay intact).
+    # RED today: the healthy path skips the whole install block.
+    root = _build_root()
+    try:
+        real_shim = (REPO_ROOT / "scripts" / "kohya_compat_shim.py").read_text(encoding="utf-8")
+        (root / "scripts" / "kohya_compat_shim.py").write_text(real_shim, encoding="utf-8")
+        (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
+        (root / "kohya" / "pyproject.toml").write_text('[project]\nname = "sd-scripts"\n', encoding="utf-8")
+        venv = _seed_flavored_venv(root, flavor="cu130")  # healthy: stub torch + accelerate + marker
+        sp = _site_packages(venv)
+        assert not (sp / "kohya_compat_shim.py").exists(), "fixture must start shim-free (the W3d prod state)"
+        shim_dir, log, _mode = _install_python3_venv_shim(root)
+        result = _run_script(
+            root,
+            MODEL_ID,
+            "flux",
+            STEPS=STEPS_SMOKE,
+            PATH=f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
+        )
+        log_text = log.read_text(encoding="utf-8") if log.exists() else ""
+        # migration must not weaken the guard: the healthy venv stays un-rebuilt
+        assert "-m venv" not in log_text, log_text
+        assert not any("-m pip install" in line for line in log_text.splitlines()), log_text
+        assert "flux_train_network.py exited with code 7" in result.stderr, (result.returncode, result.stderr, log_text)
+        # ... and STILL installs + activates the shim
+        installed = sp / "kohya_compat_shim.py"
+        assert installed.is_file(), (
+            "the compat shim must be installed on EVERY flux run — a healthy "
+            "cu130 venv predating the shim (the prod state after W3d) gets no "
+            f"fix at all.\nlog:\n{log_text}\nstderr:\n{result.stderr}"
+        )
+        assert installed.read_text(encoding="utf-8") == real_shim, (
+            "the installed shim must be a verbatim copy of scripts/kohya_compat_shim.py"
+        )
+        sitecustomize = sp / "sitecustomize.py"
+        assert sitecustomize.is_file(), f"no sitecustomize.py in {sp} on the healthy path"
+        content = sitecustomize.read_text(encoding="utf-8")
+        assert "import kohya_compat_shim" in content, content
+        assert "kohya_compat_shim.install()" in content, content
+        found = _activation_probe(sp)
+        assert found == 1, (
+            f"executing the sitecustomize must activate the shim (exactly one "
+            f"library.flux_utils finder); got {found}. sitecustomize: {content!r}"
+        )
+    finally:
+        _cleanup(root)
+
+
+def test_flux_healthy_venv_shim_copy_refreshes_stale_file():
+    # Validator condition 1, second half: the install must REFRESH the copy
+    # (cp overwrites, no exists-guard on the shim file itself) — a STALE
+    # shim already sitting in a healthy venv's site-packages is replaced by
+    # the current repo file on every run, so future shim updates reach
+    # installed venvs without paying a 10-20 minute rebuild. The
+    # sitecustomize here is pre-seeded already-activated, so the run's only
+    # observable obligation is the refresh. RED today: the healthy path
+    # never copies.
+    root = _build_root()
+    try:
+        real_shim = (REPO_ROOT / "scripts" / "kohya_compat_shim.py").read_text(encoding="utf-8")
+        (root / "scripts" / "kohya_compat_shim.py").write_text(real_shim, encoding="utf-8")
+        (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
+        (root / "kohya" / "pyproject.toml").write_text('[project]\nname = "sd-scripts"\n', encoding="utf-8")
+        venv = _seed_flavored_venv(root, flavor="cu130")
+        sp = _site_packages(venv)
+        stale = sp / "kohya_compat_shim.py"
+        stale.write_text("# STALE SHIM FROM AN OLDER INSTALL\n", encoding="utf-8")
+        (sp / "sitecustomize.py").write_text(
+            "import kohya_compat_shim\nkohya_compat_shim.install()\n", encoding="utf-8"
+        )
+        shim_dir, log, _mode = _install_python3_venv_shim(root)
+        result = _run_script(
+            root,
+            MODEL_ID,
+            "flux",
+            STEPS=STEPS_SMOKE,
+            PATH=f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
+        )
+        log_text = log.read_text(encoding="utf-8") if log.exists() else ""
+        assert "-m venv" not in log_text, log_text  # healthy venv: no rebuild
+        assert "flux_train_network.py exited with code 7" in result.stderr, (result.returncode, result.stderr, log_text)
+        assert stale.read_text(encoding="utf-8") == real_shim, (
+            "the shim copy must be REFRESHED on every flux run — the stale "
+            "file survived, so shim updates could never reach an installed "
+            "healthy venv"
+        )
+        # refresh must not duplicate the activation either
+        lines = [ln for ln in (sp / "sitecustomize.py").read_text(encoding="utf-8").splitlines() if "import kohya_compat_shim" in ln]
+        assert len(lines) == 1, lines
+    finally:
+        _cleanup(root)
+
+
+def test_flux_sitecustomize_shim_import_not_duplicated_across_rebuilds():
+    # The grep -q guard must keep the sitecustomize import idempotent: one
+    # bootstrap leaves exactly ONE `import kohya_compat_shim` line; forcing a
+    # rebuild (delete the flavor marker → guard re-arms) must still leave
+    # one, not a stack of duplicated imports.
+    root = _build_root()
+    try:
+        (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
+        (root / "kohya" / "pyproject.toml").write_text('[project]\nname = "sd-scripts"\n', encoding="utf-8")
+        shim_dir, log, _mode = _install_python3_venv_shim(root)
+        path_env = f"{shim_dir}{os.pathsep}{os.environ['PATH']}"
+
+        r1 = _run_script(root, MODEL_ID, "flux", STEPS=STEPS_SMOKE, PATH=path_env)
+        assert r1.returncode == 7, (r1.returncode, r1.stderr)
+        sp = _site_packages(root / "runtime" / "kohya-venv")
+        sitecustomize = sp / "sitecustomize.py"
+        assert sitecustomize.is_file(), sp
+        imports1 = [ln for ln in sitecustomize.read_text(encoding="utf-8").splitlines() if "import kohya_compat_shim" in ln]
+        assert len(imports1) == 1, imports1
+
+        # force a rebuild: the marker disappears → the guard re-arms.
+        (root / "runtime" / "kohya-venv" / ".torch-flavor").unlink()
+        log.unlink()
+        r2 = _run_script(root, MODEL_ID, "flux", STEPS=STEPS_SMOKE, PATH=path_env)
+        assert r2.returncode == 7, (r2.returncode, r2.stderr)
+        sp = _site_packages(root / "runtime" / "kohya-venv")
+        sitecustomize = sp / "sitecustomize.py"
+        imports2 = [ln for ln in sitecustomize.read_text(encoding="utf-8").splitlines() if "import kohya_compat_shim" in ln]
+        assert len(imports2) == 1, f"rebuild duplicated the sitecustomize import: {imports2}"
+        assert (sp / "kohya_compat_shim.py").is_file()
     finally:
         _cleanup(root)
 

@@ -62,6 +62,10 @@ FLUX-LoRA-тренинг (`train_lora.sh <id> flux`) реально работа
   текущий слаг индекса): `python3 -m venv` → cu130 torch/torchvision
   (D-005) → запись `.torch-flavor` → `requirements.txt` клона (порядок
   обязателен — requirements не должен переустанавливать CUDA-сборку torch).
+- установка compat-шима (D-006) — на каждом flux-запуске, ПОСЛЕ
+  rebuild-гварда (в т.ч. при здоровом venv) и до запуска тренера:
+  безусловный `cp` в site-packages + `sitecustomize.py` (import + install(),
+  grep-гвард по строке активации).
 - `export HF_HOME=${ROOT}/runtime/hf-cache` перед запуском; HF_TOKEN —
   из `.env` (существующий `set -a`-блок), в скрипте литералов нет.
 - Рендер: sed, как в sdxl-ветке; строковые плейсхолдеры с кавычками,
@@ -94,6 +98,24 @@ FLUX-LoRA-тренинг (`train_lora.sh <id> flux`) реально работа
   (закрывает F1-остаток): venv без маркера или со старым слагом пересобирается
   сам — включая переход с уже установленного cu124 (прецедент: ai-toolkit
   venv на torch 2.13.0+cu130).
+- (D-006) ComfyUI scaled-fp8 чекпойнты грузятся через compat-шим
+  (`scripts/kohya_compat_shim.py`, копируется на каждом flux-запуске (после
+  rebuild-гварда),
+  автозагрузка через `sitecustomize.py`: import + install()): upstream
+  strip-цикл префикса `model.diffusion_model.` ломается на БЕЗпрефиксном
+  ключе посреди dict — маркер `scaled_fp8` стоит рано в порядке ключей
+  Comfy-Org flux1-dev-fp8, но НЕ первым (keys[0] префиксован — прод-доказательство:
+  крэш «Cannot copy out of meta tensor» на unet.to("cpu") (прод-кейс
+  train-1792241951), а не ранний ValueError от max() в
+  analyze_checkpoint_state, который случился бы при непереименованном
+  ПЕРВОМ ключе): цикл обрывает переименование, и ВСЕ ОСТАВШИЕСЯ
+  префиксованные ключи остаются непереименованными → unet остаётся meta.
+  T5 `t5xxl_fp8_e4m3fn_scaled` несёт per-тензоровые `.scale_weight`,
+  которые kohya игнорирует (мусорные TE-выходы). Шим чинит оба: снимает
+  префикс со всех ключей и де-квантует fp8 по скейлам в bf16
+  (fp32-раундтрип) до assign; оборачивает ОБА лоадера — `load_flow_model`
+  И `load_t5xxl` (T5 грузится после возврата load_flow_model, тот же
+  swap-паттерн с restore в finally).
 - `blocks_to_swap=20` замедляет шаги (своп блоков GPU↔CPU) — фоновая джоба.
 - Полный трейн стартует владелец из UI; на время трейна ComfyUI останавливать
   (12 ГБ общие, hard rule 3 — busy-лок менеджера).

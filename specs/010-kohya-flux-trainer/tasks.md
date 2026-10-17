@@ -39,6 +39,29 @@
       изоляции WORKSPACE tmpdir (как test_clear_dataset.py): рендер обоих
       TOML, guard'ы exit 2, deploy tmp+mv в слот с дефисом; мёртвый
       train_config.flux.template.yaml удалён.
+- [x] T007 Compat-шим sd-scripts (прод-крэш, spec 010 follow-up): в
+      Comfy-Org flux1-dev-fp8 безпрефиксный маркер `scaled_fp8` стоит рано
+      в порядке ключей (НЕ первым — keys[0] префиксован, прод-доказательство:
+      крэш meta-тензора на unet.to("cpu"), а не ранний ValueError от max()
+      в analyze_checkpoint_state) — strip-цикл ComfyUI-префикса в
+      `library/flux_utils.py load_flow_model` (upstream @690ea7f9) ломается
+      на нём посреди dict, и ОСТАВШИЕСЯ префиксованные ключи остаются
+      непереименованными → мета-тензоры → крэш на unet.to("cpu"); scaled-fp8
+      T5 сверх того несёт per-tensor `.scale_weight`, которые kohya
+      игнорирует. Решение: `scripts/kohya_compat_shim.py` (strip на каждый
+      ключ без break; деquant пар `.scale_weight` → bf16 через fp32, дроп
+      маркера, каст «голого» fp8; `patch_flux_utils` оборачивает ОБА
+      лоадера — `load_flow_model` И `load_t5xxl` (T5 грузится после возврата
+      load_flow_model) — подменяя `load_safetensors` на время вызова
+      настоящего лоадера с restore в finally; idempotent
+      `sys.meta_path`-finder через `install()`; torch импортируется
+      лениво) — бутстрап копирует шим в site-packages venv и пишет
+      `sitecustomize.py` (import + install(), `grep -q`-гвард по строке
+      активации против дублей и против легаси import-only файла) после
+      rebuild-гварда, на каждом flux-запуске. DoD: структурные
+      AST-пины + fixture-прогоны установки в tests/test_kohya_compat_shim.py
+      и tests/test_train_lora_flux.py (170 passed, 9 skipped — fp8-поведение
+      без torch в CI).
 - [ ] T006 Дымовой прогон 20 шагов на проде (старт — владелец; см. spec DoD).
 
 ## Acceptance criteria

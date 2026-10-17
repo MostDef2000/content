@@ -320,6 +320,34 @@ if [[ "${ARCH}" == "flux" ]]; then
     ( cd "${KOHYA}" && "${KOHYA_VENV}/bin/python" -m pip install -r "${KOHYA}/requirements.txt" )
   fi
 
+  # Compat shim (spec 010 prod crash): in Comfy-Org flux1-dev-fp8 the
+  # unprefixed scaled_fp8 marker sits EARLY in key order (NOT first —
+  # keys[0] is prefixed, else analyze_checkpoint_state would die on
+  # max() before any load), so upstream's ComfyUI-prefix strip loop
+  # (library/flux_utils.py load_flow_model) breaks on it mid-dict:
+  # keys before it are renamed, the REMAINING prefixed keys stay
+  # unrenamed — the model stays partially meta and training dies at
+  # unet.to("cpu"); the ostris scaled-fp8 T5 also carries per-tensor
+  # .scale_weight keys kohya ignores. The shim (a copy of
+  # scripts/kohya_compat_shim.py in the venv's site-packages,
+  # auto-imported by sitecustomize in EVERY venv python process) patches
+  # library.flux_utils on first import to fix both.
+  # Installed on EVERY flux run, OUTSIDE the rebuild guard above: a healthy
+  # pre-shim venv (the prod state after W3d) never enters that branch, so a
+  # rebuild-only install would never land on the box. The cp is
+  # UNCONDITIONAL so future shim updates refresh installed venvs without a
+  # 10-20 minute rebuild; a failing cp aborts via set -e.
+  SP_DIR="$(echo "${KOHYA_VENV}"/lib/python*/site-packages)"
+  cp "${ROOT}/scripts/kohya_compat_shim.py" "${SP_DIR}/kohya_compat_shim.py"
+  # sitecustomize is auto-imported by the interpreter at startup; the gate
+  # matches the ACTIVATION line (import + install()): a legacy import-only
+  # sitecustomize (pre-F1 venv) without install() never registers the
+  # meta_path finder, so it must be rewritten too — and a rewrite (not an
+  # append) keeps the import list free of duplicates across runs.
+  if ! grep -q "kohya_compat_shim.install" "${SP_DIR}/sitecustomize.py" 2>/dev/null; then
+    printf 'import kohya_compat_shim\nkohya_compat_shim.install()\n' > "${SP_DIR}/sitecustomize.py"
+  fi
+
   # Shared HF cache (FLUX.1-dev is pre-cached; CLIP/T5 tokenizer files download
   # on first run). HF_TOKEN is exported by the .env source block above.
   export HF_HOME="${ROOT}/runtime/hf-cache"
