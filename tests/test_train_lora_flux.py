@@ -1315,32 +1315,37 @@ def test_flux_sitecustomize_shim_import_not_duplicated_across_rebuilds():
         _cleanup(root)
 
 
-def test_flux_memory_preflight_aborts_before_launch_on_default_slack():
+def test_flux_memory_preflight_aborts_before_launch_on_default_slack_under_small_cgroup_budget():
     # Behavioral half of the memory preflight (validator condition, after
     # train-1792249442 SIGKILL): run the flux path against a HEALTHY venv
     # (no rebuild noise) with an HONEST minimal checkpoint stub (~16 real
     # bytes — declared-bytes stubs are malformed under the hardened header
-    # validation and belong to the malformed-header pins below) and require
-    # a CLEAN ABORT before the trainer launch: non-zero rc, no launch
-    # marker, a distinguishable "preflight" line. The refusal comes from
-    # the PRODUCTION default slack (13GiB): the harness seam is explicitly
-    # unset (MEM_PREFLIGHT_SLACK_BYTES=None), so on any box with less than
-    # 13GiB available — every CI sandbox included — the host gate refuses
-    # and the slack number must be visible in the output (a leak of the
-    # harness slack=0 into this scenario is itself caught).
+    # validation and belong to the malformed-header pins) and require a
+    # CLEAN ABORT before the trainer launch: non-zero rc, no launch marker,
+    # a distinguishable "preflight" line. The pin's purpose is exercising
+    # the PRODUCTION DEFAULT slack (13GiB) — the harness seam is explicitly
+    # unset (MEM_PREFLIGHT_SLACK_BYTES=None) and the slack number must be
+    # visible in the refusal (a leak of the harness slack=0 into this
+    # scenario is itself caught). The refusal must be DETERMINISTIC on any
+    # runner (CI boxes can have >=13GiB free — a host-only gate would then
+    # legitimately proceed), so the budget is driven by a fixture cgroup
+    # with a small remaining: limit 1GiB - usage 900MiB = 130023424
+    # remaining << required (16 + 13GiB).
     root = _build_root()
     try:
         (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
         (root / "kohya" / "pyproject.toml").write_text('[project]\nname = "sd-scripts"\n', encoding="utf-8")
         _seed_flavored_venv(root, flavor="cu130")
         _write_safetensors_stub(root / "runtime" / "models" / "checkpoints" / "flux1-dev-fp8.safetensors")
-        shim_dir, log, _mode = _install_python3_venv_shim(root)
+        cg = _make_fixture_cgroup(root, limit_bytes=1024**3, usage_bytes=900 * 1024**2)
+        shim_dir, _log, _mode = _install_python3_venv_shim(root)
         result = _run_script(
             root,
             MODEL_ID,
             "flux",
             STEPS=STEPS_SMOKE,
             PATH=f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
+            MEM_PREFLIGHT_CGROUP_ROOT=str(cg),  # deterministic small budget
             MEM_PREFLIGHT_SLACK_BYTES=None,  # production default, not the harness seam
         )
         combined = (result.stdout + result.stderr).lower()
@@ -1353,9 +1358,11 @@ def test_flux_memory_preflight_aborts_before_launch_on_default_slack():
             f"abort must be a distinguishable preflight message; rc={result.returncode}\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
-        # the abort must be computed with the DEFAULT 13GB slack
-        # (13 * 1024**3 = 13958643712) — proves the seam did not leak into
-        # this scenario and the production gate is the one under test.
+        # the refusal must be computed with the DEFAULT 13GiB slack
+        # (13 * 1024**3 = 13958643712) — the shared "required (checkpoint ..
+        # + slack ..)" message carries it on both the host and the cgroup
+        # refusal branch, proving the seam did not leak and the production
+        # default is the one under test.
         assert "13958643712" in combined, (
             f"abort output must show the 13GB default slack in effect; rc={result.returncode}\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
