@@ -60,8 +60,9 @@
       активации против дублей и против легаси import-only файла) после
       rebuild-гварда, на каждом flux-запуске. DoD: структурные
       AST-пины + fixture-прогоны установки в tests/test_kohya_compat_shim.py
-      и tests/test_train_lora_flux.py (170 passed, 9 skipped — fp8-поведение
-      без torch в CI).
+      и tests/test_train_lora_flux.py (171 passed, 12 skipped — torch-gated
+      fp8-математика/behavioral-пины без torch в CI; приёмка fp8-пути —
+      прод-дым T006).
 - [ ] T006 Дымовой прогон 20 шагов на проде (старт — владелец; см. spec DoD).
 
 ## Acceptance criteria

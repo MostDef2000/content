@@ -33,6 +33,11 @@ Two test layers:
     assert SHIM_PATH exists FIRST, so they fail (not skip) while the shim
     file is missing. The strip test is pure dict-key logic (torch is a
     lazy import in the shim) and runs UNGATED in CI (reviewer F4).
+    Memory-fix pins (train-1792246674 host OOM): strip supports an
+    UNGATED in_place rename (same dict object), dequant an in_place
+    CONSUMING mode (gated; bit-exact vs copy mode), the default modes
+    keep their copy/non-consuming semantics, and the wrapper must pass
+    in_place through (structural, CI-visible).
 
 The sitecustomize ACTIVATION defect (reviewer F1 — import alone never
 calls install()) is pinned behaviorally on the prod path in
@@ -166,6 +171,20 @@ def test_patch_flux_utils_shape_wrap_load_safetensors_restore_in_finally():
     assert any(t.finalbody for t in trys), (
         "patch_flux_utils must restore the original load_safetensors in a finally block"
     )
+    # Memory fix (train-1792246674, host OOM SIGKILL between the loader's
+    # "Loading state dict" line and any traceback): the wrapper must hand
+    # the loader's dict to the fixups in CONSUMING mode — an in_place
+    # reference at the apply_sd_fixups call site inside patch_flux_utils
+    # (keyword form; a positional True does not pin the intent). Without
+    # it the raw ~17GB sd stays fully referenced while the fp32/bf16
+    # intermediates pile up (~90GB peak) and the cgroup kills the run.
+    call_kw = {
+        kw.arg for n in ast.walk(fn) if isinstance(n, ast.Call) for kw in n.keywords if kw.arg
+    }
+    assert "in_place" in call_kw | names, (
+        "patch_flux_utils must pass in_place through to apply_sd_fixups — "
+        "consuming mode is the OOM fix"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +221,34 @@ def test_strip_prefix_removes_prefix_from_all_keys():
     assert out["scaled_fp8"] is marker
     assert out["text_embedder.linear"] is emb
     assert set(sd) == {"text_embedder.linear", "model.diffusion_model.a", "scaled_fp8", "model.diffusion_model.b.block"}
+
+
+def test_strip_prefix_in_place_returns_and_mutates_same_dict():
+    # Memory fix (train-1792246674, host OOM SIGKILL): the wrapper must be
+    # able to rename the loader's ~17GB dict WITHOUT copying it —
+    # in_place=True mutates the input and returns THE SAME dict object,
+    # with the same key-set semantics as copy mode (every prefixed key
+    # renamed, unprefixed keys untouched, values passed by identity).
+    # Pure dict-key logic — runs without torch, so this pin is RED in CI
+    # today (strip_comfyui_prefix has no in_place parameter → TypeError).
+    assert SHIM_PATH.is_file()
+    shim = _load_shim()
+    marker, a, b, emb = object(), object(), object(), object()
+    sd = {
+        "text_embedder.linear": emb,
+        "model.diffusion_model.a": a,
+        "scaled_fp8": marker,
+        "model.diffusion_model.b.block": b,
+    }
+    out = shim.strip_comfyui_prefix(sd, in_place=True)
+    assert out is sd, "in_place mode must return the SAME dict object (no copy)"
+    assert set(out) == {"text_embedder.linear", "a", "scaled_fp8", "b.block"}
+    assert out["a"] is a
+    assert out["b.block"] is b
+    assert out["scaled_fp8"] is marker
+    assert out["text_embedder.linear"] is emb
+    assert "model.diffusion_model.a" not in out
+    assert "model.diffusion_model.b.block" not in out
 
 
 def test_dequant_scalar_scale():
@@ -276,6 +323,119 @@ def test_non_fp8_tensors_pass_through():
     assert torch.equal(out["a"], a)
     assert out["b"].dtype == torch.float16
     assert torch.equal(out["b"], b)
+
+
+def test_dequant_in_place_consumes_input_dict():
+    # Memory fix, core half (train-1792246674): in_place=True must POP from
+    # the input as it goes so the fp8 memory is freed progressively — the
+    # copy mode's full-fp32 intermediates on top of the still-referenced
+    # raw sd peaked at ~90GB and the cgroup SIGKILLed the run (no child
+    # traceback, rc 1). Contract: correct result AND after the call the
+    # input holds NONE of the consumed keys (paired bases, their scales,
+    # the marker); the orphan .scale_weight must not be returned either.
+    # torch-gated: SKIPPED in this sandbox; RED by construction on a torch
+    # machine today (dequant has no in_place parameter → TypeError).
+    assert SHIM_PATH.is_file()
+    _require_torch()
+    import torch
+
+    shim = _load_shim()
+    t1 = torch.ones(2).to(torch.float8_e4m3fn)
+    s1 = torch.tensor(0.5)
+    t2 = torch.ones(3).to(torch.float8_e4m3fn)
+    s2 = torch.tensor([[2.0], [0.5], [1.0]])
+    # (1,) 1-D scale — the scalar-branch shape the shim docstring claims
+    # ("0-dim, (1,) or (1,1)"): the CONSUMING path must see it too, not
+    # only the bit-exact comparison.
+    t3 = torch.ones(2).to(torch.float8_e4m3fn)
+    s3 = torch.tensor([0.5])
+    plain = torch.ones(2, dtype=torch.bfloat16)
+    stray = torch.ones(1).to(torch.float8_e4m3fn)
+    sd = {
+        "scaled_fp8": torch.tensor(0, dtype=torch.uint8),
+        "a": t1,
+        "a.scale_weight": s1,
+        "b": t2,
+        "b.scale_weight": s2,
+        "c": t3,
+        "c.scale_weight": s3,
+        "orphan.scale_weight": torch.tensor(1.0),
+        "plain": plain,
+        "stray": stray,
+    }
+    out = shim.dequant_scaled_fp8_sd(sd, in_place=True)
+    exp_a = (t1.to(torch.float32) * s1.to(torch.float32)).to(torch.bfloat16)
+    exp_b = (t2.to(torch.float32) * s2.to(torch.float32)).to(torch.bfloat16)
+    exp_c = (t3.to(torch.float32) * s3.to(torch.float32)).to(torch.bfloat16)
+    assert set(out) == {"a", "b", "c", "plain", "stray"}, set(out)
+    assert torch.equal(out["a"], exp_a)
+    assert torch.equal(out["b"], exp_b)
+    assert torch.equal(out["c"], exp_c)
+    assert torch.equal(out["plain"], plain)
+    assert out["stray"].dtype == torch.bfloat16
+    for key in ("scaled_fp8", "a", "a.scale_weight", "b", "b.scale_weight", "c", "c.scale_weight"):
+        assert key not in sd, f"in_place mode must consume {key!r} out of the input dict"
+
+
+def test_dequant_in_place_matches_copy_mode_bit_exact():
+    # Numerics guard for the chunked fp32 refactor: the SAME synthetic sd
+    # run through copy mode and through in_place mode must produce
+    # bit-identical tensors (chunk boundaries must not shift rounding).
+    # torch-gated: SKIPPED here, RED by construction on a torch machine
+    # today (no in_place parameter).
+    assert SHIM_PATH.is_file()
+    _require_torch()
+    import torch
+
+    shim = _load_shim()
+
+    def synth():
+        return {
+            "scaled_fp8": torch.tensor(0, dtype=torch.uint8),
+            "a": torch.linspace(-1.0, 1.0, 6).reshape(3, 2).to(torch.float8_e4m3fn),
+            "a.scale_weight": torch.tensor([[2.0], [0.5], [1.0]]),
+            "b": torch.ones(4).to(torch.float8_e4m3fn),
+            "b.scale_weight": torch.tensor(0.25),
+            # the scalar-branch shapes the shim docstring claims to handle
+            # ("0-dim, (1,) or (1,1)") — b covers 0-dim; these two pin the
+            # 1-element 1-D and (1,1) encodings, previously comment-only.
+            "e": torch.ones(3).to(torch.float8_e4m3fn),
+            "e.scale_weight": torch.tensor([0.5]),
+            "f": torch.linspace(0.0, 3.0, 4).to(torch.float8_e4m3fn),
+            "f.scale_weight": torch.tensor([[0.25]]),
+            "c": torch.ones(2, dtype=torch.float16),
+            "d": torch.ones(1).to(torch.float8_e5m2),
+        }
+
+    copy_out = shim.dequant_scaled_fp8_sd(synth())
+    inplace_out = shim.dequant_scaled_fp8_sd(synth(), in_place=True)
+    assert set(copy_out) == set(inplace_out)
+    for key in copy_out:
+        assert copy_out[key].dtype == inplace_out[key].dtype, key
+        assert torch.equal(copy_out[key], inplace_out[key]), key
+
+
+def test_dequant_default_mode_does_not_consume_input():
+    # Back-compat pin for the memory fix: the DEFAULT (copy) mode keeps its
+    # non-consuming semantics — a new dict out, every input key still
+    # there. GREEN today and after the fix (regression guard, not a red
+    # pin). torch-gated: SKIPPED in this sandbox.
+    assert SHIM_PATH.is_file()
+    _require_torch()
+    import torch
+
+    shim = _load_shim()
+    t = torch.ones(2).to(torch.float8_e4m3fn)
+    sd = {
+        "scaled_fp8": torch.tensor(0, dtype=torch.uint8),
+        "a": t,
+        "a.scale_weight": torch.tensor(0.5),
+    }
+    before = set(sd)
+    out = shim.dequant_scaled_fp8_sd(sd)
+    assert set(sd) == before, "default copy mode must not consume the input"
+    assert out is not sd
+    assert set(out) == {"a"}
 
 
 def test_apply_sd_fixups_composed():

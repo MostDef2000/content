@@ -16,6 +16,15 @@ The ostris scaled-fp8 T5 (t5xxl_fp8_e4m3fn_scaled.safetensors) additionally
 carries per-tensor `*.scale_weight` keys kohya ignores — raw fp8 values get
 assigned as weights (numerically wrong text-encoder outputs).
 
+Memory profile (prod OOM train-1792246674, host SIGKILL between the loader's
+"Loading state dict" line and any traceback): full-tensor fp32 intermediates
+on the ~17GB fp8 sd piled up ~90GB peak. The fixups therefore run in bounded
+chunks (fp32 transient ~16MB flat / ~256-row per-channel) and the prod path
+calls them in CONSUMING mode (`in_place=True`): tensors are popped out of
+the loader's dict as processed so fp8 memory frees progressively, and the
+steady peak is roughly the ~24GB bf16 result instead of fp32 full-tensor
+copies.
+
 This shim is installed into the kohya venv's site-packages by the bootstrap
 in scripts/train_lora.sh; a sitecustomize.py next to it imports this module
 and calls install() in EVERY python process of the venv, and install()
@@ -56,8 +65,15 @@ _SCALE_SUFFIX = ".scale_weight"
 # builds its model in bf16 — hand it dequantized bf16 tensors.
 _TARGET_DTYPE_NAME = "bfloat16"
 
+# Chunked fp32 math (memory fix, train-1792246674): the fp32 transient must
+# stay bounded — ~4M flat elements = 16MB per chunk, ~256 rows per chunk for
+# per-channel (out, 1) scales. Numerics are identical to the full-tensor
+# fp32 roundtrip: multiply and cast are elementwise ops.
+_DEQUANT_CHUNK_ELEMS = 4_000_000
+_DEQUANT_CHUNK_ROWS = 256
 
-def strip_comfyui_prefix(sd):
+
+def strip_comfyui_prefix(sd, in_place=False):
     """Strip the ComfyUI `model.diffusion_model.` prefix from EVERY key that
     carries it; keys without the prefix pass through unchanged.
 
@@ -66,8 +82,14 @@ def strip_comfyui_prefix(sd):
     key order — some earlier keys DO get renamed, the rest stay unrenamed,
     which is exactly why the prod model ended up partially meta) — here
     every key is inspected independently and no loop ever breaks early.
-    Returns a NEW dict; the input is not mutated.
+    Default returns a NEW dict (input not mutated); in_place=True renames
+    keys in the SAME dict object (pop old key, assign new) and returns it —
+    the memory fix's consuming mode for the loader's ~17GB dict.
     """
+    if in_place:
+        for key in [k for k in sd if k.startswith(_COMFYUI_PREFIX)]:
+            sd[key[len(_COMFYUI_PREFIX):]] = sd.pop(key)
+        return sd
     out = {}
     for key, value in sd.items():
         if key.startswith(_COMFYUI_PREFIX):
@@ -89,45 +111,91 @@ def _to_target(torch, tensor):
     return tensor.to(torch.float32).to(getattr(torch, _TARGET_DTYPE_NAME))
 
 
-def dequant_scaled_fp8_sd(sd):
+def _dequant_tensor(torch, tensor, scale):
+    """Dequantize ONE fp8 tensor by its scale into a preallocated bf16
+    tensor of the input's shape, in bounded chunks for the scalar and
+    (out, 1) scale shapes: numerics are identical per element to the
+    full-tensor `(tensor.fp32 * scale.fp32).bf16` roundtrip (multiply and
+    cast are elementwise — chunk boundaries cannot shift rounding), but the
+    fp32 transient is ~16MB instead of a full-tensor copy
+    (train-1792246674 OOM). EXOTIC scale shapes fall through to the plain
+    full-tensor formula — explicitly NOT chunked (correctness first, they
+    do not occur in the shipped checkpoints)."""
+    target = getattr(torch, _TARGET_DTYPE_NAME)
+    scale_fp32 = scale.to(torch.float32)
+    out = torch.empty(tensor.shape, dtype=target)
+    if scale_fp32.numel() == 1:
+        # scalar scale (0-dim, (1,) or (1,1) — all encode one per-tensor
+        # multiplier): flat chunks; reshape(()) normalizes every 1-element
+        # shape to a true scalar, and the elementwise product is identical
+        # to the old full-tensor broadcast in all three shapes.
+        flat = tensor.reshape(-1)
+        out_flat = out.view(-1)
+        scalar = scale_fp32.reshape(())
+        for r0 in range(0, flat.numel(), _DEQUANT_CHUNK_ELEMS):
+            r1 = min(r0 + _DEQUANT_CHUNK_ELEMS, flat.numel())
+            out_flat[r0:r1] = (flat[r0:r1].to(torch.float32) * scalar).to(target)
+        return out
+    if (
+        tensor.dim() == 2
+        and scale_fp32.dim() == 2
+        and scale_fp32.shape[1] == 1
+        and scale_fp32.shape[0] > 1
+        and scale_fp32.shape[0] == tensor.shape[0]
+    ):
+        # per-channel (out, 1): row chunks; a (r, 1) slice broadcasts
+        # against the (r, C) row block directly — elementwise identical to
+        # the old full-tensor formula.
+        for r0 in range(0, tensor.shape[0], _DEQUANT_CHUNK_ROWS):
+            r1 = min(r0 + _DEQUANT_CHUNK_ROWS, tensor.shape[0])
+            out[r0:r1] = (
+                tensor[r0:r1].to(torch.float32) * scale_fp32[r0:r1]
+            ).to(target)
+        return out
+    # any other broadcast shape: keep the plain (non-chunked) formula
+    return (tensor.to(torch.float32) * scale_fp32).to(target)
+
+
+def dequant_scaled_fp8_sd(sd, in_place=False):
     """Apply the scaled-fp8 fixups to a state dict.
 
     * every `<tensor>.scale_weight` pair: dequantize
       `(tensor.fp32 * scale.fp32).bf16` under the tensor key (scales may be
-      0-dim scalars or per-channel shapes like (out, 1) — plain torch
-      broadcast rules apply);
+      0-dim scalars or per-channel shapes like (out, 1) — broadcast
+      semantics preserved exactly; math runs in bounded fp32 chunks);
     * the top-level `scaled_fp8` marker is dropped regardless of its value;
     * a pure fp8 tensor WITHOUT a paired scale is cast to bf16 as-is
       (ComfyUI-style checkpoints store some tensors unscaled);
     * everything else passes through unchanged.
 
-    Returns a NEW dict; the input is not mutated.
+    Default (copy) mode returns a NEW dict, input untouched. in_place=True
+    is the consuming mode (train-1792246674 OOM fix): each tensor and its
+    scale are POPPED from the input as processed — fp8 memory frees
+    progressively; the marker and orphan scale keys are dropped from the
+    input too, and plain/stray-fp8 remainder tensors move into the result.
     """
     import torch  # lazy: this module must import (and be installed) without torch
 
-    target = getattr(torch, _TARGET_DTYPE_NAME)
     out = {}
 
     # Pass 1: dequantize every paired tensor, drop its scale key.
     paired_bases = set()
-    for key, value in sd.items():
-        if not key.endswith(_SCALE_SUFFIX):
-            continue
+    for key in [k for k in sd if k.endswith(_SCALE_SUFFIX)]:
         base = key[: -len(_SCALE_SUFFIX)]
-        if base in sd:
-            tensor = sd[base]
-            out[base] = (tensor.to(torch.float32) * value.to(torch.float32)).to(target)
-            paired_bases.add(base)
-        # An unpaired .scale_weight key has nothing to scale — drop it.
+        if base not in sd:
+            if in_place:
+                del sd[key]  # unpaired scale key has nothing to scale — drop it
+            continue
+        scale = sd.pop(key) if in_place else sd[key]
+        tensor = sd.pop(base) if in_place else sd[base]
+        out[base] = _dequant_tensor(torch, tensor, scale)
+        paired_bases.add(base)
 
     # Pass 2: every other key — drop the marker, cast stray fp8, pass the
     # rest through untouched.
-    for key, value in sd.items():
-        if key == _SCALED_FP8_MARKER:
-            continue
-        if key.endswith(_SCALE_SUFFIX):
-            continue
-        if key in paired_bases:
+    for key in list(sd):
+        value = sd.pop(key) if in_place else sd[key]
+        if key == _SCALED_FP8_MARKER or key.endswith(_SCALE_SUFFIX) or key in paired_bases:
             continue
         if isinstance(value, torch.Tensor) and value.dtype in _fp8_dtypes(torch):
             out[key] = _to_target(torch, value)
@@ -136,11 +204,12 @@ def dequant_scaled_fp8_sd(sd):
     return out
 
 
-def apply_sd_fixups(sd):
+def apply_sd_fixups(sd, in_place=False):
     """The full sd fixup pipeline for ComfyUI-style checkpoints: prefix strip
     FIRST (tensor and its .scale_weight pair share the prefix, so they stay
-    paired under the final name), then the scaled-fp8 dequant."""
-    return dequant_scaled_fp8_sd(strip_comfyui_prefix(sd))
+    paired under the final name), then the scaled-fp8 dequant. in_place=True
+    threads the consuming mode through the chain (memory fix)."""
+    return dequant_scaled_fp8_sd(strip_comfyui_prefix(sd, in_place=in_place), in_place=in_place)
 
 
 def patch_flux_utils(mod):
@@ -152,14 +221,18 @@ def patch_flux_utils(mod):
     path would leave the scaled-fp8 T5 state dict raw). For the duration of
     each call, mod.load_safetensors is replaced by a shim that runs its
     return value through apply_sd_fixups — the REAL (unmodified) kohya
-    loaders receive an already-fixed state dict. The original
+    loaders receive an already-fixed state dict. The fixups run in CONSUMING
+    mode (explicit `in_place=True` keyword): the loader's raw ~17GB fp8 sd
+    is popped out of as processed, so fp8 memory frees progressively instead
+    of piling ~90GB of fp32 transients on top of a fully-referenced dict
+    (train-1792246674 OOM). The original
     load_safetensors is restored in a finally block, win or lose; load_clip_l
     and load_ae stay untouched (no scaled-fp8 there).
     """
     original_loader = mod.load_safetensors
 
     def _fixed_load_safetensors(*args, **kwargs):
-        return apply_sd_fixups(original_loader(*args, **kwargs))
+        return apply_sd_fixups(original_loader(*args, **kwargs), in_place=True)
 
     def _make_patched(original):
         def _patched(*args, **kwargs):
