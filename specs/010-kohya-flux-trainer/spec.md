@@ -56,11 +56,12 @@ FLUX-LoRA-тренинг (`train_lora.sh <id> flux`) реально работа
 
 - guard: `${ROOT}/kohya/flux_train_network.py` отсутствует → exit 2
   (fail-fast, паттерн sdxl-гуарда).
-- bootstrap venv (только flux, только если
-  `venv/bin/python -c "import torch, torchvision"` не проходит):
-  `python3 -m venv` → cu124 torch/torchvision → `requirements.txt` клона
-  (порядок обязателен — requirements не должен переустанавливать CUDA-сборку
-  torch).
+- bootstrap venv (только flux, только если НЕ выполняется ВЕСЬ набор:
+  `venv/bin/python -c "import torch, torchvision"` проходит И есть
+  исполняемый `venv/bin/accelerate` И `.torch-flavor` в корне venv содержит
+  текущий слаг индекса): `python3 -m venv` → cu130 torch/torchvision
+  (D-005) → запись `.torch-flavor` → `requirements.txt` клона (порядок
+  обязателен — requirements не должен переустанавливать CUDA-сборку torch).
 - `export HF_HOME=${ROOT}/runtime/hf-cache` перед запуском; HF_TOKEN —
   из `.env` (существующий `set -a`-блок), в скрипте литералов нет.
 - Рендер: sed, как в sdxl-ветке; строковые плейсхолдеры с кавычками,
@@ -85,7 +86,14 @@ FLUX-LoRA-тренинг (`train_lora.sh <id> flux`) реально работа
 
 ## Limits (лимиты и операционные запреты)
 
-- Первый flux-запуск: бутстрап venv ~10–20 мин (torch cu124 ~2.5 ГБ).
+- Первый flux-запуск: бутстрап venv ~10–20 мин (torch cu130 ~2.5 ГБ).
+- (D-005) torch-индекс — **cu130**, не cu124: GPU-бокс Blackwell (sm_120),
+  cu124-колёса не содержат ядер sm_120 → первый conv2d умирает с
+  "CUDA error: no kernel image is available" (прод-кейс train-1792158920).
+  Guard бутстрапа требует маркер-файл `.torch-flavor` со слагом индекса
+  (закрывает F1-остаток): venv без маркера или со старым слагом пересобирается
+  сам — включая переход с уже установленного cu124 (прецедент: ai-toolkit
+  venv на torch 2.13.0+cu130).
 - `blocks_to_swap=20` замедляет шаги (своп блоков GPU↔CPU) — фоновая джоба.
 - Полный трейн стартует владелец из UI; на время трейна ComfyUI останавливать
   (12 ГБ общие, hard rule 3 — busy-лок менеджера).

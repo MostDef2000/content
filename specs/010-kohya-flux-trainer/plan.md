@@ -37,7 +37,7 @@
   Отсутствие → clean exit 2 c подсказкой `scripts/download_models.sh`.
 - **venv**: контейнерный python3.12; health-check
   `venv/bin/python -c "import torch, torchvision"` (покрывает и отсутствие
-  venv, и полудохлый бутстрап); порядок инсталлов cu124-torch → requirements
+  venv, и полудохлый бутстрап); порядок инсталлов torch-cu130 (D-005) → requirements
   зафиксирован комментарием в коде (requirements не должен затирать
   CUDA-сборку torch).
 - **HF**: `HF_HOME=/workspace/runtime/hf-cache` — общий кэш (хэндофф №35R);

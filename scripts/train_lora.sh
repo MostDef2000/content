@@ -278,23 +278,40 @@ if [[ "${ARCH}" == "flux" ]]; then
   # host uv-venv shipped with the kohya clone does not work inside the
   # container (interpreter symlinks point at the host), so the venv is
   # (re)created from the container python3 at runtime/kohya-venv — NOT inside
-  # the host-owned kohya checkout. ORDER MATTERS: install the cu124 torch
+  # the host-owned kohya checkout. ORDER MATTERS: install the cu130 torch
   # wheels FIRST, then requirements.txt — a plain "pip install -r
-  # requirements.txt" first would pull a non-CUDA torch build.
+  # requirements.txt" first would pull a non-CUDA torch build. cu130 (not
+  # cu124): the GPU box is Blackwell (sm_120) and the cu124 wheels carry no
+  # sm_120 kernels, so the first conv2d dies with "CUDA error: no kernel
+  # image is available for execution on the device" (prod case
+  # train-1792158920); precedent: the ai-toolkit venv was rebaked to
+  # torch 2.13.0+cu130.
   # rm -rf before venv --clear is the self-heal: `python3 -m venv` alone dies
   # with "Error: [Errno 2] No such file or directory" on a dir whose
   # bin/python3 is a broken symlink (the host uv-venv case, repro
   # train-1792131743); rm is fine because the container user writes to the
   # runtime mount, and --clear makes even a leftover partial venv harmless.
   # The probe is torch import + the accelerate binary (the final artifact of
-  # the requirements install): a venv with torch but a half-finished
-  # requirements step would otherwise skip the bootstrap and die on the
-  # missing trainer binary instead of healing (partial-bootstrap, F1).
-  if ! "${KOHYA_VENV}/bin/python3" -c "import torch, torchvision" >/dev/null 2>&1 || [[ ! -x "${KOHYA_VENV}/bin/accelerate" ]]; then
+  # the requirements install) + the .torch-flavor marker: torch imports fine
+  # on CPU paths even from a venv built against a stale index, so the guard
+  # also requires the marker to carry the current index slug
+  # (TORCH_INDEX_SLUG) — no marker (pre-rebake venv) or a stale one (wrong
+  # CUDA build for the current image) means a full rebuild, not a skip.
+  TORCH_INDEX_SLUG="cu130"
+  if ! "${KOHYA_VENV}/bin/python3" -c "import torch, torchvision" >/dev/null 2>&1 \
+     || [[ ! -x "${KOHYA_VENV}/bin/accelerate" ]] \
+     || [[ ! -f "${KOHYA_VENV}/.torch-flavor" ]] || ! grep -qx "${TORCH_INDEX_SLUG}" "${KOHYA_VENV}/.torch-flavor"; then
     echo "Bootstrapping kohya venv at ${KOHYA_VENV} (first flux run only; expect 10-20 minutes)..." >&2
     rm -rf "${KOHYA_VENV}"
     python3 -m venv --clear "${KOHYA_VENV}"
-    "${KOHYA_VENV}/bin/python" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+    "${KOHYA_VENV}/bin/python" -m pip install torch torchvision --index-url "https://download.pytorch.org/whl/${TORCH_INDEX_SLUG}"
+    # Flavor marker: torch imports on CPU paths even when the venv holds the
+    # WRONG torch build (old cu124 has no Blackwell/sm_120 kernels), so the
+    # guard needs a durable record of which index slug this venv was built
+    # from. Written only after a successful torch pip (set -e kills the run
+    # on failure, so the marker never lies about a half-install); normal
+    # umask (644) is enough — it carries no secrets.
+    echo "${TORCH_INDEX_SLUG}" > "${KOHYA_VENV}/.torch-flavor"
     # requirements.txt carries a relative editable install of sd-scripts
     # itself ("-e ."); pip resolves it against the CURRENT WORKING DIRECTORY,
     # so the install must run from inside the checkout — from the manager

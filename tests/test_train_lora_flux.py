@@ -144,17 +144,11 @@ def _run_deploy(root: Path) -> subprocess.CompletedProcess:
 
 # Emulates `python3 -m venv` for the bootstrap tests: a dangling-interpreter
 # venv dir fails exactly like the real CPython repro (Errno 2 on
-# bin/python3) unless --clear is passed; otherwise an executable stub
-# interpreter is created that logs every invocation (guard -c checks and
-# both pip installs) WITH ITS CWD to the shim log. Anything not `-m venv`
-# passes through to the real interpreter. The stub models pip semantics for
-# the two bootstrap installs: `pip install -r *requirements.txt` reads the
-# mode file — "fail" reproduces train-1792134096 (requirements die
-# mid-install: exit 1, no trainer binary), "ok" succeeds and creates a
-# bin/accelerate stub (exit 7 — a "real" trainer launch that fails without
-# faking training success), so a completed bootstrap always reaches the
-# launch stage. Placeholders __LOG__/__MODEFILE__/__REAL_PYTHON__ are
-# substituted when the shim is written.
+# bin/python3) unless --clear is passed; otherwise the venv bin gets the
+# stub interpreter from _VENV_STUB_SH (see below). Anything not `-m venv`
+# passes through to the real interpreter. Placeholders
+# __LOG__/__STUBTEMPLATE__/__REAL_PYTHON__ are substituted when the shim is
+# written.
 _PYTHON3_VENV_SHIM = """#!/usr/bin/env bash
 log="__LOG__"
 echo "python3 $*" >> "$log"
@@ -181,31 +175,7 @@ if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
       rm -rf "$dir"
     fi
     mkdir -p "$dir/bin"
-    cat > "$dir/bin/python3" <<STUB
-#!/bin/sh
-echo "venv-python cwd=\\$PWD \\$*" >> "$log"
-mode="\\$(cat "__MODEFILE__" 2>/dev/null || echo ok)"
-has_r=0
-has_req=0
-for a in "\\$@"; do
-  case "\\$a" in
-    -r) has_r=1 ;;
-    *requirements.txt) has_req=1 ;;
-  esac
-done
-if [ "\\$has_r" -eq 1 ] && [ "\\$has_req" -eq 1 ]; then
-  if [ "\\$mode" = fail ]; then
-    echo "pip-requirements FAILED cwd=\\$PWD" >> "$log"
-    exit 1
-  fi
-  bin_dir="\\$(dirname "\\$0")"
-  printf '#!/bin/sh\\necho "accelerate \\$*" >> "%s"\\nexit 7\\n' "$log" > "\\$bin_dir/accelerate"
-  chmod 755 "\\$bin_dir/accelerate"
-  echo "pip-requirements OK cwd=\\$PWD" >> "$log"
-  exit 0
-fi
-exit 0
-STUB
+    cat "__STUBTEMPLATE__" > "$dir/bin/python3"
     chmod 755 "$dir/bin/python3"
     ln -sf python3 "$dir/bin/python"
     exit 0
@@ -213,6 +183,67 @@ STUB
 fi
 exec "__REAL_PYTHON__" "$@"
 """
+
+# The stub venv interpreter, written by the shim's `-m venv` emulation and
+# by _seed_flavored_venv (one source of truth). It:
+#   - logs every invocation WITH ITS CWD (the cwd contract tests read this);
+#   - answers exit 0 to any `-c` probe (torch imports are always "fine");
+#   - `pip install -r *requirements.txt` reads the mode file: "fail"
+#     reproduces train-1792134096 (requirements die mid-install: exit 1, no
+#     trainer binary), "ok" succeeds and creates a bin/accelerate stub
+#     (exit 7 — a "real" trainer launch that fails without faking training
+#     success), so a completed bootstrap always reaches the launch stage.
+# It deliberately does NOT create the .torch-flavor marker: the marker is
+# the SCRIPT's own artifact (echo "${TORCH_INDEX_SLUG}" > ...). A stub that
+# materialized it from --index-url calls masked deletion of the writer line
+# (pair-review gap F2) — with the emulation removed, a missing writer leaves
+# no marker anywhere and the two-run test below goes red.
+# Placeholders __LOG__/__MODEFILE__ are substituted per fixture root.
+_VENV_STUB_SH = """#!/bin/sh
+echo "venv-python cwd=$PWD $*" >> "__LOG__"
+mode="$(cat "__MODEFILE__" 2>/dev/null || echo ok)"
+has_r=0
+has_req=0
+for a in "$@"; do
+  case "$a" in
+    -r) has_r=1 ;;
+    *requirements.txt) has_req=1 ;;
+  esac
+done
+bin_dir="$(dirname "$0")"
+if [ "$has_r" -eq 1 ] && [ "$has_req" -eq 1 ]; then
+  if [ "$mode" = fail ]; then
+    echo "pip-requirements FAILED cwd=$PWD" >> "__LOG__"
+    exit 1
+  fi
+  printf '#!/bin/sh\\necho "accelerate $*" >> "%s"\\nexit 7\\n' "__LOG__" > "$bin_dir/accelerate"
+  chmod 755 "$bin_dir/accelerate"
+  echo "pip-requirements OK cwd=$PWD" >> "__LOG__"
+  exit 0
+fi
+exit 0
+"""
+
+# The trainer-binary stub: logs the launch args and exits 7 (a genuine
+# failure at the launch stage, never a faked success).
+_ACCELERATE_STUB_SH = """#!/bin/sh
+echo "accelerate $*" >> "__LOG__"
+exit 7
+"""
+
+
+def _shim_paths(root: Path) -> tuple[Path, Path]:
+    return root / "shim.log", root / "shim.mode"
+
+
+def _stub_text(root: Path) -> str:
+    log, mode = _shim_paths(root)
+    return _VENV_STUB_SH.replace("__LOG__", str(log)).replace("__MODEFILE__", str(mode))
+
+
+def _accelerate_stub_text(root: Path) -> str:
+    log, _mode = _shim_paths(root)
+    return _ACCELERATE_STUB_SH.replace("__LOG__", str(log))
 
 
 def _install_python3_venv_shim(root: Path) -> tuple[Path, Path, Path]:
@@ -222,18 +253,41 @@ def _install_python3_venv_shim(root: Path) -> tuple[Path, Path, Path]:
     mid-install). Flip it between runs to script multi-run scenarios."""
     shim_dir = root / "fixture-bin"
     shim_dir.mkdir()
-    log = root / "shim.log"
-    mode = root / "shim.mode"
+    log, mode = _shim_paths(root)
     mode.write_text("ok", encoding="utf-8")
+    stub_template = shim_dir / "venv-stub.sh"
+    stub_template.write_text(_stub_text(root), encoding="utf-8")
     script = (
         _PYTHON3_VENV_SHIM.replace("__LOG__", str(log))
-        .replace("__MODEFILE__", str(mode))
+        .replace("__STUBTEMPLATE__", str(stub_template))
         .replace("__REAL_PYTHON__", sys.executable)
     )
     shim = shim_dir / "python3"
     shim.write_text(script, encoding="utf-8")
     shim.chmod(0o755)
     return shim_dir, log, mode
+
+
+def _seed_flavored_venv(root: Path, *, flavor: str | None = None, with_accelerate: bool = True) -> Path:
+    """Pre-build a COMPLETE-looking kohya venv at the location the script
+    guards (runtime/kohya-venv): stub interpreter (torch imports fine),
+    executable accelerate stub and — when flavor is given — a .torch-flavor
+    marker with that index slug. The fixture for the flavor-marker guard
+    tests: a matching marker must make the bootstrap skip, a missing or
+    stale one must force a full rebuild. Returns the venv dir."""
+    venv = root / "runtime" / "kohya-venv"
+    (venv / "bin").mkdir(parents=True)
+    stub = venv / "bin" / "python3"
+    stub.write_text(_stub_text(root), encoding="utf-8")
+    stub.chmod(0o755)
+    (venv / "bin" / "python").symlink_to("python3")
+    if with_accelerate:
+        acc = venv / "bin" / "accelerate"
+        acc.write_text(_accelerate_stub_text(root), encoding="utf-8")
+        acc.chmod(0o755)
+    if flavor is not None:
+        (venv / ".torch-flavor").write_text(f"{flavor}\n", encoding="utf-8")
+    return venv
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +378,25 @@ def test_flux_branch_does_not_read_dead_ai_toolkit_template():
     assert "train_config.flux.template.yaml" not in text
     assert "train_config_flux_kohya.template.toml" in text
     assert "train_config_flux_kohya_dataset.template.toml" in text
+
+
+def test_flux_script_writes_torch_flavor_marker_line():
+    # Pair-review gap F2: the flavor guard skips the bootstrap only when
+    # ${KOHYA_VENV}/.torch-flavor carries the current slug, and that file is
+    # produced by exactly ONE writer line in the script. The test shim used
+    # to materialize the marker from any --index-url pip call, so deleting
+    # the writer line kept the suite green while prod rebuilt the 10-20
+    # minute venv on EVERY flux run. The stub emulation is gone (marker is
+    # the script's own artifact now); this textual pin plus
+    # test_flux_second_run_skips_bootstrap_via_marker_written_by_script
+    # below close the gap from both sides.
+    text = _script_text()
+    assert 'echo "${TORCH_INDEX_SLUG}" > "${KOHYA_VENV}/.torch-flavor"' in text, (
+        "marker-writer line missing/broken: the bootstrap must record the "
+        'index slug it installed from (echo "${TORCH_INDEX_SLUG}" > '
+        '"${KOHYA_VENV}/.torch-flavor"), otherwise the flavor guard never '
+        "finds a matching marker and rebuilds on every run"
+    )
 
 
 def test_flux_templates_te_cache_excludes_caption_shuffle_and_dropout():
@@ -530,11 +603,11 @@ def test_flux_bootstrap_self_heals_broken_host_venv():
         assert result.returncode == 7
         # 3) the bootstrap really ran through the shimmed python3 -m venv and
         #    then BOTH pip installs on the stub interpreter, in the required
-        #    order (cu124 torch wheels first, then requirements.txt).
+        #    order (cu130 torch wheels first, then requirements.txt).
         assert "-m venv" in log_text, log_text
         pip_lines = [line for line in log_text.splitlines() if "-m pip install" in line]
         assert len(pip_lines) == 2, log_text
-        assert "torch" in pip_lines[0] and "cu124" in pip_lines[0], pip_lines
+        assert "torch" in pip_lines[0] and "cu130" in pip_lines[0], pip_lines
         assert "requirements.txt" in pip_lines[1], pip_lines
     finally:
         _cleanup(root)
@@ -582,14 +655,14 @@ def test_flux_pip_requirements_runs_with_cwd_inside_kohya_checkout():
 
 def test_flux_guard_rebootstraps_after_partial_bootstrap():
     # Prod trap found on the same job (F1 gate): the bootstrap guard probes
-    # only `import torch` inside the venv. When the cu124 wheels landed but
+    # only `import torch` inside the venv. When the cu130 wheels landed but
     # the requirements install died mid-way, the venv is HALF-BUILT (torch
     # importable, no bin/accelerate) — the next run skips the bootstrap and
     # fails on the missing trainer binary instead of healing. The guard must
     # also require ${KOHYA_VENV}/bin/accelerate so a partial bootstrap is
     # rebuilt from scratch.
     # Scenario: run 1 with the shim's requirements-pip in "fail" mode
-    # (cu124 OK, requirements FAILED — the train-1792134096 shape); run 2
+    # (cu130 OK, requirements FAILED — the train-1792134096 shape); run 2
     # against the SAME venv dir with requirements now succeeding must re-run
     # the whole bootstrap (fresh venv + both pip installs) and launch the
     # trainer stub. Today run 2 skips the bootstrap (torch-only guard) and
@@ -607,7 +680,7 @@ def test_flux_guard_rebootstraps_after_partial_bootstrap():
         r1 = _run_script(root, MODEL_ID, "flux", STEPS=STEPS_SMOKE, PATH=path_env)
         log1 = log.read_text(encoding="utf-8") if log.exists() else ""
         assert r1.returncode != 0, (r1.returncode, r1.stderr)
-        assert any("cu124" in line for line in log1.splitlines()), log1
+        assert any("cu130" in line for line in log1.splitlines()), log1
         assert "pip-requirements FAILED" in log1, log1
         assert "flux_train_network.py exited with code" not in r1.stderr, r1.stderr
         # locate the venv the script created (location-agnostic: it is the
@@ -630,6 +703,138 @@ def test_flux_guard_rebootstraps_after_partial_bootstrap():
         )
         pip2 = [line for line in log2.splitlines() if "-m pip install" in line]
         assert len(pip2) == 2, log2
+        assert "flux_train_network.py exited with code 7" in r2.stderr, (r2.returncode, r2.stderr, log2)
+        assert r2.returncode == 7
+    finally:
+        _cleanup(root)
+
+
+def test_flux_guard_rebuilds_on_missing_or_stale_torch_flavor():
+    # Torch-flavor rebake (cu124 → cu130): the bootstrap records the index
+    # slug it installed from in ${KOHYA_VENV}/.torch-flavor, and the guard
+    # skips the bootstrap only when the venv python imports torch+torchvision
+    # AND the marker says "cu130" AND bin/accelerate is executable. A venv
+    # that looks complete but carries NO marker or a STALE one ("cu124" —
+    # built against the old index) is the wrong torch build for the new CUDA
+    # image and must be rebuilt from scratch, with the marker rewritten to
+    # cu130. RED today: the committed guard (e23dfb9) has no flavor notion —
+    # torch+accelerate make it skip the bootstrap, so no rebuild happens and
+    # the marker stays missing/stale; the pip install itself still says
+    # cu124, so the fresh bootstrap of the first variant also fails the
+    # cu130 contract.
+    for stale in (None, "cu124"):
+        root = _build_root()
+        try:
+            (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
+            (root / "kohya" / "pyproject.toml").write_text('[project]\nname = "sd-scripts"\n', encoding="utf-8")
+            venv = _seed_flavored_venv(root, flavor=stale)
+            shim_dir, log, _mode = _install_python3_venv_shim(root)
+            result = _run_script(
+                root,
+                MODEL_ID,
+                "flux",
+                STEPS=STEPS_SMOKE,
+                PATH=f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
+            )
+            log_text = log.read_text(encoding="utf-8") if log.exists() else ""
+            label = f"flavor={stale!r}: "
+            # the half-recognized venv must be rebuilt end-to-end ...
+            assert "-m venv" in log_text, (
+                f"{label}guard skipped the bootstrap on a venv without a "
+                f"matching cu130 marker.\nlog:\n{log_text}\nstderr:\n{result.stderr}"
+            )
+            pip_lines = [line for line in log_text.splitlines() if "-m pip install" in line]
+            assert len(pip_lines) == 2, f"{label}{log_text}"
+            assert "cu130" in pip_lines[0], f"{label}{pip_lines}"
+            # ... and the marker must come out saying cu130 ...
+            marker = venv / ".torch-flavor"
+            assert marker.is_file(), f"{label}.torch-flavor marker not written by the rebuild"
+            assert "cu130" in marker.read_text(encoding="utf-8"), f"{label}{marker.read_text(encoding='utf-8')!r}"
+            # ... and the run still ends at the trainer launch (stub exit 7).
+            assert "flux_train_network.py exited with code 7" in result.stderr, (
+                f"{label}{result.returncode}\n{result.stderr}\n{log_text}"
+            )
+            assert result.returncode == 7
+        finally:
+            _cleanup(root)
+
+
+def test_flux_guard_skips_bootstrap_on_matching_torch_flavor():
+    # The other side of the flavor gate: a venv with torch importable,
+    # executable accelerate AND .torch-flavor == "cu130" is fully current —
+    # the bootstrap must be SKIPPED entirely (no python3 -m venv, no pip
+    # torch install) and the launch must run the existing trainer binary.
+    # Green today (the committed torch+accelerate guard also skips) and must
+    # stay green after the flavor fix — the regression guard that the marker
+    # check does not force needless 10-20 minute rebuilds on every run.
+    root = _build_root()
+    try:
+        (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
+        venv = _seed_flavored_venv(root, flavor="cu130")
+        shim_dir, log, _mode = _install_python3_venv_shim(root)
+        result = _run_script(
+            root,
+            MODEL_ID,
+            "flux",
+            STEPS=STEPS_SMOKE,
+            PATH=f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
+        )
+        log_text = log.read_text(encoding="utf-8") if log.exists() else ""
+        assert "-m venv" not in log_text, log_text
+        assert not any("-m pip install" in line for line in log_text.splitlines()), log_text
+        # the seeded marker and trainer binary survive untouched ...
+        assert (venv / ".torch-flavor").read_text(encoding="utf-8").strip() == "cu130"
+        # ... and the run goes straight to the launch of the seeded stub.
+        assert "flux_train_network.py exited with code 7" in result.stderr, (result.returncode, result.stderr, log_text)
+        assert result.returncode == 7
+    finally:
+        _cleanup(root)
+
+
+def test_flux_second_run_skips_bootstrap_via_marker_written_by_script():
+    # F2 behavioral half: .torch-flavor must be the SCRIPT's own artifact —
+    # the shim stub deliberately never creates it. Two runs on ONE tree:
+    #   run 1: venv location empty → full bootstrap (rm+venv+both pip) and
+    #          the script's writer line leaves a cu130 marker;
+    #   run 2: same tree, marker current → the guard skips the bootstrap
+    #          ENTIRELY: no `python3 -m venv`, no pip calls, straight to the
+    #          trainer launch (accelerate stub, exit 7).
+    # Delete the writer line and run 2 finds no matching marker, rebuilds a
+    # 10-20 minute venv on every run, and this test goes red — while every
+    # single-run test (which the old stub-marker masked) would have stayed
+    # green.
+    root = _build_root()
+    try:
+        (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
+        (root / "kohya" / "pyproject.toml").write_text('[project]\nname = "sd-scripts"\n', encoding="utf-8")
+        shim_dir, log, _mode = _install_python3_venv_shim(root)
+        path_env = f"{shim_dir}{os.pathsep}{os.environ['PATH']}"
+
+        # run 1: full bootstrap on the empty venv location.
+        r1 = _run_script(root, MODEL_ID, "flux", STEPS=STEPS_SMOKE, PATH=path_env)
+        log1 = log.read_text(encoding="utf-8") if log.exists() else ""
+        assert "-m venv" in log1, log1
+        assert len([line for line in log1.splitlines() if "-m pip install" in line]) == 2, log1
+        assert "flux_train_network.py exited with code 7" in r1.stderr, (r1.returncode, r1.stderr, log1)
+        # the marker exists ONLY because the script wrote it (the stub does
+        # not create it) and carries the slug the script installed from.
+        marker = root / "runtime" / "kohya-venv" / ".torch-flavor"
+        assert marker.is_file(), (
+            "run 1 left no .torch-flavor marker: the script's marker-writer "
+            f"line is missing/broken.\nlog1:\n{log1}\nstderr:\n{r1.stderr}"
+        )
+        assert "cu130" in marker.read_text(encoding="utf-8"), marker.read_text(encoding="utf-8")
+
+        # run 2: SAME tree — the guard must skip the whole bootstrap.
+        log.unlink()
+        r2 = _run_script(root, MODEL_ID, "flux", STEPS=STEPS_SMOKE, PATH=path_env)
+        log2 = log.read_text(encoding="utf-8") if log.exists() else ""
+        assert "-m venv" not in log2, (
+            "run 2 rebuilt the venv on a marker-current tree — without the "
+            "script writing .torch-flavor during run 1 the guard can never "
+            f"match the flavor and every run pays 10-20 minutes.\nlog2:\n{log2}\nstderr:\n{r2.stderr}"
+        )
+        assert not any("-m pip install" in line for line in log2.splitlines()), log2
         assert "flux_train_network.py exited with code 7" in r2.stderr, (r2.returncode, r2.stderr, log2)
         assert r2.returncode == 7
     finally:

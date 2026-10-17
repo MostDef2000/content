@@ -24,7 +24,7 @@
       резолв 4 локальных моделей по раскладке download_models.sh → exit 2 с
       подсказкой); рендер двух TOML (sed, числа без кавычек);
       SKIP_TRAIN-шов на месте (после рендера, до тренировки); бутстрап venv
-      (venv python → cu124 torch → requirements, порядок в комментарии);
+      (venv python → torch-cu130 (D-005) → requirements, порядок в комментарии);
       `export HF_HOME`; `accelerate launch --num_processes 1
       --num_machines 1 --mixed_precision bf16 flux_train_network.py
       --config_file <f1> --dataset_config <f2>`; деплой tmp+mv →
