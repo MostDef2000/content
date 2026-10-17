@@ -34,9 +34,11 @@ Run either way:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -53,6 +55,45 @@ STEPS_SMOKE = "20"  # render override used by the happy-path fixtures
 # EVERY fixture test; the install test asserts the site-packages copy equals
 # this exact content, pinning the copy source to ${ROOT}/scripts/.
 SHIM_PLACEHOLDER = "# fixture placeholder for kohya_compat_shim\n"
+
+
+def _write_safetensors_stub(path: Path, data_bytes: int = 16) -> None:
+    """Write an HONEST minimal safetensors file: 8-byte little-endian header
+    length + JSON header declaring ONE F32 tensor whose data_offsets match
+    REAL data bytes appended after the header. Honest means it survives the
+    hardened header validation (supported byte description, non-empty
+    tensor set, offsets inside the data section) — declared-bytes stubs
+    whose offsets exceed the file are MALFORMED under that validation and
+    must not be used for memory-branch coverage. Model stubs use this so
+    the memory preflight (which parses the header without torch) sees
+    well-formed files, like real checkpoints."""
+    header = json.dumps(
+        {"t": {"dtype": "F32", "shape": [data_bytes // 4], "data_offsets": [0, data_bytes]}}
+    ).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(header)) + header + b"\0" * data_bytes)
+
+
+def _write_safetensors_header(path: Path, header: dict, data_bytes: int = 0) -> None:
+    """Write an arbitrary safetensors HEADER VERBATIM (plus data_bytes of
+    real data) — for the malformed-header pins: entries without a byte
+    description, metadata-only (empty tensor set), offsets exceeding the
+    data section."""
+    raw = json.dumps(header).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(raw)) + raw + b"\0" * data_bytes)
+
+
+def _make_fixture_cgroup(root: Path, *, limit_bytes: int, usage_bytes: int | None = None) -> Path:
+    """v2-layout cgroup directory tree for the preflight seam
+    (MEM_PREFLIGHT_CGROUP_ROOT): <dir>/memory.max with the given limit and,
+    when usage_bytes is provided, <dir>/memory.current. usage_bytes=None
+    builds the fail-closed scenario (finite limit, unreadable usage).
+    Returns the dir to pass as the seam."""
+    cg = root / "cgroup-fixture"
+    cg.mkdir(parents=True, exist_ok=True)
+    (cg / "memory.max").write_text(f"{limit_bytes}\n", encoding="utf-8")
+    if usage_bytes is not None:
+        (cg / "memory.current").write_text(f"{usage_bytes}\n", encoding="utf-8")
+    return cg
 
 
 # ---------------------------------------------------------------------------
@@ -75,8 +116,10 @@ def _build_root(
     location), the flux + sdxl templates, an executable ai-toolkit venv stub,
     the kohya checkout marker, a 15-image/15-caption dataset and the four
     local FLUX base checkpoints of the shared ComfyUI runtime layout
-    (scripts/download_models.sh). Files are zero-byte stubs — the SKIP_TRAIN
-    seam stops before anything reads them."""
+    (scripts/download_models.sh). Model files are HONEST minimal safetensors
+    stubs (one tiny tensor, offsets inside the data section) — the SKIP_TRAIN
+    seam stops before anything reads them, and the memory preflight's header
+    parser accepts them under its hardened validation."""
     root = Path(tempfile.mkdtemp(prefix="train-lora-flux-"))
     (root / "scripts").mkdir(parents=True)
     shutil.copy(SCRIPT, root / "scripts" / "train_lora.sh")
@@ -105,10 +148,10 @@ def _build_root(
     (models / "checkpoints").mkdir(parents=True)
     (models / "vae").mkdir()
     (models / "text_encoders").mkdir()
-    (models / "checkpoints" / dit).write_bytes(b"d")
-    (models / "vae" / "ae.safetensors").write_bytes(b"a")
-    (models / "text_encoders" / "clip_l.safetensors").write_bytes(b"c")
-    (models / "text_encoders" / t5).write_bytes(b"t")
+    _write_safetensors_stub(models / "checkpoints" / dit)
+    _write_safetensors_stub(models / "vae" / "ae.safetensors")
+    _write_safetensors_stub(models / "text_encoders" / "clip_l.safetensors")
+    _write_safetensors_stub(models / "text_encoders" / t5)
     return root
 
 
@@ -116,11 +159,24 @@ def _cleanup(root: Path) -> None:
     shutil.rmtree(root, ignore_errors=True)
 
 
-def _run_script(root: Path, *args: str, **env_overrides: str) -> subprocess.CompletedProcess:
+def _run_script(root: Path, *args: str, **env_overrides: str | None) -> subprocess.CompletedProcess:
     """Run the fixture copy of train_lora.sh with a minimal, controlled env
-    (no inherited STEPS/SEED/... from the test process)."""
+    (no inherited STEPS/SEED/... from the test process).
+
+    MEM_PREFLIGHT_SLACK_BYTES is pinned to 0 by default: the launch-path
+    fixtures run on CI boxes with far less RAM than the 13GB production
+    slack, and the stub checkpoints measure ~0 bytes, so the gate reduces
+    to "available >= 0" (the preflight itself still runs and logs — only
+    the margin is neutralized). A caller that must exercise the PRODUCTION
+    default (the behavioral preflight-abort test) passes
+    MEM_PREFLIGHT_SLACK_BYTES=None, which leaves the variable unset."""
     env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
-    env.update(env_overrides)
+    env["MEM_PREFLIGHT_SLACK_BYTES"] = "0"
+    for key, value in env_overrides.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
     return subprocess.run(
         ["bash", str(root / "scripts" / "train_lora.sh"), *args],
         capture_output=True,
@@ -435,6 +491,170 @@ def test_flux_bootstrap_installs_compat_shim_text_contract():
     assert re.search(r'grep -q[^\n]*(sitecustomize|kohya_compat_shim)', text), (
         "the sitecustomize write must be guarded by grep -q so a re-run does "
         "not duplicate the shim activation"
+    )
+
+
+def _extract_preflight_block(text: str) -> str:
+    """Body of the pure-python memory-preflight heredoc (python3 - <<'PY'
+    ... PY). Raises AssertionError when the block does not exist."""
+    m = re.search(r"python3\s+-\s*<<\s*'?PY'?\n(?P<body>.*?)\n\s*PY\b", text, re.DOTALL)
+    assert m is not None, (
+        "no pure-python memory-preflight heredoc (python3 - <<'PY' ... PY) "
+        "in scripts/train_lora.sh"
+    )
+    return m.group("body")
+
+
+def test_flux_memory_preflight_structural_contract():
+    # Validator requirement after the third-SIGKILL evidence
+    # (train-1792249442): before any heavy allocation the flux path must
+    # run a PURE-PYTHON memory preflight that (a) reads the effective
+    # cgroup limit — v2 /sys/fs/cgroup/memory.max with the v1 fallback
+    # /sys/fs/cgroup/memory/memory.limit_in_bytes, (b) reads MemAvailable
+    # and SwapTotal from /proc/meminfo, (c) sums the checkpoint tensor
+    # bytes from the SAFETENSORS HEADER (struct + json, no torch import),
+    # (d) logs the measurements, (e) aborts non-zero with a
+    # distinguishable preflight message when MemAvailable is below the
+    # checkpoint bytes plus a margin — the abort math must reference the
+    # MEASURED bytes, not a hardcoded size. Placement: AFTER the flux
+    # SKIP_TRAIN seam (the seam bypasses it — coherent with the existing
+    # SKIP_TRAIN contract) and BEFORE the accelerate launch.
+    # Regression pin: the block must exist with all of this; the harness
+    # seam (MEM_PREFLIGHT_SLACK_BYTES=0 in _run_script) never weakens this
+    # text check — the PRODUCTION default slack is pinned explicitly below.
+    text = _script_text()
+    block = _extract_preflight_block(text)
+    # v2/v1 limit files must be read — either as full literals or composed
+    # from the MEM_PREFLIGHT_CGROUP_ROOT seam (the cgroup-enforcement round
+    # replaces the hardcoded paths with root + file; both spellings satisfy
+    # the same meaning: the file is read under the default root).
+    seam_composed = "MEM_PREFLIGHT_CGROUP_ROOT" in text
+    assert "/sys/fs/cgroup/memory.max" in block or ("memory.max" in block and seam_composed), (
+        "cgroup v2 limit must be read"
+    )
+    assert "/sys/fs/cgroup/memory/memory.limit_in_bytes" in block or (
+        "memory.limit_in_bytes" in block and seam_composed
+    ), "cgroup v1 fallback must be read"
+    assert "/proc/meminfo" in block, "host meminfo must be read"
+    assert "MemAvailable" in block and "SwapTotal" in block, "both host memory fields must be read"
+    # safetensors header math: 8-byte little-endian length + JSON, tensor
+    # bytes summed from the header (data_offsets or per-tensor nbytes)
+    assert "struct" in block and "<Q" in block, (
+        "the preflight must parse the safetensors 8-byte LE header length"
+    )
+    assert "json" in block, "the preflight must parse the header JSON"
+    assert "data_offsets" in block or "nbytes" in block, (
+        "checkpoint bytes must be summed from header-measured tensor bytes "
+        "(data_offsets/nbytes), not a hardcoded size"
+    )
+    assert "import torch" not in block, "the preflight must be torch-free (pure python)"
+    assert "print" in block, "the preflight must log its measurements"
+    assert re.search(r"sys\.exit\(|raise SystemExit", block), (
+        "the preflight must abort non-zero on insufficient memory"
+    )
+    assert "preflight" in block.lower(), (
+        "the abort message must be distinguishable (contain 'preflight')"
+    )
+    # production default: the slack comes from the 13GB literal expression,
+    # the env seam only overrides it — grep the default INSIDE the block so
+    # a weakened default (e.g. 0 baked in) fails here even though the test
+    # harness passes slack=0 through the seam.
+    assert re.search(r'MEM_PREFLIGHT_SLACK_BYTES",\s*13\s*\*\s*1024\*\*3', block), (
+        "the preflight must default the slack to 13GB (13 * 1024**3) via "
+        "MEM_PREFLIGHT_SLACK_BYTES; the seam may only override it"
+    )
+    # placement: flux SKIP_TRAIN seam < preflight < accelerate launch
+    seam_pos = text.index('if [[ "${SKIP_TRAIN:-}" == "1" ]]')
+    block_pos = text.index(block)
+    launch_pos = text.index('bin/accelerate" launch')
+    assert seam_pos < block_pos, (
+        "the preflight must sit AFTER the flux SKIP_TRAIN seam (SKIP_TRAIN=1 "
+        "must bypass it, matching the existing seam contract)"
+    )
+    assert block_pos < launch_pos, "the preflight must run before the accelerate launch"
+
+
+def test_flux_preflight_cgroup_enforcement_structural_contract():
+    # Validator DEFECT 1 (gate adequacy): the current block decides on host
+    # MemAvailable ALONE — the cgroup limit is read for logging but a
+    # finite limit tighter than the host never stops a doomed run (the
+    # cgroup SIGKILLs it mid-train instead of a clean refusal). Required
+    # enforcement: effective_budget = min(MemAvailable, limit - usage)
+    # when the limit is finite; fail closed (refuse) when a finite limit
+    # exists but usage is unreadable; unlimited (v2 "max", v1 >= 2^60) →
+    # host-only. Controllable via the MEM_PREFLIGHT_CGROUP_ROOT seam
+    # (default /sys/fs/cgroup; v2: <root>/memory.max + <root>/memory.current;
+    # v1: <root>/memory/memory.limit_in_bytes + memory.usage_in_bytes).
+    # RED today: no usage reads, no min(), no seam, no fail-closed marker.
+    text = _script_text()
+    block = _extract_preflight_block(text)
+    # seam with the documented default (bash :- form or python get-default)
+    assert re.search(
+        r'MEM_PREFLIGHT_CGROUP_ROOT[^\n]{0,60}(?:"?/sys/fs/cgroup|:-/sys/fs/cgroup)', text
+    ), (
+        "the preflight must read the cgroup files under MEM_PREFLIGHT_CGROUP_ROOT "
+        'with the default "/sys/fs/cgroup"'
+    )
+    assert "memory.current" in block, "v2 usage file must be read"
+    assert "memory.usage_in_bytes" in block, "v1 usage file must be read"
+    assert re.search(r"\bmin\s*\(", block), (
+        "the gate must compute min(host avail, cgroup remaining) for a finite limit"
+    )
+    assert re.search(r"fail[-_ ]?clos|refus", block, re.I), (
+        "unreadable usage under a finite limit must fail closed (marked refusal)"
+    )
+
+
+def test_flux_preflight_header_and_slack_validation_structural_contract():
+    # Validator DEFECT 2 (validation gaps):
+    #  (a) the only header bound today is `header_len > file_size - 8` —
+    #     size-DEPENDENT: a huge sparse file with a giant bogus header still
+    #     passes and triggers a multi-GB header read. Required: an explicit
+    #     ceiling INDEPENDENT of the file size (e.g. 256MB constant).
+    #  (b) header entries are trusted blindly: value.get("data_offsets")
+    #     then offsets[1] - offsets[0] — no dict/2-int/0<=start<=end entry
+    #     validation (malformed headers crash with a traceback or produce
+    #     negative totals). Required: entry validation or marked refusal.
+    #  (c) slack is parsed as a bare int: a NEGATIVE MEM_PREFLIGHT_SLACK_BYTES
+    #     silently WEAKENS the gate (required shrinks) and a non-integer
+    #     value dies with a raw ValueError traceback. Required: non-negative
+    #     validation with a marked refuse, and clean handling of invalid
+    #     values.
+    # RED today: none of the three markers exist.
+    text = _script_text()
+    block = _extract_preflight_block(text)
+    # (a) header ceiling independent of file size: header_len compared
+    # against an ALL-CAPS constant, a numeric product, or a name containing
+    # max/limit/ceil — NOT against the lowercase file_size expression.
+    assert re.search(
+        r"header_len\s*>=?\s*(?:[A-Z0-9_]{2,}\b|\d+\s*\*|[A-Za-z_]*(?:max|limit|ceil)[A-Za-z_]*)",
+        block,
+    ), (
+        "an explicit header-size ceiling (constant/limit expression, e.g. 256MB), "
+        "independent of the file size, must bound header_len"
+    )
+    # (b) data_offsets entry validation (2-int sequence, ordered) or a
+    # marked refusal for malformed entries.
+    assert re.search(
+        r"(len\(\s*offsets\s*\)|isinstance\(\s*offsets|0\s*<=\s*\w+\s*<=\s*\w+|(?:invalid|malformed|bad)[^\n]{0,40}offset)",
+        block,
+        re.I,
+    ), (
+        "header entries must be validated (data_offsets: 2-int sequence with "
+        "0 <= start <= end) or refused with a marked error"
+    )
+    # (c) slack non-negative + invalid-value refusal.
+    assert re.search(r"slack\s*<\s*=?\s*0", block), (
+        "a negative MEM_PREFLIGHT_SLACK_BYTES must be refused, never allowed "
+        "to weaken the gate"
+    )
+    assert re.search(
+        r"(try:[\s\S]{0,120}?slack\s*=\s*int\(|slack[^\n]{0,80}(?:isdigit|ValueError|invalid)|(?:invalid|unparsable)[^\n]{0,60}slack)",
+        block,
+        re.I,
+    ), (
+        "a non-integer slack must be rejected with a clean marked refusal, "
+        "not a raw ValueError traceback"
     )
 
 
@@ -1091,6 +1311,293 @@ def test_flux_sitecustomize_shim_import_not_duplicated_across_rebuilds():
         imports2 = [ln for ln in sitecustomize.read_text(encoding="utf-8").splitlines() if "import kohya_compat_shim" in ln]
         assert len(imports2) == 1, f"rebuild duplicated the sitecustomize import: {imports2}"
         assert (sp / "kohya_compat_shim.py").is_file()
+    finally:
+        _cleanup(root)
+
+
+def test_flux_memory_preflight_aborts_before_launch_on_default_slack():
+    # Behavioral half of the memory preflight (validator condition, after
+    # train-1792249442 SIGKILL): run the flux path against a HEALTHY venv
+    # (no rebuild noise) with an HONEST minimal checkpoint stub (~16 real
+    # bytes — declared-bytes stubs are malformed under the hardened header
+    # validation and belong to the malformed-header pins below) and require
+    # a CLEAN ABORT before the trainer launch: non-zero rc, no launch
+    # marker, a distinguishable "preflight" line. The refusal comes from
+    # the PRODUCTION default slack (13GiB): the harness seam is explicitly
+    # unset (MEM_PREFLIGHT_SLACK_BYTES=None), so on any box with less than
+    # 13GiB available — every CI sandbox included — the host gate refuses
+    # and the slack number must be visible in the output (a leak of the
+    # harness slack=0 into this scenario is itself caught).
+    root = _build_root()
+    try:
+        (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
+        (root / "kohya" / "pyproject.toml").write_text('[project]\nname = "sd-scripts"\n', encoding="utf-8")
+        _seed_flavored_venv(root, flavor="cu130")
+        _write_safetensors_stub(root / "runtime" / "models" / "checkpoints" / "flux1-dev-fp8.safetensors")
+        shim_dir, log, _mode = _install_python3_venv_shim(root)
+        result = _run_script(
+            root,
+            MODEL_ID,
+            "flux",
+            STEPS=STEPS_SMOKE,
+            PATH=f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
+            MEM_PREFLIGHT_SLACK_BYTES=None,  # production default, not the harness seam
+        )
+        combined = (result.stdout + result.stderr).lower()
+        assert result.returncode != 0, (result.returncode, result.stdout, result.stderr)
+        assert "flux_train_network.py exited with code" not in result.stderr, (
+            "the run reached the trainer launch — no memory preflight aborted it first\n"
+            f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert "preflight" in combined, (
+            f"abort must be a distinguishable preflight message; rc={result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        # the abort must be computed with the DEFAULT 13GB slack
+        # (13 * 1024**3 = 13958643712) — proves the seam did not leak into
+        # this scenario and the production gate is the one under test.
+        assert "13958643712" in combined, (
+            f"abort output must show the 13GB default slack in effect; rc={result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    finally:
+        _cleanup(root)
+
+
+def test_flux_memory_preflight_refuses_when_cgroup_budget_below_requirement():
+    # DEFECT 1 behavioral: a FINITE cgroup limit tighter than the host must
+    # drive the decision. Fixture v2 cgroup root via the
+    # MEM_PREFLIGHT_CGROUP_ROOT seam: limit 1GiB (1073741824), usage
+    # 900MiB (943718400) → remaining 130023424 bytes. The checkpoint is an
+    # HONEST ~16B stub and the PRODUCTION default slack (13GiB) is kept
+    # (MEM_PREFLIGHT_SLACK_BYTES=None → unset) — required ≈ 13GiB exceeds
+    # the CGROUP budget (124MiB) long before the host matters; the cgroup
+    # is what must refuse the run. The refusal output must expose the
+    # cgroup arithmetic: the remaining value 130023424 has to appear, and
+    # the trainer launch must not start.
+    root = _build_root()
+    try:
+        (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
+        (root / "kohya" / "pyproject.toml").write_text('[project]\nname = "sd-scripts"\n', encoding="utf-8")
+        _seed_flavored_venv(root, flavor="cu130")
+        _write_safetensors_stub(root / "runtime" / "models" / "checkpoints" / "flux1-dev-fp8.safetensors")
+        cg = _make_fixture_cgroup(root, limit_bytes=1024**3, usage_bytes=900 * 1024**2)
+        shim_dir, _log, _mode = _install_python3_venv_shim(root)
+        result = _run_script(
+            root,
+            MODEL_ID,
+            "flux",
+            STEPS=STEPS_SMOKE,
+            PATH=f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
+            MEM_PREFLIGHT_CGROUP_ROOT=str(cg),
+            MEM_PREFLIGHT_SLACK_BYTES=None,  # production default slack
+        )
+        combined = result.stdout + result.stderr
+        assert result.returncode != 0, (result.returncode, combined)
+        assert "flux_train_network.py exited with code" not in result.stderr, (
+            "the run reached the trainer launch despite a cgroup budget far "
+            f"below the requirement\nrc={result.returncode}\n{combined}"
+        )
+        assert "preflight" in combined.lower(), (
+            f"refusal must be a distinguishable preflight message; rc={result.returncode}\n{combined}"
+        )
+        assert "130023424" in combined, (
+            "the refusal must expose the cgroup budget arithmetic "
+            "(limit 1073741824 - usage 943718400 = 130023424 remaining); "
+            f"rc={result.returncode}\n{combined}"
+        )
+    finally:
+        _cleanup(root)
+
+
+def test_flux_memory_preflight_proceeds_when_cgroup_budget_sufficient():
+    # DEFECT 1 false-refusal guard: with a GENEROUS finite cgroup (limit
+    # 64GiB = 68719476736, usage 1GiB) and the harness seam slack=0 against
+    # an empty stub checkpoint, the gate must PROCEED to the trainer launch
+    # (stub exit 7). The fixture's limit value must appear in the output —
+    # proof the MEM_PREFLIGHT_CGROUP_ROOT seam was actually honored (today
+    # the script ignores it, reads the real missing /sys/fs/cgroup and logs
+    # cgroup_limit=None → the value never appears → RED), and that reading
+    # the cgroup does not turn into a false refusal when the budget fits.
+    root = _build_root()
+    try:
+        (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
+        (root / "kohya" / "pyproject.toml").write_text('[project]\nname = "sd-scripts"\n', encoding="utf-8")
+        _seed_flavored_venv(root, flavor="cu130")
+        cg = _make_fixture_cgroup(root, limit_bytes=64 * 1024**3, usage_bytes=1024**3)
+        shim_dir, _log, _mode = _install_python3_venv_shim(root)
+        result = _run_script(
+            root,
+            MODEL_ID,
+            "flux",
+            STEPS=STEPS_SMOKE,
+            PATH=f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
+            MEM_PREFLIGHT_CGROUP_ROOT=str(cg),
+            MEM_PREFLIGHT_SLACK_BYTES="0",  # explicit: threshold = measured bytes
+        )
+        combined = result.stdout + result.stderr
+        assert "68719476736" in combined, (
+            "the preflight must read the limit from MEM_PREFLIGHT_CGROUP_ROOT "
+            f"and log it (seam honored); rc={result.returncode}\n{combined}"
+        )
+        assert "preflight" in combined.lower(), combined
+        assert "flux_train_network.py exited with code 7" in result.stderr, (
+            "a sufficient cgroup budget must NOT false-refuse — the run must "
+            f"reach the trainer launch; rc={result.returncode}\n{combined}"
+        )
+        assert result.returncode == 7
+    finally:
+        _cleanup(root)
+
+
+def test_flux_memory_preflight_fails_closed_when_cgroup_usage_unreadable():
+    # Round-9 follow-up: the fail-closed branch — a FINITE cgroup limit
+    # whose usage file is unreadable must REFUSE the run, never fall
+    # through to the host-only decision (host MemAvailable says nothing
+    # about what this cgroup is actually allowed to use). Fixture v2 root
+    # via the seam: memory.max = 2GiB (finite), memory.current MISSING;
+    # production default slack (MEM_PREFLIGHT_SLACK_BYTES=None → 13GiB)
+    # and an empty stub checkpoint. Discriminators: the refusal must carry
+    # the fail-closed marker AND the fixture's limit value (a host-only
+    # fallback — the regression this guards — would abort with the generic
+    # budget message and never print 2147483648, and with a small enough
+    # slack would proceed to the launch instead).
+    root = _build_root()
+    try:
+        (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
+        (root / "kohya" / "pyproject.toml").write_text('[project]\nname = "sd-scripts"\n', encoding="utf-8")
+        _seed_flavored_venv(root, flavor="cu130")
+        # finite limit, NO memory.current → usage unreadable
+        cg = _make_fixture_cgroup(root, limit_bytes=2 * 1024**3)
+        assert not (cg / "memory.current").exists()
+        shim_dir, _log, _mode = _install_python3_venv_shim(root)
+        result = _run_script(
+            root,
+            MODEL_ID,
+            "flux",
+            STEPS=STEPS_SMOKE,
+            PATH=f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
+            MEM_PREFLIGHT_CGROUP_ROOT=str(cg),
+            MEM_PREFLIGHT_SLACK_BYTES=None,  # production default slack
+        )
+        combined = result.stdout + result.stderr
+        assert result.returncode != 0, (result.returncode, combined)
+        assert "flux_train_network.py exited with code" not in result.stderr, (
+            "the run reached the trainer launch despite a finite cgroup limit "
+            f"with unreadable usage — fail-closed violated\nrc={result.returncode}\n{combined}"
+        )
+        assert "preflight" in combined.lower(), (
+            f"refusal must be a distinguishable preflight message; rc={result.returncode}\n{combined}"
+        )
+        assert re.search(r"fail[-_ ]?clos", combined, re.I), (
+            "the refusal must be the marked fail-closed branch (finite limit + "
+            f"unreadable usage), not a host-only fallback; rc={result.returncode}\n{combined}"
+        )
+        assert "2147483648" in combined, (
+            "the refusal must expose the fixture's finite cgroup limit "
+            f"(2GiB = 2147483648) — proof the seam root was read; rc={result.returncode}\n{combined}"
+        )
+    finally:
+        _cleanup(root)
+
+
+def _run_preflight_scenario(root: Path, ckpt_header: dict | None, data_bytes: int) -> subprocess.CompletedProcess:
+    """Shared driver for the malformed-header pins: healthy venv, the DiT
+    stub written with an arbitrary header (or the honest default when
+    None), harness slack=0 — so a parser that silently UNDERCOUNTS lets the
+    gate pass and the run proceeds to the launch stub (rc 7 + marker),
+    which is exactly what these pins must catch."""
+    (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
+    (root / "kohya" / "pyproject.toml").write_text('[project]\nname = "sd-scripts"\n', encoding="utf-8")
+    _seed_flavored_venv(root, flavor="cu130")
+    dit = root / "runtime" / "models" / "checkpoints" / "flux1-dev-fp8.safetensors"
+    if ckpt_header is None:
+        _write_safetensors_stub(dit)
+    else:
+        _write_safetensors_header(dit, ckpt_header, data_bytes=data_bytes)
+    shim_dir, _log, _mode = _install_python3_venv_shim(root)
+    return _run_script(
+        root,
+        MODEL_ID,
+        "flux",
+        STEPS=STEPS_SMOKE,
+        PATH=f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
+    )
+
+
+def test_flux_preflight_refuses_entry_without_byte_description():
+    # Validator blocker (1): an entry with neither data_offsets nor nbytes
+    # ({"w": {}}) currently contributes 0 SILENTLY — the gate undercounts
+    # the checkpoint and a real multi-GB load then OOMs. Required: refuse
+    # entries lacking a supported byte description. With slack=0 the
+    # undercounted total lets today's run PROCEED to the launch stub — the
+    # rc/marker assertions carry the red. Chosen refusal marker: the word
+    # "unsupported" (or "no byte description") naming the offending entry.
+    root = _build_root()
+    try:
+        result = _run_preflight_scenario(root, {"w": {}}, data_bytes=16)
+        combined = result.stdout + result.stderr
+        assert result.returncode != 0, (result.returncode, combined)
+        assert "flux_train_network.py exited with code" not in result.stderr, (
+            "an entry with no byte description was silently undercounted and the "
+            f"run proceeded to launch; rc={result.returncode}\n{combined}"
+        )
+        assert "preflight" in combined.lower(), combined
+        assert re.search(r"unsupported|no byte description", combined, re.I), (
+            'refusal must mark the unsupported entry (e.g. "unsupported"); '
+            f"rc={result.returncode}\n{combined}"
+        )
+    finally:
+        _cleanup(root)
+
+
+def test_flux_preflight_refuses_empty_tensor_set():
+    # Validator blocker (2): a metadata-only header ({"__metadata__": ...})
+    # is an EMPTY tensor set — no weights at all; today it parses to 0 bytes
+    # and is accepted (with slack=0 the run proceeds). Required: refuse —
+    # a checkpoint with zero tensors is corrupt for training purposes, never
+    # a free pass. Chosen refusal marker: "empty" / "no tensors".
+    root = _build_root()
+    try:
+        result = _run_preflight_scenario(root, {"__metadata__": {"format": "pt"}}, data_bytes=0)
+        combined = result.stdout + result.stderr
+        assert result.returncode != 0, (result.returncode, combined)
+        assert "flux_train_network.py exited with code" not in result.stderr, (
+            f"metadata-only (empty tensor set) header was accepted; rc={result.returncode}\n{combined}"
+        )
+        assert "preflight" in combined.lower(), combined
+        assert re.search(r"empty|no tensors", combined, re.I), (
+            f"refusal must mark the empty tensor set; rc={result.returncode}\n{combined}"
+        )
+    finally:
+        _cleanup(root)
+
+
+def test_flux_preflight_refuses_offsets_beyond_data_section():
+    # Validator blocker (3): offsets are validated only for internal
+    # ordering (0 <= start <= end) — an entry claiming data_offsets
+    # [0, 100000] in a file whose data section is 16 bytes passes today
+    # (undercount-free but phantom-sized; with slack=0 the 100000 total
+    # still fits the budget and the run proceeds). Required: end must be
+    # <= file_size - 8 - header_len; refuse with "exceeds".
+    root = _build_root()
+    try:
+        result = _run_preflight_scenario(
+            root,
+            {"w": {"dtype": "F32", "shape": [25000], "data_offsets": [0, 100000]}},
+            data_bytes=16,
+        )
+        combined = result.stdout + result.stderr
+        assert result.returncode != 0, (result.returncode, combined)
+        assert "flux_train_network.py exited with code" not in result.stderr, (
+            "offsets exceeding the data section were accepted; "
+            f"rc={result.returncode}\n{combined}"
+        )
+        assert "preflight" in combined.lower(), combined
+        assert "exceeds" in combined.lower(), (
+            f"refusal must mark the offset/data-section bound violation ('exceeds'); "
+            f"rc={result.returncode}\n{combined}"
+        )
     finally:
         _cleanup(root)
 

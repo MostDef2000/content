@@ -38,6 +38,16 @@ Two test layers:
     CONSUMING mode (gated; bit-exact vs copy mode), the default modes
     keep their copy/non-consuming semantics, and the wrapper must pass
     in_place through (structural, CI-visible).
+    RAM-policy pins (train-1792249442, <~26GB usable — even the chunked
+    bf16 result does not fit): dequant takes a target parameter, the
+    DEFAULT target=None re-quantizes paired tensors back into their
+    input fp8 dtype, target=torch.bfloat16 is the explicit old contract,
+    and the wrapper must use fp8-preserve for load_flow_model vs
+    explicit bf16 for load_t5xxl. The composed/consumes/flow-wrapper
+    dtype expectations follow the preserve-fp8 default (the target
+    implementation has since landed in the working tree — these pins now
+    VERIFY it; they would have failed against the old bf16-forcing code);
+    the bit-exact pin stays target-agnostic.
 
 The sitecustomize ACTIVATION defect (reviewer F1 — import alone never
 calls install()) is pinned behaviorally on the prod path in
@@ -229,8 +239,9 @@ def test_strip_prefix_in_place_returns_and_mutates_same_dict():
     # in_place=True mutates the input and returns THE SAME dict object,
     # with the same key-set semantics as copy mode (every prefixed key
     # renamed, unprefixed keys untouched, values passed by identity).
-    # Pure dict-key logic — runs without torch, so this pin is RED in CI
-    # today (strip_comfyui_prefix has no in_place parameter → TypeError).
+    # Pure dict-key logic — runs without torch, so this pin is GREEN in CI
+    # today (the landed strip_comfyui_prefix accepts in_place; it was RED
+    # before the parameter existed → TypeError).
     assert SHIM_PATH.is_file()
     shim = _load_shim()
     marker, a, b, emb = object(), object(), object(), object()
@@ -252,6 +263,12 @@ def test_strip_prefix_in_place_returns_and_mutates_same_dict():
 
 
 def test_dequant_scalar_scale():
+    # The bf16 result is now an EXPLICIT opt-in (target=torch.bfloat16):
+    # the RAM reality (train-1792249442, <~26GB usable) moved the DEFAULT
+    # to preserving the input fp8 dtype — pinned by
+    # test_dequant_target_none_preserves_input_fp8_dtype.
+    # torch-gated: SKIPPED in this sandbox; on a torch machine this
+    # exercises the landed explicit-target opt-in.
     assert SHIM_PATH.is_file()
     _require_torch()
     import torch
@@ -259,13 +276,14 @@ def test_dequant_scalar_scale():
     shim = _load_shim()
     t = torch.tensor([1.0, -2.0, 0.5], dtype=torch.float8_e4m3fn)
     scale = torch.tensor(0.25)  # 0-dim scalar
-    out = shim.dequant_scaled_fp8_sd({"x": t, "x.scale_weight": scale})
+    out = shim.dequant_scaled_fp8_sd({"x": t, "x.scale_weight": scale}, target=torch.bfloat16)
     assert out["x"].dtype == torch.bfloat16
     expected = (t.to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16)
     assert torch.equal(out["x"], expected)
 
 
 def test_dequant_per_channel_scale():
+    # bf16 explicit opt-in at the per-channel shape (same note as above).
     assert SHIM_PATH.is_file()
     _require_torch()
     import torch
@@ -273,7 +291,7 @@ def test_dequant_per_channel_scale():
     shim = _load_shim()
     t = torch.ones(4, 3).to(torch.float8_e4m3fn)
     scale = torch.tensor([[2.0], [0.5], [1.0], [4.0]])  # (out, 1) per-row broadcast
-    out = shim.dequant_scaled_fp8_sd({"w": t, "w.scale_weight": scale})
+    out = shim.dequant_scaled_fp8_sd({"w": t, "w.scale_weight": scale}, target=torch.bfloat16)
     expected = (t.to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16)
     assert out["w"].shape == (4, 3)
     assert out["w"].dtype == torch.bfloat16
@@ -299,13 +317,17 @@ def test_dequant_drops_scale_keys_and_marker():
 
 
 def test_plain_fp8_without_scale_cast_to_bf16():
+    # With an EXPLICIT bf16 target a stray fp8 tensor (no scale) is cast
+    # through fp32; under the new default (target=None) it PRESERVES its
+    # fp8 dtype instead — pinned in test_dequant_target_none... and in the
+    # consumes-input test.
     assert SHIM_PATH.is_file()
     _require_torch()
     import torch
 
     shim = _load_shim()
     t = torch.tensor([1.0, -0.5], dtype=torch.float8_e4m3fn)
-    out = shim.dequant_scaled_fp8_sd({"z": t})
+    out = shim.dequant_scaled_fp8_sd({"z": t}, target=torch.bfloat16)
     assert out["z"].dtype == torch.bfloat16
     assert torch.equal(out["z"], t.to(torch.float32).to(torch.bfloat16))
 
@@ -325,6 +347,80 @@ def test_non_fp8_tensors_pass_through():
     assert torch.equal(out["b"], b)
 
 
+def test_dequant_target_none_preserves_input_fp8_dtype():
+    # RAM reality (train-1792249442: SIGKILL right after "Loading state
+    # dict from flux1-dev-fp8.safetensors" even with chunked+consuming
+    # dequant — the box has < ~26GB usable, a ~24GB bf16 result cannot
+    # fit): the DEFAULT target=None must keep every paired tensor in its
+    # INPUT fp8 dtype — dequant fp32 × scale, re-quantize back. End-state
+    # equivalence (corrected per review): this is what kohya's plain-fp8
+    # checkpoint flow under fp8_base consumes — a SINGLE fp32→fp8
+    # rounding. It is NOT bit-identical to the old bf16→kohya-cast-to-fp8
+    # design (that path double-rounds, fp32→bf16→fp8, and can differ by
+    # ≤1 fp8 ulp on ties; it also never completed a run — it died OOM),
+    # so no "deployed end-state" exists to match. Values/scales here are
+    # exact powers of two, so the assertions stay exact under either
+    # reading. torch-gated: SKIPPED in this sandbox; on a torch machine
+    # this verifies the landed target=None default.
+    assert SHIM_PATH.is_file()
+    _require_torch()
+    import torch
+
+    shim = _load_shim()
+    t4 = torch.ones(2).to(torch.float8_e4m3fn)
+    s4 = torch.tensor(0.5)  # scalar branch
+    t5 = torch.ones(3, 2).to(torch.float8_e5m2)
+    s5 = torch.tensor([[2.0], [0.5], [1.0]])  # per-channel (out, 1) branch
+    sd = {
+        "scaled_fp8": torch.tensor(0, dtype=torch.uint8),
+        "a": t4,
+        "a.scale_weight": s4,
+        "b": t5,
+        "b.scale_weight": s5,
+    }
+    before = set(sd)
+    out = shim.dequant_scaled_fp8_sd(sd)  # default target=None = preserve
+    assert out is not sd and set(sd) == before, "in_place=False must not consume"
+    assert out["a"].dtype == torch.float8_e4m3fn
+    assert out["b"].dtype == torch.float8_e5m2
+    exp_a = (t4.to(torch.float32) * s4.to(torch.float32)).to(torch.float8_e4m3fn)
+    exp_b = (t5.to(torch.float32) * s5.to(torch.float32)).to(torch.float8_e5m2)
+    assert torch.equal(out["a"].to(torch.float32), exp_a.to(torch.float32))
+    assert torch.equal(out["b"].to(torch.float32), exp_b.to(torch.float32))
+
+
+def test_dequant_target_bfloat16_explicit():
+    # The OLD contract as an explicit opt-in: target=torch.bfloat16 must
+    # produce bf16 for both paired tensors (this is what the wrapper will
+    # request for load_t5xxl). torch-gated: SKIPPED here; on a torch machine
+    # this verifies the landed target parameter's explicit-bf16 branch.
+    assert SHIM_PATH.is_file()
+    _require_torch()
+    import torch
+
+    shim = _load_shim()
+    t4 = torch.ones(2).to(torch.float8_e4m3fn)
+    s4 = torch.tensor(0.5)
+    t5 = torch.ones(3, 2).to(torch.float8_e5m2)
+    s5 = torch.tensor([[2.0], [0.5], [1.0]])
+    out = shim.dequant_scaled_fp8_sd(
+        {
+            "scaled_fp8": torch.tensor(0, dtype=torch.uint8),
+            "a": t4,
+            "a.scale_weight": s4,
+            "b": t5,
+            "b.scale_weight": s5,
+        },
+        target=torch.bfloat16,
+    )
+    assert out["a"].dtype == torch.bfloat16
+    assert out["b"].dtype == torch.bfloat16
+    exp_a = (t4.to(torch.float32) * s4.to(torch.float32)).to(torch.bfloat16)
+    exp_b = (t5.to(torch.float32) * s5.to(torch.float32)).to(torch.bfloat16)
+    assert torch.equal(out["a"], exp_a)
+    assert torch.equal(out["b"], exp_b)
+
+
 def test_dequant_in_place_consumes_input_dict():
     # Memory fix, core half (train-1792246674): in_place=True must POP from
     # the input as it goes so the fp8 memory is freed progressively — the
@@ -333,8 +429,9 @@ def test_dequant_in_place_consumes_input_dict():
     # traceback, rc 1). Contract: correct result AND after the call the
     # input holds NONE of the consumed keys (paired bases, their scales,
     # the marker); the orphan .scale_weight must not be returned either.
-    # torch-gated: SKIPPED in this sandbox; RED by construction on a torch
-    # machine today (dequant has no in_place parameter → TypeError).
+    # torch-gated: SKIPPED in this sandbox; on a torch machine this verifies
+    # the landed preserve-fp8 default (it would have failed against the old
+    # bf16-forcing code).
     assert SHIM_PATH.is_file()
     _require_torch()
     import torch
@@ -364,15 +461,23 @@ def test_dequant_in_place_consumes_input_dict():
         "stray": stray,
     }
     out = shim.dequant_scaled_fp8_sd(sd, in_place=True)
-    exp_a = (t1.to(torch.float32) * s1.to(torch.float32)).to(torch.bfloat16)
-    exp_b = (t2.to(torch.float32) * s2.to(torch.float32)).to(torch.bfloat16)
-    exp_c = (t3.to(torch.float32) * s3.to(torch.float32)).to(torch.bfloat16)
+    # NEW default target policy (train-1792249442 RAM pin): paired fp8
+    # tensors are re-quantized back into their INPUT dtype (all products
+    # here are exact powers of two), and a stray fp8 tensor without a
+    # scale PRESERVES its fp8 dtype (no bf16 inflation) — the landed default
+    # this pin verifies (the old code forced bf16 for both).
+    exp_a = (t1.to(torch.float32) * s1.to(torch.float32)).to(torch.float8_e4m3fn)
+    exp_b = (t2.to(torch.float32) * s2.to(torch.float32)).to(torch.float8_e4m3fn)
+    exp_c = (t3.to(torch.float32) * s3.to(torch.float32)).to(torch.float8_e4m3fn)
     assert set(out) == {"a", "b", "c", "plain", "stray"}, set(out)
-    assert torch.equal(out["a"], exp_a)
-    assert torch.equal(out["b"], exp_b)
-    assert torch.equal(out["c"], exp_c)
+    assert out["a"].dtype == torch.float8_e4m3fn
+    assert out["b"].dtype == torch.float8_e4m3fn
+    assert out["c"].dtype == torch.float8_e4m3fn
+    assert torch.equal(out["a"].to(torch.float32), exp_a.to(torch.float32))
+    assert torch.equal(out["b"].to(torch.float32), exp_b.to(torch.float32))
+    assert torch.equal(out["c"].to(torch.float32), exp_c.to(torch.float32))
     assert torch.equal(out["plain"], plain)
-    assert out["stray"].dtype == torch.bfloat16
+    assert out["stray"].dtype == torch.float8_e4m3fn
     for key in ("scaled_fp8", "a", "a.scale_weight", "b", "b.scale_weight", "c", "c.scale_weight"):
         assert key not in sd, f"in_place mode must consume {key!r} out of the input dict"
 
@@ -381,8 +486,10 @@ def test_dequant_in_place_matches_copy_mode_bit_exact():
     # Numerics guard for the chunked fp32 refactor: the SAME synthetic sd
     # run through copy mode and through in_place mode must produce
     # bit-identical tensors (chunk boundaries must not shift rounding).
-    # torch-gated: SKIPPED here, RED by construction on a torch machine
-    # today (no in_place parameter).
+    # Target-AGNOSTIC by design (compares the two modes to each other):
+    # green under the old bf16-forcing code AND the landed preserve-fp8
+    # default — it pins mode equality, never the target policy (that is
+    # tests 1-3's job). torch-gated: SKIPPED in this sandbox.
     assert SHIM_PATH.is_file()
     _require_torch()
     import torch
@@ -409,10 +516,18 @@ def test_dequant_in_place_matches_copy_mode_bit_exact():
 
     copy_out = shim.dequant_scaled_fp8_sd(synth())
     inplace_out = shim.dequant_scaled_fp8_sd(synth(), in_place=True)
+    # Mode-EQUALITY only: the two modes must agree on keys, on each
+    # tensor's dtype and on its values (fp32 view — exact for both fp8 and
+    # bf16 results). The dtype POLICY itself (preserve-fp8 default vs
+    # explicit bf16) is pinned by the target tests, NOT here — this pin
+    # stays green under whichever target the default uses, guarding only
+    # that the chunked/consuming refactor cannot shift rounding.
     assert set(copy_out) == set(inplace_out)
     for key in copy_out:
         assert copy_out[key].dtype == inplace_out[key].dtype, key
-        assert torch.equal(copy_out[key], inplace_out[key]), key
+        assert torch.equal(
+            copy_out[key].to(torch.float32), inplace_out[key].to(torch.float32)
+        ), key
 
 
 def test_dequant_default_mode_does_not_consume_input():
@@ -443,7 +558,10 @@ def test_apply_sd_fixups_composed():
     # (first in this fixture — stricter than prod's early-but-not-first),
     # prefixed tensors with per-channel .scale_weight pairs, one unprefixed
     # key and one plain fp16 tensor. The composed pipeline must land on:
-    # stripped keys, dequantized bf16 values, no markers, no scale keys.
+    # stripped keys, no markers, no scale keys — and under the NEW default
+    # target policy (train-1792249442 RAM pin) the paired fp8 tensor is
+    # re-quantized back into its INPUT fp8 dtype (products here are exact
+    # powers of two) — the landed default this pin verifies.
     assert SHIM_PATH.is_file()
     _require_torch()
     import torch
@@ -463,9 +581,11 @@ def test_apply_sd_fixups_composed():
     out = shim.apply_sd_fixups(sd)
     assert set(out) == {"blocks.0.attn.qkv.weight", "final.linear", "text_embedder.emb"}
     qkv = out["blocks.0.attn.qkv.weight"]
-    assert qkv.dtype == torch.bfloat16
-    expected = (t.to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16)
-    assert torch.equal(qkv, expected)
+    assert qkv.dtype == torch.float8_e4m3fn, (
+        "default composed policy: preserve the input fp8 dtype (target=None)"
+    )
+    expected = (t.to(torch.float32) * scale.to(torch.float32)).to(torch.float8_e4m3fn)
+    assert torch.equal(qkv.to(torch.float32), expected.to(torch.float32))
     assert torch.equal(out["final.linear"], plain)
     assert torch.equal(out["text_embedder.emb"], emb)
 
@@ -513,9 +633,12 @@ def test_patch_flux_utils_wraps_load_safetensors_and_restores():
 
     out = mod.load_flow_model("fake.safetensors")
     assert set(out) == {"a"}, out.keys()
-    assert out["a"].dtype == torch.bfloat16
-    expected = (t.to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16)
-    assert torch.equal(out["a"], expected)
+    # RAM policy (train-1792249442): the wrapper must run the DiT sd with
+    # target=None — the fp8 pair STAYS fp8 (bf16 result ~24GB does not fit
+    # the box) — the landed wrapper behavior this pin verifies.
+    assert out["a"].dtype == torch.float8_e4m3fn
+    expected = (t.to(torch.float32) * scale.to(torch.float32)).to(torch.float8_e4m3fn)
+    assert torch.equal(out["a"].to(torch.float32), expected.to(torch.float32))
     # the temporary load_safetensors patch must be restored after the call
     assert mod.load_safetensors is original_loader
 
@@ -563,8 +686,13 @@ def test_patch_flux_utils_also_fixes_load_t5xxl_path():
     shim.patch_flux_utils(mod)
     assert mod.load_t5xxl is not original_t5, "patch_flux_utils must wrap load_t5xxl too"
 
-    exp_flow = (t_flow.to(torch.float32) * s_flow.to(torch.float32)).to(torch.bfloat16)
-    exp_t5 = (t_t5.to(torch.float32) * s_t5.to(torch.float32)).to(torch.bfloat16)
+    # per-path target policy (train-1792249442): the flow path preserves
+    # the fp8 dtypes (target=None), the T5 path gets explicit bf16; the
+    # products here are exact powers of two in both dtypes.
+    exp_flow_a = (t_flow.to(torch.float32) * s_flow.to(torch.float32)).to(torch.float8_e4m3fn)
+    exp_flow_t5 = (t_t5.to(torch.float32) * s_t5.to(torch.float32)).to(torch.float8_e4m3fn)
+    exp_t5_a = (t_flow.to(torch.float32) * s_flow.to(torch.float32)).to(torch.bfloat16)
+    exp_t5_t5 = (t_t5.to(torch.float32) * s_t5.to(torch.float32)).to(torch.bfloat16)
 
     # the upstream sequence: flow first, T5 loaded AFTER it returned —
     # both paths must still hand out the FIXED sd, and the module-global
@@ -578,9 +706,74 @@ def test_patch_flux_utils_also_fixes_load_t5xxl_path():
         assert "scaled_fp8" not in out, out.keys()
         assert not any(str(k).endswith(".scale_weight") for k in out), out.keys()
         assert "model.diffusion_model.a" not in out, out.keys()
-        assert torch.equal(out["a"], exp_flow)
-        assert out["t5_block.weight"].dtype == torch.bfloat16
-        assert torch.equal(out["t5_block.weight"], exp_t5)
+
+    # flow path: fp8 preserved (the landed default; old code forced bf16)
+    assert out_flow["a"].dtype == torch.float8_e4m3fn
+    assert out_flow["t5_block.weight"].dtype == torch.float8_e4m3fn
+    assert torch.equal(out_flow["a"].to(torch.float32), exp_flow_a.to(torch.float32))
+    assert torch.equal(
+        out_flow["t5_block.weight"].to(torch.float32), exp_flow_t5.to(torch.float32)
+    )
+    # T5 path: explicit bf16 (TE-cache quality must not degrade to fp8)
+    assert out_t5["a"].dtype == torch.bfloat16
+    assert out_t5["t5_block.weight"].dtype == torch.bfloat16
+    assert torch.equal(out_t5["a"], exp_t5_a)
+    assert torch.equal(out_t5["t5_block.weight"], exp_t5_t5)
+
+
+def test_wrapper_loaders_use_distinct_targets():
+    # The wrapper's per-loader target policy (train-1792249442 design):
+    # load_flow_model runs the fixups with target=None (DiT sd stays in
+    # its ~17GB fp8 form — the only footprint the box can hold), while
+    # load_t5xxl requests an explicit bf16 target (TE-cache quality).
+    # One fake module, BOTH loaders calling the module-global
+    # load_safetensors; after patch_flux_utils the two paths must return
+    # the same pair in DIFFERENT dtypes. torch-gated: SKIPPED here; on a
+    # torch machine this verifies the landed per-loader target split (the
+    # old wrapper forced bf16 for both).
+    assert SHIM_PATH.is_file()
+    _require_torch()
+    import torch
+
+    shim = _load_shim()
+    mod = types.ModuleType("library.flux_utils")
+    exec(  # noqa: S102 - building the fake module namespace on purpose
+        "def load_safetensors(path):\n"
+        "    return dict(RAW)\n"
+        "def load_flow_model(sd_path, dtype=None, device=None):\n"
+        "    sd = load_safetensors(sd_path)\n"
+        "    return sd\n"
+        "def load_t5xxl(dtype, device=None):\n"
+        "    sd = load_safetensors(T5_PATH)\n"
+        "    return sd\n",
+        mod.__dict__,
+    )
+    t = torch.ones(2).to(torch.float8_e4m3fn)
+    scale = torch.tensor(0.5)
+    mod.RAW = {
+        "scaled_fp8": torch.tensor(0, dtype=torch.uint8),
+        "a": t,
+        "a.scale_weight": scale,
+    }
+    mod.T5_PATH = "t5xxl_fp8_e4m3fn_scaled.safetensors"
+    original_loader = mod.load_safetensors
+
+    shim.patch_flux_utils(mod)
+
+    flow_out = mod.load_flow_model("flux1-dev-fp8.safetensors")
+    assert set(flow_out) == {"a"}, flow_out.keys()
+    assert flow_out["a"].dtype == torch.float8_e4m3fn, (
+        "the flow path must PRESERVE fp8 (target=None) — the bf16 result "
+        "does not fit the box's <~26GB RAM (train-1792249442)"
+    )
+    assert mod.load_safetensors is original_loader
+
+    t5_out = mod.load_t5xxl("bf16")
+    assert set(t5_out) == {"a"}, t5_out.keys()
+    assert t5_out["a"].dtype == torch.bfloat16, (
+        "the T5 path must get the explicit bf16 target (TE-cache quality)"
+    )
+    assert mod.load_safetensors is original_loader
 
 
 def test_install_meta_path_hook_is_idempotent():

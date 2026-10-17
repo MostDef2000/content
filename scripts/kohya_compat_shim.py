@@ -16,14 +16,27 @@ The ostris scaled-fp8 T5 (t5xxl_fp8_e4m3fn_scaled.safetensors) additionally
 carries per-tensor `*.scale_weight` keys kohya ignores — raw fp8 values get
 assigned as weights (numerically wrong text-encoder outputs).
 
-Memory profile (prod OOM train-1792246674, host SIGKILL between the loader's
-"Loading state dict" line and any traceback): full-tensor fp32 intermediates
-on the ~17GB fp8 sd piled up ~90GB peak. The fixups therefore run in bounded
-chunks (fp32 transient ~16MB flat / ~256-row per-channel) and the prod path
-calls them in CONSUMING mode (`in_place=True`): tensors are popped out of
-the loader's dict as processed so fp8 memory frees progressively, and the
-steady peak is roughly the ~24GB bf16 result instead of fp32 full-tensor
-copies.
+Memory profile (two prod SIGKILLs, both silent deaths by the OOM signature):
+train-1792246674 — full-tensor fp32 intermediates on the ~17GB fp8 sd piled
+up ~90GB peak; fixed by bounded chunks (fp32 transient ~16MB flat /
+~256-row per-channel) plus CONSUMING mode (`in_place=True`: tensors are
+popped out of the loader's dict as processed, fp8 memory frees
+progressively). train-1792249442 — even the ~24GB bf16 RESULT cannot fit
+the box budget (< ~26GB): fixed by REAL re-quantization — the flow model
+dequantizes back into the checkpoint's own fp8 dtype (1:1 fp8→fp8 with
+progressive release, flow-phase peak ≈ the DiT-sd size, 1:1), while the T5 runs
+explicitly bf16 (T5-phase peak ≈ DiT-sd + ~1.7GB CLIP + ~9.4GB T5 — ~23.1GB
+for a ~12GB DiT-sd, ~28.1GB for ~17GB; estimates — the trainer's memory
+preflight measures the real checkpoint bytes and available memory). The flow end-state is the correctly-rounded SINGLE-rounding
+fp8 quantization of the true values — the same end-state as kohya's
+PLAIN-fp8 fp8_base flow for a raw fp8 checkpoint. It is NOT bit-identical
+to the old bf16-materialize + kohya-cast path (which never completed a run
+anyway): that was double rounding e4m3(bf16(x)) vs this single rounding
+e4m3(x) — the two differ by ≤1 fp8 ulp only in double-rounding ties
+(~1/32 of normal-binade elements). The kohya cast at
+flux_train_network.py:129, if it runs at all, touches only the non-fp8
+remainder (same-dtype Tensor.to() allocates nothing — worst case ≈
++~2.5GB, not a full-DiT spike).
 
 This shim is installed into the kohya venv's site-packages by the bootstrap
 in scripts/train_lora.sh; a sitecustomize.py next to it imports this module
@@ -105,25 +118,33 @@ def _fp8_dtypes(torch):
     return (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
-def _to_target(torch, tensor):
-    """fp32-roundtrip cast to the trainer dtype (fp8 -> bf16 directly can
-    round differently than through fp32; go through fp32 explicitly)."""
-    return tensor.to(torch.float32).to(getattr(torch, _TARGET_DTYPE_NAME))
+def _to_target(torch, tensor, target=None):
+    """Cast a stray fp8 tensor (no paired scale — its stored values ARE the
+    true values): with an explicit torch dtype, fp32-roundtrip into it (fp8
+    -> bf16 directly can round differently than through fp32); with
+    target=None (fp8-preserve mode) the tensor keeps its own fp8 dtype —
+    nothing to re-quantize, returned as-is."""
+    if target is None:
+        return tensor
+    return tensor.to(torch.float32).to(target)
 
 
-def _dequant_tensor(torch, tensor, scale):
-    """Dequantize ONE fp8 tensor by its scale into a preallocated bf16
+def _dequant_tensor(torch, tensor, scale, target=None):
+    """Dequantize ONE fp8 tensor by its scale into a preallocated output
     tensor of the input's shape, in bounded chunks for the scalar and
-    (out, 1) scale shapes: numerics are identical per element to the
-    full-tensor `(tensor.fp32 * scale.fp32).bf16` roundtrip (multiply and
-    cast are elementwise — chunk boundaries cannot shift rounding), but the
-    fp32 transient is ~16MB instead of a full-tensor copy
-    (train-1792246674 OOM). EXOTIC scale shapes fall through to the plain
-    full-tensor formula — explicitly NOT chunked (correctness first, they
-    do not occur in the shipped checkpoints)."""
-    target = getattr(torch, _TARGET_DTYPE_NAME)
+    (out, 1) scale shapes. target=None re-quantizes into the INPUT's own
+    dtype (flow path: each tensor keeps its own fp8 dtype — e4m3fn AND
+    e5m2 inputs alike); a torch dtype object (e.g. torch.bfloat16 for the
+    T5 path) casts the result there instead. Numerics are identical per
+    element to the full-tensor `(tensor.fp32 * scale.fp32).cast` roundtrip
+    (multiply and cast are elementwise — chunk boundaries cannot shift
+    rounding), but the fp32 transient is ~16MB instead of a full-tensor
+    copy (train-1792246674 OOM). EXOTIC scale shapes fall through to the
+    plain full-tensor formula — explicitly NOT chunked (correctness first,
+    they do not occur in the shipped checkpoints)."""
+    out_dtype = tensor.dtype if target is None else target
     scale_fp32 = scale.to(torch.float32)
-    out = torch.empty(tensor.shape, dtype=target)
+    out = torch.empty(tensor.shape, dtype=out_dtype)
     if scale_fp32.numel() == 1:
         # scalar scale (0-dim, (1,) or (1,1) — all encode one per-tensor
         # multiplier): flat chunks; reshape(()) normalizes every 1-element
@@ -134,7 +155,7 @@ def _dequant_tensor(torch, tensor, scale):
         scalar = scale_fp32.reshape(())
         for r0 in range(0, flat.numel(), _DEQUANT_CHUNK_ELEMS):
             r1 = min(r0 + _DEQUANT_CHUNK_ELEMS, flat.numel())
-            out_flat[r0:r1] = (flat[r0:r1].to(torch.float32) * scalar).to(target)
+            out_flat[r0:r1] = (flat[r0:r1].to(torch.float32) * scalar).to(out_dtype)
         return out
     if (
         tensor.dim() == 2
@@ -150,22 +171,27 @@ def _dequant_tensor(torch, tensor, scale):
             r1 = min(r0 + _DEQUANT_CHUNK_ROWS, tensor.shape[0])
             out[r0:r1] = (
                 tensor[r0:r1].to(torch.float32) * scale_fp32[r0:r1]
-            ).to(target)
+            ).to(out_dtype)
         return out
     # any other broadcast shape: keep the plain (non-chunked) formula
-    return (tensor.to(torch.float32) * scale_fp32).to(target)
+    return (tensor.to(torch.float32) * scale_fp32).to(out_dtype)
 
 
-def dequant_scaled_fp8_sd(sd, in_place=False):
+def dequant_scaled_fp8_sd(sd, in_place=False, target=None):
     """Apply the scaled-fp8 fixups to a state dict.
 
     * every `<tensor>.scale_weight` pair: dequantize
-      `(tensor.fp32 * scale.fp32).bf16` under the tensor key (scales may be
+      `(tensor.fp32 * scale.fp32).cast` under the tensor key (scales may be
       0-dim scalars or per-channel shapes like (out, 1) — broadcast
-      semantics preserved exactly; math runs in bounded fp32 chunks);
+      semantics preserved exactly; math runs in bounded fp32 chunks).
+      target=None re-quantizes into the INPUT tensor's own dtype (flow
+      path: fp8-preserve, e4m3fn and e5m2 alike); a torch dtype object
+      casts the result there (T5 path: torch.bfloat16);
     * the top-level `scaled_fp8` marker is dropped regardless of its value;
-    * a pure fp8 tensor WITHOUT a paired scale is cast to bf16 as-is
-      (ComfyUI-style checkpoints store some tensors unscaled);
+    * a pure fp8 tensor WITHOUT a paired scale follows the same target:
+      kept in its own fp8 dtype when target=None, fp32-roundtripped into
+      the target dtype otherwise (ComfyUI-style checkpoints store some
+      tensors unscaled);
     * everything else passes through unchanged.
 
     Default (copy) mode returns a NEW dict, input untouched. in_place=True
@@ -188,28 +214,32 @@ def dequant_scaled_fp8_sd(sd, in_place=False):
             continue
         scale = sd.pop(key) if in_place else sd[key]
         tensor = sd.pop(base) if in_place else sd[base]
-        out[base] = _dequant_tensor(torch, tensor, scale)
+        out[base] = _dequant_tensor(torch, tensor, scale, target)
         paired_bases.add(base)
 
-    # Pass 2: every other key — drop the marker, cast stray fp8, pass the
+    # Pass 2: every other key — drop the marker, handle stray fp8, pass the
     # rest through untouched.
     for key in list(sd):
         value = sd.pop(key) if in_place else sd[key]
         if key == _SCALED_FP8_MARKER or key.endswith(_SCALE_SUFFIX) or key in paired_bases:
             continue
         if isinstance(value, torch.Tensor) and value.dtype in _fp8_dtypes(torch):
-            out[key] = _to_target(torch, value)
+            out[key] = _to_target(torch, value, target)
         else:
             out[key] = value
     return out
 
 
-def apply_sd_fixups(sd, in_place=False):
+def apply_sd_fixups(sd, in_place=False, target=None):
     """The full sd fixup pipeline for ComfyUI-style checkpoints: prefix strip
     FIRST (tensor and its .scale_weight pair share the prefix, so they stay
     paired under the final name), then the scaled-fp8 dequant. in_place=True
-    threads the consuming mode through the chain (memory fix)."""
-    return dequant_scaled_fp8_sd(strip_comfyui_prefix(sd, in_place=in_place), in_place=in_place)
+    threads the consuming mode through the chain (memory fix); target=None
+    re-quantizes fp8 into each tensor's own dtype (flow path), a torch dtype
+    object (torch.bfloat16) casts results there (T5 path)."""
+    return dequant_scaled_fp8_sd(
+        strip_comfyui_prefix(sd, in_place=in_place), in_place=in_place, target=target
+    )
 
 
 def patch_flux_utils(mod):
@@ -222,19 +252,38 @@ def patch_flux_utils(mod):
     each call, mod.load_safetensors is replaced by a shim that runs its
     return value through apply_sd_fixups — the REAL (unmodified) kohya
     loaders receive an already-fixed state dict. The fixups run in CONSUMING
-    mode (explicit `in_place=True` keyword): the loader's raw ~17GB fp8 sd
-    is popped out of as processed, so fp8 memory frees progressively instead
-    of piling ~90GB of fp32 transients on top of a fully-referenced dict
-    (train-1792246674 OOM). The original
-    load_safetensors is restored in a finally block, win or lose; load_clip_l
-    and load_ae stay untouched (no scaled-fp8 there).
+    mode (explicit `in_place=True` keyword) with DISTINCT targets per
+    loader:
+      * load_flow_model -> target=None: REAL re-quantization into the
+        checkpoint's own fp8 dtype — the correctly-rounded SINGLE-rounding
+        quantization of the true values, i.e. the same end-state as
+        kohya's PLAIN-fp8 fp8_base flow for a raw fp8 checkpoint (NOT the
+        old bf16-materialize + kohya-cast path: that was double rounding
+        e4m3(bf16(x)) vs this single rounding e4m3(x) — ≤1 fp8 ulp apart
+        only in double-rounding ties, ~1/32 of normal-binade elements, and
+        that old path never completed a run). The kohya cast at
+        flux_train_network.py:129, if it runs at all, touches only the
+        non-fp8 remainder (same-dtype Tensor.to() allocates nothing); this
+        eliminates the ~24GB bf16 materialization — flow-phase
+        peak ≈ the DiT-sd size (1:1 fp8→fp8, progressive release;
+        train-1792249442: the box budget is < ~26GB, a 24GB bf16 result
+        cannot fit);
+      * load_t5xxl -> torch.bfloat16: the TE cache must hold bf16 caption
+        embeddings — an fp8 T5 would bake fp8 quantization noise into them
+        (T5-phase peak ≈ DiT-sd + ~1.7GB CLIP + ~9.4GB T5 — ~23.1GB for a
+        ~12GB DiT-sd, ~28.1GB for ~17GB; estimates — the trainer's memory
+        preflight measures the real checkpoint bytes and available memory).
+    The original load_safetensors is restored in a finally block, win or
+    lose; load_clip_l and load_ae stay untouched (no scaled-fp8 there).
     """
+    import torch  # lazy: torch.bfloat16 target for the T5 path
+
     original_loader = mod.load_safetensors
 
-    def _fixed_load_safetensors(*args, **kwargs):
-        return apply_sd_fixups(original_loader(*args, **kwargs), in_place=True)
+    def _make_patched(original, target):
+        def _fixed_load_safetensors(*args, **kwargs):
+            return apply_sd_fixups(original_loader(*args, **kwargs), in_place=True, target=target)
 
-    def _make_patched(original):
         def _patched(*args, **kwargs):
             mod.load_safetensors = _fixed_load_safetensors
             try:
@@ -244,8 +293,10 @@ def patch_flux_utils(mod):
 
         return _patched
 
-    mod.load_flow_model = _make_patched(mod.load_flow_model)
-    mod.load_t5xxl = _make_patched(mod.load_t5xxl)
+    # flow: fp8-preserve (re-quantize into the checkpoint's own fp8 grid);
+    # T5: explicit bf16 (TE-cache quality).
+    mod.load_flow_model = _make_patched(mod.load_flow_model, None)
+    mod.load_t5xxl = _make_patched(mod.load_t5xxl, torch.bfloat16)
     return mod
 
 

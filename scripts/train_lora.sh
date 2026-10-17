@@ -274,6 +274,190 @@ if [[ "${ARCH}" == "flux" ]]; then
     exit 0
   fi
 
+  # Memory preflight (spec 010 D-006, bounded-memory rounds): train-1792249442
+  # died to host SIGKILL because the box budget is < ~26GB — a 20-minute train
+  # that dies half-way is worse than a 1-second refusal to start. Pure stdlib
+  # (NO torch — this runs before the venv python), placed after the SKIP_TRAIN
+  # seam and before the accelerate launch: measures the DiT checkpoint size
+  # from its safetensors header (struct '<Q' + json data_offsets/nbytes, with
+  # an absolute 256MB header ceiling and strict entry validation — the
+  # trainer loads exactly this file as {{FLUX_DIT}} ->
+  # --pretrained_model_name_or_path), reads MemAvailable + SwapTotal and the
+  # cgroup state (v2 memory.max + memory.current, v1 fallback; seam root
+  # MEM_PREFLIGHT_CGROUP_ROOT, default /sys/fs/cgroup), logs every value
+  # under a PREFLIGHT marker, and aborts non-zero when the effective budget
+  # < measured_ckpt_bytes + SLACK — budget = min(MemAvailable,
+  # cgroup_limit - cgroup_usage) for a finite limit, and a finite limit with
+  # unreadable usage fails CLOSED (never silently host-only).
+  # SLACK defaults to 13GB (T5 9.4GB + CLIP 1.7GB + ~1.9GB headroom), must be
+  # a non-negative integer, and is overridable via the
+  # MEM_PREFLIGHT_SLACK_BYTES seam (tests set 0 — threshold = measured bytes
+  # only).
+  FLUX_DIT="${FLUX_DIT}" python3 - <<'PY'
+import json
+import os
+import struct
+import sys
+
+MAX_HEADER_BYTES = 256 * 1024 * 1024
+
+
+def cgroup_state():
+    """(limit, usage, source): cgroup v2 under <root>/ (memory.max +
+    memory.current), v1 fallback under <root>/memory/ (memory.limit_in_bytes
+    + memory.usage_in_bytes). "max" (v2) or >= 2^60 (v1) = unlimited; a root
+    that cannot be read at all -> (None, None, "unknown") = host-only, while
+    a FINITE limit with unreadable usage returns usage=None and fails
+    closed at the gate (never a silent host-only)."""
+    root = os.environ.get("MEM_PREFLIGHT_CGROUP_ROOT", "/sys/fs/cgroup")
+    try:
+        with open(os.path.join(root, "memory.max")) as fh:
+            raw = fh.read().strip()
+        limit = None if raw == "max" else int(raw)
+        try:
+            with open(os.path.join(root, "memory.current")) as fh:
+                usage = int(fh.read().strip())
+        except (OSError, ValueError):
+            usage = None
+        return limit, usage, "cgroup-v2"
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(os.path.join(root, "memory", "memory.limit_in_bytes")) as fh:
+            raw = int(fh.read().strip())
+        limit = None if raw >= (1 << 60) else raw
+        try:
+            with open(os.path.join(root, "memory", "memory.usage_in_bytes")) as fh:
+                usage = int(fh.read().strip())
+        except (OSError, ValueError):
+            usage = None
+        return limit, usage, "cgroup-v1"
+    except (OSError, ValueError):
+        return None, None, "unknown"
+
+
+def meminfo():
+    avail = swap = None
+    with open("/proc/meminfo") as fh:
+        for line in fh:
+            if line.startswith("MemAvailable:"):
+                avail = int(line.split()[1]) * 1024
+            elif line.startswith("SwapTotal:"):
+                swap = int(line.split()[1]) * 1024
+    if avail is None:
+        sys.exit("preflight: cannot read MemAvailable from /proc/meminfo")
+    return avail, swap
+
+
+def ckpt_tensor_bytes(path):
+    # Corrupt/truncated checkpoint → clean, marked abort (word "preflight"),
+    # never a traceback; header_len is bounded by the ABSOLUTE 256MB ceiling
+    # FIRST, then by the file size, so garbage first-8-bytes can never
+    # trigger a huge header read. Every entry must be a JSON object with
+    # data_offsets = [start, end] (0 <= start <= end) or a non-negative
+    # nbytes integer — anything malformed is a clean refusal, never a
+    # silent undercount.
+    file_size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        raw = fh.read(8)
+        if len(raw) < 8:
+            sys.exit(f"preflight: cannot parse checkpoint header for {path}: truncated (file {file_size} bytes)")
+        (header_len,) = struct.unpack("<Q", raw)
+        if header_len > MAX_HEADER_BYTES:
+            sys.exit(f"preflight: cannot parse checkpoint header for {path}: header length {header_len} exceeds the {MAX_HEADER_BYTES} byte ceiling (file {file_size} bytes)")
+        if header_len > file_size - 8:
+            sys.exit(f"preflight: cannot parse checkpoint header for {path}: header length {header_len} exceeds file size {file_size} (file {file_size} bytes)")
+        try:
+            header = json.loads(fh.read(header_len))
+            if not isinstance(header, dict):
+                raise ValueError("header is not a JSON object")
+        except (ValueError, UnicodeDecodeError) as e:
+            sys.exit(f"preflight: cannot parse checkpoint header for {path}: {e} (file {file_size} bytes)")
+    total = 0
+    # data section = bytes after the 8-byte length and the JSON header; every
+    # declared span must fit inside it (real checkpoints always do).
+    data_section = file_size - 8 - header_len
+    for key, value in header.items():
+        if key == "__metadata__":
+            continue
+        if not isinstance(value, dict):
+            sys.exit(f"preflight: cannot parse checkpoint header for {path}: entry {key!r} is not a JSON object (file {file_size} bytes)")
+        offsets = value.get("data_offsets")
+        if offsets is not None:
+            if (
+                not isinstance(offsets, (list, tuple))
+                or len(offsets) != 2
+                or not all(type(n) is int for n in offsets)
+                or not 0 <= offsets[0] <= offsets[1]
+            ):
+                sys.exit(f"preflight: cannot parse checkpoint header for {path}: malformed data_offsets for {key!r}: {offsets!r} (file {file_size} bytes)")
+            if offsets[1] > data_section:
+                sys.exit(f"preflight: data_offsets for '{key}' end {offsets[1]} exceeds the data section {data_section} (file {file_size} bytes)")
+            total += offsets[1] - offsets[0]
+        elif "nbytes" in value:
+            nbytes = value["nbytes"]
+            if type(nbytes) is not int or nbytes < 0:
+                sys.exit(f"preflight: cannot parse checkpoint header for {path}: invalid nbytes for {key!r}: {nbytes!r} (file {file_size} bytes)")
+            total += nbytes
+        else:
+            sys.exit(f"preflight: unsupported entry for '{key}': no data_offsets or nbytes (file {os.path.getsize(path)} bytes)")
+    tensors = len(header) - (1 if "__metadata__" in header else 0)
+    if tensors == 0:
+        sys.exit(f"preflight: empty checkpoint header: no tensors (file {os.path.getsize(path)} bytes)")
+    return total, header_len, tensors
+
+
+ckpt_path = os.environ["FLUX_DIT"]
+if not os.path.isfile(ckpt_path):
+    sys.exit(f"preflight: flux checkpoint not found: {ckpt_path}")
+ckpt_bytes, header_len, tensors = ckpt_tensor_bytes(ckpt_path)
+limit, usage, cgroup_src = cgroup_state()
+avail, swap = meminfo()
+raw_slack = os.environ.get("MEM_PREFLIGHT_SLACK_BYTES", 13 * 1024**3)
+try:
+    slack = int(raw_slack)
+except (TypeError, ValueError):
+    sys.exit(f"preflight: invalid slack: MEM_PREFLIGHT_SLACK_BYTES={raw_slack!r} is not an integer")
+if slack < 0:
+    sys.exit(f"preflight: invalid slack: MEM_PREFLIGHT_SLACK_BYTES={raw_slack!r} is negative")
+required = ckpt_bytes + slack
+if limit is None:
+    budget, remaining = avail, None
+else:
+    if usage is None:
+        sys.exit(f"preflight: fail closed: cgroup limit {limit} but usage unreadable (source {cgroup_src})")
+    remaining = limit - usage
+    budget = min(avail, remaining)
+print(f"PREFLIGHT ckpt={ckpt_path}")
+print(
+    f"PREFLIGHT ckpt_tensor_bytes={ckpt_bytes} "
+    f"ckpt_file_bytes={os.path.getsize(ckpt_path)} "
+    f"header_len={header_len} tensors={tensors}"
+)
+print(
+    f"PREFLIGHT mem_available={avail} swap_total={swap} "
+    f"cgroup_limit={limit} cgroup_usage={usage} cgroup_src={cgroup_src}"
+)
+print(
+    f"PREFLIGHT slack={slack} required={required} "
+    f"budget={budget} remaining={remaining}"
+)
+if budget < required:
+    if limit is None:
+        where = f"mem_available {avail}, cgroup unlimited"
+    else:
+        where = (
+            f"mem_available {avail}, cgroup limit {limit} - usage {usage} "
+            f"= remaining {remaining}"
+        )
+    sys.exit(
+        "preflight: not enough memory to start the flux trainer: required "
+        f"(checkpoint {ckpt_bytes} + slack {slack}) = {required} bytes, "
+        f"budget {budget} bytes ({where})"
+    )
+print("PREFLIGHT ok")
+PY
+
   # Venv bootstrap (first flux run, and self-heal on every broken state): the
   # host uv-venv shipped with the kohya clone does not work inside the
   # container (interpreter symlinks point at the host), so the venv is
