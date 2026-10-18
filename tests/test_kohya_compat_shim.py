@@ -78,7 +78,14 @@ flux_utils.load_t5xxl to return a STUB instead of loading from disk: real
 :157-160 reads it), eval()/to()/train() no-ops returning self (the stub
 surface the cache path touches at :144/:154/:246-247/:284-286), and any
 encode/forward call raising RuntimeError containing "text encoder cache"
-(guard against an incomplete cache / stub misuse). With the env absent or
+(guard against an incomplete cache / stub misuse). Since train-1792334532
+the stub ALSO exposes the network-creation traversal surface with EMPTY
+results — named_modules/named_parameters/named_buffers/parameters/buffers
+yield nothing, state_dict() == {}, requires_grad_ returns self — because
+networks/lora_flux.py create_modules (:819, reached from :947 "create
+LoRA for Text Encoder 1") TRAVERSES the text encoder even under
+network_train_unet_only, and yielding zero modules is exactly the
+designed skip (zero TE LoRA; pinned by P9). With the env absent or
 EMPTY the real loaders pass through untouched; the DiT path
 (load_flow_model) stays wrapped and live under the gate either way. The
 behavioral pins inject a FAKE torch module via sys.modules — the gate
@@ -1248,6 +1255,82 @@ def test_skip_te_env_wraps_clip_l_and_t5xxl_with_stubs():
             "(load_flow_model) must still load (the trainer holds DiT + ~3GB, D-007)"
         )
         assert "text_embedder.linear" in flow, flow
+
+
+def test_skip_te_stub_exposes_empty_network_traversal_surface():
+    # P9 (prod train-1792334532 — the FIRST time the trainer ever ran,
+    # because the TE cache pass finally completed rc=0 with 53/53 npz):
+    # kohya's network creation TRAVERSES the text encoder even under
+    # network_train_unet_only — networks/lora_flux.py create_modules :819
+    # runs `for name, module in root_module.named_modules():`, called
+    # from :947 ("create LoRA for Text Encoder 1") — and the D-007 stub
+    # exposed only dtype/eval/to/train/encode/forward, so the run died:
+    # AttributeError: '_SkippedTextEncoder' object has no attribute
+    # 'named_modules'. Intent: with a real nn.Module the traversal yields
+    # modules and the TE-target match list decides which get LoRA; the
+    # designed skip under network_train_unet_only means ZERO TE LoRA
+    # modules, so the stub's traversal must yield NOTHING across the
+    # whole module-traversal surface (named_modules/named_parameters/
+    # named_buffers/parameters/buffers return EMPTY iterables,
+    # state_dict() == {}, requires_grad_(...) returns self) — on BOTH
+    # stubs (clip_l and t5xxl are traversed the same way). The
+    # encode/forward tripwires stay exactly as pinned by
+    # test_skip_te_env_wraps_clip_l_and_t5xxl_with_stubs — this pin ADDS
+    # traversal surface, and re-checks one tripwire to prove the addition
+    # did not swallow it. Landed RED-first against the pre-traversal
+    # stub; PERMANENT guard — its red signature if the surface is ever
+    # removed: AttributeError on named_modules, the exact prod frame.
+    assert SHIM_PATH.is_file()
+    with _env(KOHYA_SKIP_TEXT_ENCODERS="1"), _fake_torch_installed() as fake_torch:
+        shim = _load_shim()
+        mod = _fake_flux_utils_with_counters()
+        shim.patch_flux_utils(mod)
+
+        clip = mod.load_clip_l("clip_l.safetensors", fake_torch.bfloat16, "cpu")
+        t5 = mod.load_t5xxl(
+            "t5xxl_fp8_e4m3fn_scaled.safetensors", None, "cpu", disable_mmap=False
+        )
+
+        for label, stub in (("clip_l", clip), ("t5xxl", t5)):
+            # the exact crashing frame (lora_flux.py:819): named_modules()
+            # must be iterable AND yield nothing
+            named_modules = stub.named_modules()
+            assert iter(named_modules) is not None, (
+                f"{label}: named_modules() must return an iterable "
+                "(lora_flux.py:819 iterates it directly)"
+            )
+            assert list(named_modules) == [], (
+                f"{label}: the traversal must yield NOTHING — under "
+                "network_train_unet_only the designed skip means zero TE "
+                f"LoRA modules; got: {list(stub.named_modules())}"
+            )
+            assert list(stub.named_parameters()) == [], label
+            assert list(stub.named_buffers()) == [], label
+            assert list(stub.parameters()) == [], label
+            assert list(stub.buffers()) == [], label
+            assert stub.state_dict() == {}, label
+            assert stub.requires_grad_(False) is stub, (
+                f"{label}: requires_grad_ must be a self-returning no-op "
+                "(network creation freezes/presets grads across traversed modules)"
+            )
+
+        # tripwires UNCHANGED by the surface addition (one re-check per
+        # method family; full tripwire contract stays pinned by the
+        # stub-behavior test above):
+        for label, stub in (("clip_l", clip), ("t5xxl", t5)):
+            for method in ("encode", "forward"):
+                try:
+                    getattr(stub, method)("some text")
+                except RuntimeError as exc:
+                    assert "text encoder cache" in str(exc), (
+                        f"{label}.{method}() tripwire must survive the "
+                        f"traversal-surface addition; got: {exc!r}"
+                    )
+                else:
+                    raise AssertionError(
+                        f"{label}.{method}() must still raise RuntimeError "
+                        "after the traversal surface was added"
+                    )
 
 
 def test_skip_te_env_absent_or_empty_uses_real_loaders():

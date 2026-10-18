@@ -126,15 +126,26 @@ class _SkippedTextEncoder:
     run never loads. Upstream flux_train_network.py still LOADS both TEs
     unconditionally (:141 CLIP-L, :153 T5XXL) even with a complete on-disk
     cache; with network_train_unet_only LoRA they are never encoded through
-    (get_models_for_text_encoding :206-213 returns None), so the stub exposes
-    exactly the surface the cache path touches:
+    (get_models_for_text_encoding :206-213 returns None). The stub exposes
+    the cache-path surface below PLUS the network-creation traversal
+    surface — kohya TRAVERSES the text encoder even under
+    network_train_unet_only (networks/lora_flux.py create_modules :819
+    iterates root_module.named_modules(), called from :947 "create LoRA
+    for Text Encoder 1"; prod train-1792334532 died AttributeError there
+    before this surface existed):
       * .dtype — a REAL torch dtype (bfloat16): the fp8 dtype check at
         flux_train_network.py:157-160 reads it;
       * eval()/to()/train() — no-ops returning self (:144/:154 and
         :246-247/:284-286);
-      * encode()/forward() — LOUD tripwire: RuntimeError mentioning the
-        text encoder cache, so an incomplete cache or stub misuse fails the
-        run instead of silently training on garbage.
+      * named_modules()/named_parameters()/named_buffers()/parameters()/
+        buffers() — EMPTY iterables; state_dict() — a FRESH empty dict;
+        requires_grad_() — a self-returning no-op: the traversal yields
+        NOTHING, i.e. ZERO TE LoRA modules — the designed skip under
+        network_train_unet_only (the intended empty TE-LoRA set);
+      * encode()/forward() — LOUD tripwire, UNCHANGED by the traversal
+        surface: RuntimeError mentioning the text encoder cache, so an
+        incomplete cache or stub misuse fails the run instead of silently
+        training on garbage.
     torch is imported lazily (this module must stay importable without it)."""
 
     def __init__(self, name):
@@ -150,6 +161,34 @@ class _SkippedTextEncoder:
         return self
 
     def train(self, mode=True):
+        return self
+
+    # --- network-creation traversal surface (defect #5, train-1792334532):
+    # networks/lora_flux.py create_modules :819 iterates
+    # root_module.named_modules() (called from :947) even under
+    # network_train_unet_only. The traversal must yield NOTHING -> zero TE
+    # LoRA modules = the designed skip. All iterators are FRESH per call;
+    # state_dict hands out a fresh dict (never a shared one).
+
+    def named_modules(self, *args, **kwargs):
+        return iter(())
+
+    def named_parameters(self, *args, **kwargs):
+        return iter(())
+
+    def named_buffers(self, *args, **kwargs):
+        return iter(())
+
+    def parameters(self, *args, **kwargs):
+        return iter(())
+
+    def buffers(self, *args, **kwargs):
+        return iter(())
+
+    def state_dict(self, *args, **kwargs):
+        return {}
+
+    def requires_grad_(self, *args, **kwargs):
         return self
 
     def encode(self, *args, **kwargs):
