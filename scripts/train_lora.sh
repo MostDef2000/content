@@ -557,13 +557,21 @@ PY
   # itself; the flag is spelled out for explicitness. --config_file is NOT
   # used for this pass: the rendered TOML carries training-only keys
   # (network_module, optimizer_type, ...) outside the cache writer's parser.
-  # FAIL-FAST: a non-zero cache pass aborts the run — the trainer must never
-  # launch on an incomplete cache (the shim's stub tripwire is the in-depth
-  # guard; this is the script-level one). Runs WITHOUT the D-007 env gate:
-  # the cache pass needs the REAL text-encoder loaders.
+  # The tool is invoked THROUGH scripts/cache_pass_wrapper.py (this repo's
+  # fix for prod train-1792313236: upstream @690ea7f9 asserts
+  # `is_sdxl or args.weighted_captions is None` at :62 while its parser
+  # spells --weighted_captions store_true/default=False — the FLUX branch
+  # is unreachable from CLI/TOML; the wrapper loads the tool as a module,
+  # forces args.weighted_captions = None and calls cache_to_disk; the tool
+  # path is the wrapper's FIRST argument). FAIL-FAST: a non-zero cache pass
+  # aborts the run — the trainer must never launch on an incomplete cache
+  # (the shim's stub tripwire is the in-depth guard; this is the
+  # script-level one). Runs WITHOUT the D-007 env gate: the cache pass
+  # needs the REAL text-encoder loaders.
   echo "TE-CACHE-PASS start: ${KOHYA}/tools/cache_text_encoder_outputs.py (loads CLIP-L + T5-XXL only)" >&2
   te_cache_rc=0
-  "${KOHYA_VENV}/bin/python" "${KOHYA}/tools/cache_text_encoder_outputs.py" \
+  "${KOHYA_VENV}/bin/python" "${ROOT}/scripts/cache_pass_wrapper.py" \
+    "${KOHYA}/tools/cache_text_encoder_outputs.py" \
     --flux \
     --pretrained_model_name_or_path "${FLUX_DIT}" \
     --clip_l "${FLUX_CLIP_L}" \

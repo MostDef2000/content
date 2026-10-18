@@ -81,12 +81,26 @@
       префлайта без изменений). DoD: `bash -n`;
       `pytest tests/test_kohya_compat_shim.py tests/test_train_lora_flux.py`
       — все 7 D-007 пинов зелёные; полный прогон после раунда:
-      188 passed, 15 skipped (torch-gated пины — в CI; фактический счётчик
-      DoD, синхронизирован с этим прогоном). Сверка счётчика: база 181 —
-      наблюдённый прогон до D-007 (оркестратор, 2026-10-18) + 7 новых
-      D-007 пинов = 188; JOURNAL 2026-10-17 подтверждает только
-      устаревание числа 178 в старом tasks.md (считать DoD-число после
-      последнего пина).
+      192 passed, 15 skipped (torch-gated пины — в CI; фактический счётчик
+      DoD, синхронизирован с этим прогоном). Сверка счётчика: база 188 —
+      DoD-прогон D-007 (коммит 6e58231) + 4 новых пина wrapper-фикса
+      (3 в tests/test_cache_pass_wrapper.py + 1 инвокация в
+      tests/test_train_lora_flux.py, T009) = 192; прежний урок в силе:
+      считать DoD-число после последнего пина.
+- [x] T009 (D-007 follow-up; фикс прод-инцидента train-1792313236,
+      коммит pending): апстрим-дефект tools/cache_text_encoder_outputs.py
+      @690ea7f9 — assert `is_sdxl or args.weighted_captions is None`
+      (:62) при `--weighted_captions` store_true/default=False (~:217) →
+      flux-ветка недостижима из CLI/TOML; прод: PREFLIGHT ok →
+      TE-CACHE-PASS rc=1. Решение: `scripts/cache_pass_wrapper.py` — тул
+      грузится модулем, __main__-флоу повторён дословно,
+      args.weighted_captions форсируется в None (downstream is_weighted
+      — truthiness-only), cache_to_disk без перехвата — fail-fast
+      прежний; `train_lora.sh` инвоцирует wrapper (путь тула — первый
+      аргумент); апстрим-файлы не модифицируются. Спека: D-007 addendum
+      в spec.md. DoD: pytest tests/test_cache_pass_wrapper.py
+      tests/test_train_lora_flux.py — 4 новых пина зелёные; полный
+      прогон: 192 passed, 15 skipped (сверка счётчика — в T008).
 - [ ] T006 Дымовой прогон 20 шагов на проде (старт — владелец; см. spec DoD).
 
 ## Acceptance criteria

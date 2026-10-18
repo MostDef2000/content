@@ -443,21 +443,37 @@ def test_flux_script_emits_te_cache_pass_before_accelerate_launch():
     # Ordering is pinned against the REAL invocation, never a mention: the
     # memory-preflight slack comment also names the tool and was the first
     # text.index hit, so a plain index comparison could be satisfied by a
-    # comment alone. Discriminator: the venv-python call line
-    # (${VAR}/bin/python" "${VAR}/tools/cache_text_encoder_outputs.py —
-    # quote-anchored) searched in comment-stripped code, so no comment edit
-    # can satisfy it and deleting the invocation fails here. The real
-    # run-log ordering stays covered by test_flux_cache_pass_runs_before_trainer_launch.
+    # comment alone. Discriminator (train-1792313236 crossing update): the
+    # cache pass now runs THROUGH scripts/cache_pass_wrapper.py, so the
+    # quote-anchored triple
+    #   ${VAR}/bin/python" ${VAR}/scripts/cache_pass_wrapper.py"
+    #   ${VAR}/tools/cache_text_encoder_outputs.py"
+    # is required, with ONLY whitespace/line-continuation backslashes
+    # between the quoted segments (no arbitrary text, no .* across
+    # statements), searched in comment-stripped code. The tool path stays
+    # anchored as the wrapper's FIRST argument (closing quote included — a
+    # longer path like ....py.bak cannot match). The OLD direct form (tool
+    # path straight after bin/python") no longer satisfies this pin:
+    # reverting to it is the prod bug (upstream :62 weighted_captions
+    # assert) and it also fails the behavioral
+    # test_flux_cache_pass_invokes_tool_through_wrapper; deleting or
+    # commenting out the invocation fails here too. The real run-log
+    # ordering stays covered by test_flux_cache_pass_runs_before_trainer_launch.
     code = "\n".join(
         ln for ln in text.splitlines() if not ln.lstrip().startswith("#")
     )
     invocation = re.search(
-        r'\$\{[A-Za-z_]+\}/bin/python"\s+"\$\{[A-Za-z_]+\}/tools/cache_text_encoder_outputs\.py',
+        r'\$\{[A-Za-z_]+\}/bin/python"[\s\\]+"\$\{[A-Za-z_]+\}/scripts/'
+        r'cache_pass_wrapper\.py"[\s\\]+"\$\{[A-Za-z_]+\}/tools/'
+        r'cache_text_encoder_outputs\.py"',
         code,
     )
     assert invocation is not None, (
         "the cache pass must be a real ${VENV}/bin/python invocation of "
-        "tools/cache_text_encoder_outputs.py, not just a comment mention"
+        "scripts/cache_pass_wrapper.py carrying tools/"
+        "cache_text_encoder_outputs.py as its first argument — not a comment "
+        "mention, not the direct-tool form that dies at the upstream :62 "
+        "weighted_captions assert"
     )
     assert invocation.start() < code.index('bin/accelerate" launch'), (
         "the cache pass must be emitted BEFORE the accelerate flux_train_network.py launch"
@@ -1733,6 +1749,79 @@ def test_flux_cache_pass_runs_without_skip_text_encoders_env():
             f"gate is trainer-scoped); saw: {venv_env_lines}\n"
             f"rc={result.returncode}\nstderr:\n{result.stderr}"
         )
+    finally:
+        _cleanup(root)
+
+
+def test_flux_cache_pass_invokes_tool_through_wrapper():
+    # train-1792313236 (W3 round-11, contract pin for the wrapper fix): the
+    # DIRECT cache-pass invocation dies upstream at
+    # tools/cache_text_encoder_outputs.py:62 — `assert is_sdxl or
+    # args.weighted_captions is None` can NEVER pass for FLUX from CLI/TOML
+    # (the parser spells --weighted_captions store_true/default=False, so
+    # parse_args yields False, never None). The fix routes the
+    # cache pass through scripts/cache_pass_wrapper.py (loads the tool as a
+    # module, forces args.weighted_captions = None, calls cache_to_disk),
+    # invoked as venv python <wrapper> <tool path> <flags>. Pin at the
+    # venv-python boundary (the existing stub logs every invocation's
+    # argv): (1) the cache pass runs THROUGH the wrapper — argv[0] basename
+    # cache_pass_wrapper.py with the tool path (tools/
+    # cache_text_encoder_outputs.py) as the FOLLOWING argument; (2) NO
+    # logged venv-python invocation may carry the tool path itself as
+    # argv[0] (the direct form is the bug). The wrapper fix has landed:
+    # this pin is the PERMANENT regression guard — it forbids the
+    # direct-tool form (prod bug train-1792313236, upstream :62
+    # weighted_captions assert) and requires the wrapper form.
+    # Deliberately argv-shape-agnostic siblings:
+    # the existing ordering, both-boundary env-polarity and slack pins
+    # filter by substring and stayed green across the fix.
+    root = _build_root()
+    try:
+        result, lines = _run_flux_launch_plan(root)
+        argvs = []
+        for ln in lines:
+            if not ln.startswith("venv-python "):
+                continue
+            # log format: 'venv-python cwd=$PWD $*' — fixture paths are
+            # space-free (mkdtemp), so a plain split recovers the argv.
+            _cwd, _sep, rest = ln[len("venv-python ") :].partition(" ")
+            argvs.append(rest.split())
+        direct = [
+            a for a in argvs
+            if a and os.path.basename(a[0]) == "cache_text_encoder_outputs.py"
+        ]
+        assert not direct, (
+            "the TE cache pass must NOT invoke tools/cache_text_encoder_outputs.py "
+            "directly (argv[0] = the tool path — the train-1792313236 design "
+            f"that dies at the :62 weighted_captions assert); observed: {direct}\n"
+            f"rc={result.returncode}"
+        )
+        wrapper_calls = [
+            a for a in argvs if a and os.path.basename(a[0]) == "cache_pass_wrapper.py"
+        ]
+        assert wrapper_calls, (
+            "no cache_pass_wrapper.py invocation in the flux run plan — the "
+            "TE cache pass must run through the wrapper (fix for "
+            f"train-1792313236); log argvs: {argvs}\nrc={result.returncode}"
+        )
+        # every invocation naming the tool must be a wrapper call with the
+        # tool path as its FIRST argument (argv[1] of the python process).
+        tool_calls = [
+            a for a in argvs if any(x.endswith("cache_text_encoder_outputs.py") for x in a)
+        ]
+        assert tool_calls, (
+            f"no cache-pass invocation at all in the run plan; log argvs: {argvs}\n"
+            f"rc={result.returncode}\nstderr:\n{result.stderr}"
+        )
+        for a in tool_calls:
+            assert os.path.basename(a[0]) == "cache_pass_wrapper.py", (
+                "the tool path may only appear as an ARGUMENT of the wrapper, "
+                f"never as a directly invoked script; got argv: {a}"
+            )
+            assert len(a) > 1 and a[1].endswith("tools/cache_text_encoder_outputs.py"), (
+                "the wrapper must receive the tool path as its first argument "
+                f"(argv[1] of the python invocation); got argv: {a}"
+            )
     finally:
         _cleanup(root)
 

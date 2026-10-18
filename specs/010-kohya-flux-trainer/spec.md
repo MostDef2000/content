@@ -208,6 +208,22 @@ FLUX-LoRA-тренинг (`train_lora.sh <id> flux`) реально работа
   чистым rc cache-pass, а не SIGKILL; т.е. один гейт покрывает оба прохода.
   Пиковые цифры — оценки из анализа (Box: 23.37 ГБ avail; DiT 17.05 ГБ;
   тренер без TE ~19.4 ГБ CPU), приёмка — по T006.
+- (D-007, addendum) Фикс доступности flux-ветки cache-pass (прод-прогон
+  train-1792313236): апстрим-дефект `tools/cache_text_encoder_outputs.py`
+  @690ea7f9 — assert `is_sdxl or args.weighted_captions is None` (:62)
+  открывает `cache_to_disk`, тогда как парсер тула объявляет
+  `--weighted_captions` store_true/default=False (~:217) → flux-ветка
+  недостижима из CLI/TOML (TOML без null). Прод train-1792313236:
+  PREFLIGHT ok (required=20467523796 < budget=25570648064) →
+  TE-CACHE-PASS rc=1 на :62. Репо-фикс — `scripts/cache_pass_wrapper.py`,
+  апстрим-файлы НЕ модифицируются: тул грузится как модуль
+  (spec_from_file_location), его `__main__`-флоу повторён дословно
+  (`setup_parser` → `parse_args` → `args_util.read_config_from_file`),
+  `args.weighted_captions = None` — единственное проходное для :62
+  значение (downstream is_weighted — truthiness-only), `cache_to_disk`
+  зовётся без перехвата — fail-fast прежний (rc≠0 обрывает запуск,
+  см. D-007); `train_lora.sh` инвоцирует wrapper, путь тула — первый
+  аргумент.
 - `blocks_to_swap=20` замедляет шаги (своп блоков GPU↔CPU) — фоновая джоба.
 - Полный трейн стартует владелец из UI; на время трейна ComfyUI останавливать
   (12 ГБ общие, hard rule 3 — busy-лок менеджера).
