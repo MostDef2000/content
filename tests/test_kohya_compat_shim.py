@@ -53,6 +53,24 @@ The sitecustomize ACTIVATION defect (reviewer F1 — import alone never
 calls install()) is pinned behaviorally on the prod path in
 tests/test_train_lora_flux.py::test_flux_bootstrap_installs_compat_shim_into_site_packages.
 
+D-007 TE-SKIP pins (two-pass memory design, Valery W3): upstream
+flux_train_network.py load_target_model loads CLIP-L (:141), T5XXL (:153)
+and AE (:162) UNCONDITIONALLY — no cache-existence skip — so with a
+complete on-disk text-encoder cache the trainer must NOT pay for the TEs
+at all. With env KOHYA_SKIP_TEXT_ENCODERS present and NON-EMPTY,
+patch_flux_utils must additionally wrap flux_utils.load_clip_l and
+flux_utils.load_t5xxl to return a STUB instead of loading from disk: real
+.dtype (torch.bfloat16 — the fp8 dtype check at flux_train_network.py
+:157-160 reads it), eval()/to()/train() no-ops returning self (the stub
+surface the cache path touches at :144/:154/:246-247/:284-286), and any
+encode/forward call raising RuntimeError containing "text encoder cache"
+(guard against an incomplete cache / stub misuse). With the env absent or
+EMPTY the real loaders pass through untouched; the DiT path
+(load_flow_model) stays wrapped and live under the gate either way. The
+behavioral pins inject a FAKE torch module via sys.modules — the gate
+path needs no real tensor math — so they are RED/GREEN in torch-less CI
+instead of skipping (same lazy-import seam the strip tests rely on).
+
 pytest-compatible; pytest is not required.
 
 Run either way:
@@ -63,7 +81,9 @@ Run either way:
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -110,6 +130,103 @@ def _top_level_func(tree: ast.Module, name: str) -> ast.FunctionDef | None:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return node
     return None
+
+
+# ---------------------------------------------------------------------------
+# D-007 harness: env mechanism + fake-torch injection for the TE-skip gate
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _env(**assignments: str | None):
+    """Harness env mechanism: set each NAME to its value (None pops the key),
+    restore the previous state in finally. Lets the TE-skip pins flip
+    KOHYA_SKIP_TEXT_ENCODERS deterministically inside the test process."""
+    saved = {}
+    for key, value in assignments.items():
+        saved[key] = os.environ.get(key)
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@contextlib.contextmanager
+def _fake_torch_installed():
+    """Inject a minimal fake `torch` into sys.modules for the duration of the
+    block (restored in finally, real torch untouched when installed). The
+    TE-skip gate path performs NO real tensor math — the stub carries the
+    dtype sentinel by reference and the sd-fixup passthrough only does
+    dict-key work on non-tensor values — so these pins run (and can be RED)
+    in torch-less CI instead of skipping, exactly like the strip tests rely
+    on the shim's lazy torch import."""
+    fake = types.ModuleType("torch")
+
+    class _FakeDtype:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __repr__(self) -> str:
+            return f"torch.{self.name}"
+
+    class _FakeTensor:  # isinstance target only — never constructed here
+        pass
+
+    fake.bfloat16 = _FakeDtype("bfloat16")
+    fake.float32 = _FakeDtype("float32")
+    fake.float8_e4m3fn = _FakeDtype("float8_e4m3fn")
+    fake.float8_e5m2 = _FakeDtype("float8_e5m2")
+    fake.Tensor = _FakeTensor
+    saved = sys.modules.get("torch")
+    sys.modules["torch"] = fake
+    try:
+        yield fake
+    finally:
+        if saved is None:
+            sys.modules.pop("torch", None)
+        else:
+            sys.modules["torch"] = saved
+
+
+# Upstream signatures (library/flux_utils.py @690ea7f9): load_clip_l(ckpt_path,
+# dtype, device, disable_mmap=False, state_dict=None) at :248 and
+# load_t5xxl(ckpt_path, dtype, device, disable_mmap=False, state_dict=None) at
+# :358 — the fakes mirror them and count invocations per loader, so "the
+# original loader was NOT invoked" is observable rather than assumed.
+_FAKE_FLUX_UTILS_SRC = (
+    "def load_safetensors(path):\n"
+    "    CALLS['safetensors'] += 1\n"
+    "    return dict(RAW)\n"
+    "def load_flow_model(ckpt_path, dtype=None, device=None, disable_mmap=False, state_dict=None):\n"
+    "    CALLS['flow'] += 1\n"
+    "    return load_safetensors(ckpt_path)\n"
+    "def load_clip_l(ckpt_path, dtype, device, disable_mmap=False, state_dict=None):\n"
+    "    CALLS['clip_l'] += 1\n"
+    "    return {'clip_l_original': ckpt_path}\n"
+    "def load_t5xxl(ckpt_path, dtype, device, disable_mmap=False, state_dict=None):\n"
+    "    CALLS['t5xxl'] += 1\n"
+    "    return {'t5xxl_original': ckpt_path}\n"
+)
+
+
+def _fake_flux_utils_with_counters():
+    """library.flux_utils fake whose loaders increment per-loader counters
+    (harness stub counters for the TE-skip gate pins). RAW carries no
+    scaled-fp8 marker, no scale pairs and no tensors, so the DiT fixup
+    wrapper passes it through with pure dict-key logic under the fake torch."""
+    mod = types.ModuleType("library.flux_utils")
+    exec(_FAKE_FLUX_UTILS_SRC, mod.__dict__)  # noqa: S102 - fake module namespace
+    mod.CALLS = {"safetensors": 0, "flow": 0, "clip_l": 0, "t5xxl": 0}
+    mod.RAW = {"text_embedder.linear": object()}
+    return mod
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +311,72 @@ def test_patch_flux_utils_shape_wrap_load_safetensors_restore_in_finally():
     assert "in_place" in call_kw | names, (
         "patch_flux_utils must pass in_place through to apply_sd_fixups — "
         "consuming mode is the OOM fix"
+    )
+
+
+def test_shim_source_has_skip_te_gate_and_stub_surface():
+    # D-007 two-pass memory design, STRUCTURAL half (CI-visible, unconditional):
+    # the shim must gate on KOHYA_SKIP_TEXT_ENCODERS (read from the
+    # environment), define a TE stub class exposing the surface upstream
+    # touches on the skipped TEs — .dtype (flux_train_network.py:157-160 fp8
+    # dtype check), .eval() (:144/:154), .to() (:246-247/:284-286), .train()
+    # — plus an encode/forward guard raising RuntimeError with the literal
+    # "text encoder cache", and reference load_clip_l (the second TE loader
+    # that must be stubbed alongside load_t5xxl). The gate has landed: this
+    # pin is the STRUCTURAL REGRESSION GUARD for the D-007 gate — CI-visible
+    # without torch, it fails if the env gate, the stub surface, or the
+    # tripwire message is ever removed or renamed in the shim source (the
+    # behavioral half below is torch-gated, so this is the only
+    # unconditional protection of the design).
+    src = _read_shim_source()
+    assert "KOHYA_SKIP_TEXT_ENCODERS" in src, (
+        "shim must gate the TE stubbing on the KOHYA_SKIP_TEXT_ENCODERS env var"
+    )
+    assert "text encoder cache" in src, (
+        'the stub guard message must contain the literal "text encoder cache"'
+    )
+    tree = ast.parse(src)
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    literals = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    assert "environ" in attrs or "getenv" in attrs, (
+        "the gate must read the environment (os.environ / os.getenv)"
+    )
+    assert "load_clip_l" in names | attrs | literals, (
+        "the shim must wrap flux_utils.load_clip_l under the gate (both TEs: "
+        "clip_l AND t5xxl — upstream loads them unconditionally at :141/:153)"
+    )
+    # TE stub surface: a class with eval/to/train no-ops and an encode/
+    # forward (or __getattr__) guard.
+    stub_cls = None
+    for cls in (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)):
+        methods = {m.name for m in cls.body if isinstance(m, ast.FunctionDef)}
+        if {"eval", "to", "train"} <= methods and ({"encode", "forward", "__getattr__"} & methods):
+            stub_cls = cls
+            break
+    assert stub_cls is not None, (
+        "shim must define a TE stub class exposing eval/to/train and an "
+        "encode/forward (or __getattr__) guard"
+    )
+    members = {m.name for m in stub_cls.body if isinstance(m, ast.FunctionDef)}
+    dtype_ok = "dtype" in members or any(
+        isinstance(n, ast.Attribute) and n.attr == "dtype" for n in ast.walk(stub_cls)
+    )
+    assert dtype_ok, "the TE stub must expose .dtype (a real torch dtype — bf16)"
+    guard_fns = [
+        m for m in stub_cls.body
+        if isinstance(m, ast.FunctionDef) and m.name in {"encode", "forward", "__getattr__", "__call__"}
+    ]
+    raises_runtime_error = any(
+        isinstance(node, ast.Raise)
+        and isinstance(node.exc, ast.Call)
+        and isinstance(node.exc.func, ast.Name)
+        and node.exc.func.id == "RuntimeError"
+        for m in guard_fns
+        for node in ast.walk(m)
+    )
+    assert raises_runtime_error, (
+        "the TE stub encode/forward guard must raise RuntimeError (cache-incomplete tripwire)"
     )
 
 
@@ -774,6 +957,115 @@ def test_wrapper_loaders_use_distinct_targets():
         "the T5 path must get the explicit bf16 target (TE-cache quality)"
     )
     assert mod.load_safetensors is original_loader
+
+
+def test_skip_te_env_wraps_clip_l_and_t5xxl_with_stubs():
+    # D-007 two-pass memory design, BEHAVIORAL half (fake torch — runs and
+    # is RED in torch-less CI). With KOHYA_SKIP_TEXT_ENCODERS=1 the wrapped
+    # load_clip_l / load_t5xxl must return STUB objects WITHOUT invoking the
+    # original loaders at all (harness stub counters: the loaders and the
+    # module-global load_safetensors stay untouched — that is the whole
+    # memory point: upstream flux_train_network.py loads both TEs
+    # unconditionally at :141/:153, and with a complete cache +
+    # network_train_unet_only LoRA get_models_for_text_encoding (:206-213)
+    # returns None, so the TEs are never encoded through in the training
+    # loop). Stub contract: real .dtype = torch.bfloat16 (the fp8 dtype
+    # check at :157-160 reads it), eval()/to()/train() no-ops returning
+    # self (the surface touched at :144/:154 and :246-247/:284-286), and
+    # encode/forward raising RuntimeError containing "text encoder cache"
+    # (clear guard if the cache is incomplete or the stub is misused). The
+    # DiT path stays live: load_flow_model must still run the original
+    # loader through the sd-fixup wrapper.
+    assert SHIM_PATH.is_file()
+    with _env(KOHYA_SKIP_TEXT_ENCODERS="1"), _fake_torch_installed() as fake_torch:
+        shim = _load_shim()
+        mod = _fake_flux_utils_with_counters()
+        shim.patch_flux_utils(mod)
+
+        clip = mod.load_clip_l("clip_l.safetensors", fake_torch.bfloat16, "cpu")
+        assert mod.CALLS["clip_l"] == 0, (
+            "KOHYA_SKIP_TEXT_ENCODERS=1: load_clip_l must return a stub "
+            "WITHOUT invoking the original loader"
+        )
+        t5 = mod.load_t5xxl(
+            "t5xxl_fp8_e4m3fn_scaled.safetensors", None, "cpu", disable_mmap=False
+        )
+        assert mod.CALLS["t5xxl"] == 0, (
+            "KOHYA_SKIP_TEXT_ENCODERS=1: load_t5xxl must return a stub "
+            "WITHOUT invoking the original loader"
+        )
+        assert mod.CALLS["safetensors"] == 0, (
+            "stubbed TE loaders must not read anything from disk"
+        )
+
+        for label, stub in (("clip_l", clip), ("t5xxl", t5)):
+            assert stub is not None, f"{label}: stub must be returned"
+            assert stub.dtype is fake_torch.bfloat16, (
+                f"{label}: stub .dtype must be the real bf16 dtype "
+                "(flux_train_network.py:157-160 dtype check)"
+            )
+            assert stub.eval() is stub, f"{label}: eval() must be a self-returning no-op (:144/:154)"
+            assert stub.to("cpu") is stub, f"{label}: to() must be a self-returning no-op (:246-247)"
+            assert stub.train() is stub, f"{label}: train() must be a self-returning no-op"
+
+        for label, stub in (("clip_l", clip), ("t5xxl", t5)):
+            for method in ("encode", "forward"):
+                try:
+                    getattr(stub, method)("some text")
+                except RuntimeError as exc:
+                    assert "text encoder cache" in str(exc), (
+                        f"{label}.{method}() must raise RuntimeError mentioning "
+                        f"'text encoder cache'; got: {exc!r}"
+                    )
+                else:
+                    raise AssertionError(
+                        f"{label}.{method}() must raise RuntimeError — a stub that "
+                        "silently 'encodes' would train on garbage instead of tripping "
+                        "on an incomplete cache"
+                    )
+
+        # the gate must not over-stub: the DiT loader still runs (through the
+        # sd-fixup wrapper) even with the env set.
+        flow = mod.load_flow_model("flux1-dev-fp8.safetensors")
+        assert mod.CALLS["flow"] == 1, (
+            "KOHYA_SKIP_TEXT_ENCODERS stubs the TEXT ENCODERS only — the DiT "
+            "(load_flow_model) must still load (the trainer holds DiT + ~3GB, D-007)"
+        )
+        assert "text_embedder.linear" in flow, flow
+
+
+def test_skip_te_env_absent_or_empty_uses_real_loaders():
+    # D-007 gate polarity (permanent regression guard for the stubbing):
+    # with the env ABSENT or EMPTY the real loaders must pass through
+    # untouched — load_clip_l is not stubbed (invoked, original return
+    # value), and load_t5xxl keeps the existing sd-fixup behavior (original
+    # invoked). This pins that the gate reads "present AND non-empty", so
+    # no ambient empty variable can silently stub the TEs on a non-two-pass
+    # run. The gate now EXISTS in scripts/kohya_compat_shim.py, so this
+    # polarity is enforced BY THE GATE, not by construction: env absent or
+    # empty must NEVER stub the TEs — any future widening of the trigger
+    # (e.g. "key present at all", or a truthiness-flipped check) flips
+    # this pin red.
+    assert SHIM_PATH.is_file()
+    for env_value in (None, ""):
+        with _env(KOHYA_SKIP_TEXT_ENCODERS=env_value), _fake_torch_installed() as fake_torch:
+            shim = _load_shim()
+            mod = _fake_flux_utils_with_counters()
+            shim.patch_flux_utils(mod)
+
+            clip = mod.load_clip_l("clip_l.safetensors", fake_torch.bfloat16, "cpu")
+            assert mod.CALLS["clip_l"] == 1, (
+                f"KOHYA_SKIP_TEXT_ENCODERS={env_value!r}: the original "
+                "load_clip_l must be invoked (no stubbing without the gate)"
+            )
+            assert clip == {"clip_l_original": "clip_l.safetensors"}, clip
+
+            t5 = mod.load_t5xxl("t5.safetensors", None, "cpu")
+            assert mod.CALLS["t5xxl"] == 1, (
+                f"KOHYA_SKIP_TEXT_ENCODERS={env_value!r}: the original "
+                "load_t5xxl must be invoked (real loaders pass through)"
+            )
+            assert t5 == {"t5xxl_original": "t5.safetensors"}, t5
 
 
 def test_install_meta_path_hook_is_idempotent():

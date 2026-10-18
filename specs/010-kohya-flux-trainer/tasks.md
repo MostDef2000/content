@@ -60,9 +60,33 @@
       активации против дублей и против легаси import-only файла) после
       rebuild-гварда, на каждом flux-запуске. DoD: структурные
       AST-пины + fixture-прогоны установки в tests/test_kohya_compat_shim.py
-      и tests/test_train_lora_flux.py (178 passed, 15 skipped — torch-gated
-      fp8-математика/behavioral-пины без torch в CI; приёмка fp8-пути —
-      прод-дым T006).
+      и tests/test_train_lora_flux.py (счётчик синхронизирован в T008).
+- [x] T008 (W4, D-007 двухпроходная TE-cache-архитектура): (a) шим — env-гейт
+      `KOHYA_SKIP_TEXT_ENCODERS` (непустое значение): `load_clip_l`/`load_t5xxl`
+      возвращают стаб (реальный `.dtype` = torch.bfloat16, no-op
+      eval/to/train с self, encode/forward → RuntimeError с литералом
+      «text encoder cache»); без env — реальные лоадеры не тронуты; путь DiT
+      живой в обоих режимах. (b) `train_lora.sh` flux-ветка: TE-cache-pass
+      `tools/cache_text_encoder_outputs.py` (venv python, НЕ accelerate) с
+      явными флагами-зеркалами TOML (--flux, --pretrained_model_name_or_path
+      DiT → token length 512, --clip_l, --t5xxl, --dataset_config,
+      --cache_text_encoder_outputs_to_disk, --mixed_precision bf16) ПОСЛЕ
+      бутстрапа/рендера и ДО accelerate-запуска; ненулевой rc cache-pass
+      обрывает запуск (маркер «TE-CACHE-PASS ... failed») — тренер не
+      стартует на неполном кэше; запуск тренера несёт
+      `KOHYA_SKIP_TEXT_ENCODERS=1` (env-prefix, только на тренер);
+      preflight-slack 13→3 ГиБ (3221225472) + обновлённый комментарий.
+      (c) Спека: D-007 в spec.md (двухпроходность, калибровка слэка 13→3 как
+      следствие устранённой co-residency TE, контракт стаб-гварда, формула
+      префлайта без изменений). DoD: `bash -n`;
+      `pytest tests/test_kohya_compat_shim.py tests/test_train_lora_flux.py`
+      — все 7 D-007 пинов зелёные; полный прогон после раунда:
+      188 passed, 15 skipped (torch-gated пины — в CI; фактический счётчик
+      DoD, синхронизирован с этим прогоном). Сверка счётчика: база 181 —
+      наблюдённый прогон до D-007 (оркестратор, 2026-10-18) + 7 новых
+      D-007 пинов = 188; JOURNAL 2026-10-17 подтверждает только
+      устаревание числа 178 в старом tasks.md (считать DoD-число после
+      последнего пина).
 - [ ] T006 Дымовой прогон 20 шагов на проде (старт — владелец; см. spec DoD).
 
 ## Acceptance criteria

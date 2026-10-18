@@ -77,7 +77,8 @@ FLUX-LoRA-тренинг (`train_lora.sh <id> flux`) реально работа
   --dataset_config <f2>` — ДВА файла: sd-scripts flattens `--config_file`
   в argparse-namespace, а `--dataset_config` валидируется строгим
   voluptuous-схемой (extra keys запрещены), один файл не может обслужить
-  оба опции (решение оркестратора #2).
+  оба опции (решение оркестратора #2). Перед запуском — TE-cache-pass
+  (D-007), сам запуск несёт `KOHYA_SKIP_TEXT_ENCODERS=1` (env-prefix).
 - Модели — локальные single-file чекпоинты (автозагрузки с HF нет):
   `pretrained_model_name_or_path` (DiT, BFL-формат), `ae`, `clip_l`,
   `t5xxl` — резолв по раскладке `download_models.sh`
@@ -149,10 +150,64 @@ FLUX-LoRA-тренинг (`train_lora.sh <id> flux`) реально работа
   прохождения отсутствие SIGKILL, не конкретная строка; в логе ДОЛЖНЫ
   присутствовать значения PREFLIGHT (префлайт до аллокаций; шов
   MEM_PREFLIGHT_SLACK_BYTES — для тестовых прогонов), и abort префлайта —
-  УСПЕШНЫЙ исход гейта, а не провал трейнера. Если фаза T5
-  тоже не влезет — следующий шаг T5-в-fp8 с трейдоффом качества TE
-  (решение владельца); этот рычаг также требует снизить
-  MEM_PREFLIGHT_SLACK_BYTES (дефолт 13 ГБ кодирует T5-bf16-фазу).
+   УСПЕШНЫЙ исход гейта, а не провал трейнера. Если фаза T5
+   тоже не влезет — следующий шаг T5-в-fp8 с трейдоффом качества TE
+   (решение владельца); этот рычаг также требует снизить
+   MEM_PREFLIGHT_SLACK_BYTES (дефолт 13 ГБ кодировал T5-bf16-фазу —
+   co-residency, устранённую D-007; теперь дефолт 3 ГБ, см. D-007).
+- (D-007) Двухпроходная TE-cache-архитектура памяти (Valery W3): проход 1 —
+  standalone-писатель кэша `tools/cache_text_encoder_outputs.py` (venv
+  python, НЕ accelerate launch; flux-ветка грузит ТОЛЬКО clip_l + t5xxl,
+  без DiT/VAE) запускается train_lora.sh ПЕРЕД тренером с явными флагами,
+  зеркалящими отрендеренный TOML (`--flux`,
+  `--pretrained_model_name_or_path <DiT>` — state-analysis выбирает dev →
+  длина T5-токенов 512, тот же дефолт, что у тренера; `--clip_l`,
+  `--t5xxl`, `--dataset_config <rendered dataset TOML>`,
+  `--cache_text_encoder_outputs_to_disk`, `--mixed_precision bf16`;
+  t5xxl_max_token_length/apply_t5_attn_mask/text_encoder_batch_size НЕ
+  передаются, т.к. TOML их не ставит — отсутствующие значения идентичны в
+  обоих проходах; `--config_file` не используется — конкретный блокер:
+  отрендеренный TOML несёт network-* ключи (network_module, network_dim,
+  network_alpha, network_train_unet_only), а их регистрирует train_network.py,
+  НЕ семейство add_training_arguments у tools/-писателя кэша — его парсер эти
+  ключи не знает. Идентичность кэша между проходами — конструктивная:
+  npz-путь в апстриме выводится из АБСОЛЮТНОГО пути картинки
+  (strategy_flux.get_outputs_npz_path = splitext(image_abs_path)+суффикс),
+  а не из output_dir/cwd; оба прохода читают один и тот же отрендеренный
+  dataset-TOML → места кэша совпадают по конструкции; is_partial=False
+  захардкожен в standalone (:170) и фактически False у тренера
+  (train_clip_l/train_t5xxl False при unet-only) — именование и содержимое
+  кэша согласованы). Проход 2 — тренер без TE:
+  upstream flux_train_network.py грузит CLIP-L (:141) и T5XXL (:153)
+  БЕЗУСЛОВНО даже при полном дисковом кэше, а с network_train_unet_only
+  LoRA get_models_for_text_encoding (:206-213) возвращает None — TE никогда
+  не кодируют через себя и являются мёртвым грузом ~11 ГБ RAM. Запуск
+  тренера несёт `KOHYA_SKIP_TEXT_ENCODERS=1` (env-prefix, только на
+  инвокацию тренера, никогда на cache-pass): шим по НЕпустому значению
+  переменной возвращает вместо загрузки заглушки из `load_clip_l`/
+  `load_t5xxl` — контракт стаба: настоящий `.dtype` (torch.bfloat16 — его
+  читает fp8-проверка на :157-160), no-op `eval()/to()/train()` с
+  возвратом self (поверхность :144/:154, :246-247/:284-286), а любой
+  `encode`/`forward` поднимает RuntimeError с литералом «text encoder
+  cache» — громкий срыв при неполном кэше (заглушка, «молча кодирующая»
+  мусор, запрещена контрактом). Путь DiT (`load_flow_model`) под гейтом
+  остаётся живым (шим-фиксапы применяются как раньше). Порядок во flux-ветке:
+  рендер TOML → preflight (позиция неизменна) → venv bootstrap → установка
+  шима → CACHE PASS (после bootstrap+шима, до тренера) → запуск тренера;
+  ненулевой rc cache-pass обрывает ВЕСЬ запуск
+  с маркером «TE-CACHE-PASS ... failed» — тренер никогда не стартует на
+  неполном кэше (fail-fast на уровне скрипта поверх стаб-триппера шима).
+  WHY слэк 13→3 ГБ: это КАЛИБРОВКА ДИЗАЙНА, а не ослабление гейта — старые
+  13 ГБ (T5 9.4 + CLIP 1.7 + ~1.9 хедрум) кодировали co-residency T5-bf16-фазы
+  с DiT в тренере, которой при двухпроходной схеме больше НЕ СУЩЕСТВУЕТ
+  (TE никогда не в одном процессе с DiT); формула префлайта НЕ меняется
+  (ckpt + slack; slack 3 ГиБ), пик cache-pass по HOST-RAM (~12.3 ГБ:
+  T5-bf16 + CLIP, без DiT) доминируется той же формулой и далеко ниже
+  kill-line (~26 ГБ) — риск SIGKILL на проходе 1 пренебрежим; отдельный
+  режим отказа прохода 1 — VRAM OOM (~10.9 из 12 ГБ, впритык) — падает
+  чистым rc cache-pass, а не SIGKILL; т.е. один гейт покрывает оба прохода.
+  Пиковые цифры — оценки из анализа (Box: 23.37 ГБ avail; DiT 17.05 ГБ;
+  тренер без TE ~19.4 ГБ CPU), приёмка — по T006.
 - `blocks_to_swap=20` замедляет шаги (своп блоков GPU↔CPU) — фоновая джоба.
 - Полный трейн стартует владелец из UI; на время трейна ComfyUI останавливать
   (12 ГБ общие, hard rule 3 — busy-лок менеджера).

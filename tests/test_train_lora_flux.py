@@ -17,13 +17,26 @@ Three layers:
      zero "{{" leftovers, exit 0; negatives STEPS=abc / missing T5-XXL /
      missing kohya checkout each exit 2 without rendering; the untouched SDXL
      SKIP_TRAIN path still renders runtime/train/<id>.yaml and exits 0.
-  3. deploy_flux_lora extracted from the script and run in bash against a
-     fixture tree: empty output dir → rc 3; happy path → newest checkpoint
-     atomically deployed to runtime/models/loras/<id>-flux.safetensors with
-     mode 0644 and no tmp leftovers.
+   3. deploy_flux_lora extracted from the script and run in bash against a
+      fixture tree: empty output dir → rc 3; happy path → newest checkpoint
+      atomically deployed to runtime/models/loras/<id>-flux.safetensors with
+      mode 0644 and no tmp leftovers.
 Plus compose.yaml: the manager service bind-mounts the kohya checkout at
 /workspace/kohya (the ROOT/kohya the script guards), next to the #16
 ai-toolkit bind.
+
+D-007 (two-pass memory design, Valery W3) launch-plan pins: the flux path
+runs the standalone TE cache pass (tools/cache_text_encoder_outputs.py)
+BEFORE the accelerate flux_train_network.py launch, the trainer launch
+carries KOHYA_SKIP_TEXT_ENCODERS=1 (observed via the accelerate stub's own
+env dump — the cache pass adds a second python invocation before the
+launch, so the run plan is no longer single-invocation) while the cache
+pass invocation itself must see the gate UNSET (observed via the venv
+stub's cache-tool-keyed venv-env dump — the cache writer needs the REAL
+TE loaders), and the memory preflight default slack is recalibrated
+13GiB → 3GiB (TE-free trainer: DiT + ~3GB overhead; the cache-pass peak
+is dominated by the same ckpt+slack gate) while the harness seam
+MEM_PREFLIGHT_SLACK_BYTES=0 stays.
 
 pytest-compatible; pytest is not required.
 
@@ -164,10 +177,11 @@ def _run_script(root: Path, *args: str, **env_overrides: str | None) -> subproce
     (no inherited STEPS/SEED/... from the test process).
 
     MEM_PREFLIGHT_SLACK_BYTES is pinned to 0 by default: the launch-path
-    fixtures run on CI boxes with far less RAM than the 13GB production
-    slack, and the stub checkpoints measure ~0 bytes, so the gate reduces
-    to "available >= 0" (the preflight itself still runs and logs — only
-    the margin is neutralized). A caller that must exercise the PRODUCTION
+    fixtures run on CI boxes with far less RAM than the production slack
+    (3 GiB since the D-007 two-pass recalibration; 13 GiB before it), and
+    the stub checkpoints measure ~0 bytes, so the gate reduces to
+    "available >= 0" (the preflight itself still runs and logs — only the
+    margin is neutralized). A caller that must exercise the PRODUCTION
     default (the behavioral preflight-abort test) passes
     MEM_PREFLIGHT_SLACK_BYTES=None, which leaves the variable unset."""
     env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
@@ -256,6 +270,14 @@ exec "__REAL_PYTHON__" "$@"
 #     trainer binary), "ok" succeeds and creates a bin/accelerate stub
 #     (exit 7 — a "real" trainer launch that fails without faking training
 #     success), so a completed bootstrap always reaches the launch stage.
+# The created accelerate stub ALSO dumps the KOHYA_SKIP_TEXT_ENCODERS value
+# its own process env actually carries (D-007 launch-env probe; kept in sync
+# with _ACCELERATE_STUB_SH — both stub spellings must log identically).
+# The stub ALSO dumps its own KOHYA_SKIP_TEXT_ENCODERS as a "venv-env ..."
+# line, but ONLY when the invocation matches *cache_text_encoder_outputs.py*
+# — the N2 cache-pass env probe mirroring the accelerate-env dump (the cache
+# pass runs as PLAIN venv python and must see the gate UNSET; keying the
+# dump to the cache tool keeps every other venv-python line minimal).
 # It deliberately does NOT create the .torch-flavor marker: the marker is
 # the SCRIPT's own artifact (echo "${TORCH_INDEX_SLUG}" > ...). A stub that
 # materialized it from --index-url calls masked deletion of the writer line
@@ -267,19 +289,24 @@ echo "venv-python cwd=$PWD $*" >> "__LOG__"
 mode="$(cat "__MODEFILE__" 2>/dev/null || echo ok)"
 has_r=0
 has_req=0
+has_cache=0
 for a in "$@"; do
   case "$a" in
     -r) has_r=1 ;;
     *requirements.txt) has_req=1 ;;
+    *cache_text_encoder_outputs.py) has_cache=1 ;;
   esac
 done
+if [ "$has_cache" -eq 1 ]; then
+  echo "venv-env KOHYA_SKIP_TEXT_ENCODERS=${KOHYA_SKIP_TEXT_ENCODERS:-UNSET}" >> "__LOG__"
+fi
 bin_dir="$(dirname "$0")"
 if [ "$has_r" -eq 1 ] && [ "$has_req" -eq 1 ]; then
   if [ "$mode" = fail ]; then
     echo "pip-requirements FAILED cwd=$PWD" >> "__LOG__"
     exit 1
   fi
-  printf '#!/bin/sh\\necho "accelerate $*" >> "%s"\\nexit 7\\n' "__LOG__" > "$bin_dir/accelerate"
+  printf '#!/bin/sh\\necho "accelerate $*" >> "%s"\\necho "accelerate-env KOHYA_SKIP_TEXT_ENCODERS=${KOHYA_SKIP_TEXT_ENCODERS:-UNSET}" >> "%s"\\nexit 7\\n' "__LOG__" "__LOG__" > "$bin_dir/accelerate"
   chmod 755 "$bin_dir/accelerate"
   echo "pip-requirements OK cwd=$PWD" >> "__LOG__"
   exit 0
@@ -287,10 +314,14 @@ fi
 exit 0
 """
 
-# The trainer-binary stub: logs the launch args and exits 7 (a genuine
+# The trainer-binary stub: logs the launch args AND the KOHYA_SKIP_TEXT_ENCODERS
+# value in its own process env (the D-007 launch-env probe — the contract is
+# what the launched trainer process actually sees, not how the script spells
+# it: export vs inline prefix both satisfy it), then exits 7 (a genuine
 # failure at the launch stage, never a faked success).
 _ACCELERATE_STUB_SH = """#!/bin/sh
 echo "accelerate $*" >> "__LOG__"
+echo "accelerate-env KOHYA_SKIP_TEXT_ENCODERS=${KOHYA_SKIP_TEXT_ENCODERS:-UNSET}" >> "__LOG__"
 exit 7
 """
 
@@ -393,6 +424,44 @@ def test_flux_launches_accelerate_with_config_and_dataset_files():
     assert "flux_train_network.py" in body
     assert '--config_file "${RENDERED}"' in body
     assert '--dataset_config "${RENDERED_DATASET}"' in body
+
+
+def test_flux_script_emits_te_cache_pass_before_accelerate_launch():
+    # D-007 two-pass memory design, text contract (the cache pass adds a
+    # SECOND python invocation BEFORE the accelerate launch — upstream
+    # tools/cache_text_encoder_outputs.py flux branch loads ONLY clip_l +
+    # t5xxl, no DiT/VAE, so the trainer can then run TE-free under
+    # KOHYA_SKIP_TEXT_ENCODERS=1). The script must reference the standalone
+    # cache tool and position it before the accelerate flux_train_network.py
+    # launch. Exact flag spelling (rendered TOML vs explicit minimal set) is
+    # pinned behaviorally in test_flux_cache_pass_runs_before_trainer_launch.
+    text = _script_text()
+    assert "cache_text_encoder_outputs.py" in text, (
+        "train_lora.sh must invoke tools/cache_text_encoder_outputs.py "
+        "(the D-007 pre-trainer cache pass)"
+    )
+    # Ordering is pinned against the REAL invocation, never a mention: the
+    # memory-preflight slack comment also names the tool and was the first
+    # text.index hit, so a plain index comparison could be satisfied by a
+    # comment alone. Discriminator: the venv-python call line
+    # (${VAR}/bin/python" "${VAR}/tools/cache_text_encoder_outputs.py —
+    # quote-anchored) searched in comment-stripped code, so no comment edit
+    # can satisfy it and deleting the invocation fails here. The real
+    # run-log ordering stays covered by test_flux_cache_pass_runs_before_trainer_launch.
+    code = "\n".join(
+        ln for ln in text.splitlines() if not ln.lstrip().startswith("#")
+    )
+    invocation = re.search(
+        r'\$\{[A-Za-z_]+\}/bin/python"\s+"\$\{[A-Za-z_]+\}/tools/cache_text_encoder_outputs\.py',
+        code,
+    )
+    assert invocation is not None, (
+        "the cache pass must be a real ${VENV}/bin/python invocation of "
+        "tools/cache_text_encoder_outputs.py, not just a comment mention"
+    )
+    assert invocation.start() < code.index('bin/accelerate" launch'), (
+        "the cache pass must be emitted BEFORE the accelerate flux_train_network.py launch"
+    )
 
 
 def test_flux_resolves_four_local_base_checkpoints():
@@ -555,13 +624,16 @@ def test_flux_memory_preflight_structural_contract():
     assert "preflight" in block.lower(), (
         "the abort message must be distinguishable (contain 'preflight')"
     )
-    # production default: the slack comes from the 13GB literal expression,
-    # the env seam only overrides it — grep the default INSIDE the block so
-    # a weakened default (e.g. 0 baked in) fails here even though the test
-    # harness passes slack=0 through the seam.
-    assert re.search(r'MEM_PREFLIGHT_SLACK_BYTES",\s*13\s*\*\s*1024\*\*3', block), (
-        "the preflight must default the slack to 13GB (13 * 1024**3) via "
-        "MEM_PREFLIGHT_SLACK_BYTES; the seam may only override it"
+    # production default: the slack comes from the 3GiB expression (D-007
+    # two-pass recalibration: the trainer holds DiT + ~3GB TE-free overhead;
+    # the old 13GB = T5 9.4GB + CLIP 1.7GB + headroom decomposition is
+    # obsolete because the cache pass keeps the TEs out of the trainer), the
+    # env seam only overrides it — grep the default INSIDE the block so a
+    # weakened default (e.g. 0 baked in) or the retired 13GB value fails
+    # here even though the test harness passes slack=0 through the seam.
+    assert re.search(r'MEM_PREFLIGHT_SLACK_BYTES",\s*(?:3\s*\*\s*1024\*\*3|3221225472)', block), (
+        "the preflight must default the slack to 3GiB (3 * 1024**3 = "
+        "3221225472) via MEM_PREFLIGHT_SLACK_BYTES; the seam may only override it"
     )
     # placement: flux SKIP_TRAIN seam < preflight < accelerate launch
     seam_pos = text.index('if [[ "${SKIP_TRAIN:-}" == "1" ]]')
@@ -1317,20 +1389,21 @@ def test_flux_sitecustomize_shim_import_not_duplicated_across_rebuilds():
 
 def test_flux_memory_preflight_aborts_before_launch_on_default_slack_under_small_cgroup_budget():
     # Behavioral half of the memory preflight (validator condition, after
-    # train-1792249442 SIGKILL): run the flux path against a HEALTHY venv
-    # (no rebuild noise) with an HONEST minimal checkpoint stub (~16 real
-    # bytes — declared-bytes stubs are malformed under the hardened header
+    # train-1792249442 SIGKILL; slack recalibrated to 3GiB by the D-007
+    # two-pass design): run the flux path against a HEALTHY venv (no rebuild
+    # noise) with an HONEST minimal checkpoint stub (~16 real bytes —
+    # declared-bytes stubs are malformed under the hardened header
     # validation and belong to the malformed-header pins) and require a
     # CLEAN ABORT before the trainer launch: non-zero rc, no launch marker,
     # a distinguishable "preflight" line. The pin's purpose is exercising
-    # the PRODUCTION DEFAULT slack (13GiB) — the harness seam is explicitly
-    # unset (MEM_PREFLIGHT_SLACK_BYTES=None) and the slack number must be
-    # visible in the refusal (a leak of the harness slack=0 into this
-    # scenario is itself caught). The refusal must be DETERMINISTIC on any
-    # runner (CI boxes can have >=13GiB free — a host-only gate would then
-    # legitimately proceed), so the budget is driven by a fixture cgroup
-    # with a small remaining: limit 1GiB - usage 900MiB = 130023424
-    # remaining << required (16 + 13GiB).
+    # the PRODUCTION DEFAULT slack (3GiB = 3221225472) — the harness seam is
+    # explicitly unset (MEM_PREFLIGHT_SLACK_BYTES=None) and the slack number
+    # must be visible in the refusal (a leak of the harness slack=0 into
+    # this scenario is itself caught). The refusal must be DETERMINISTIC on
+    # any runner (CI boxes can have >=3GiB free — a host-only gate would
+    # then legitimately proceed), so the budget is driven by a fixture
+    # cgroup with a small remaining: limit 1GiB - usage 900MiB = 130023424
+    # remaining << required (16 + 3GiB).
     root = _build_root()
     try:
         (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
@@ -1358,13 +1431,14 @@ def test_flux_memory_preflight_aborts_before_launch_on_default_slack_under_small
             f"abort must be a distinguishable preflight message; rc={result.returncode}\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
-        # the refusal must be computed with the DEFAULT 13GiB slack
-        # (13 * 1024**3 = 13958643712) — the shared "required (checkpoint ..
-        # + slack ..)" message carries it on both the host and the cgroup
+        # the refusal must be computed with the DEFAULT 3GiB slack
+        # (3 * 1024**3 = 3221225472, the D-007 TE-free recalibration of the
+        # retired 13GiB/13958643712 value) — the shared "required (checkpoint
+        # .. + slack ..)" message carries it on both the host and the cgroup
         # refusal branch, proving the seam did not leak and the production
         # default is the one under test.
-        assert "13958643712" in combined, (
-            f"abort output must show the 13GB default slack in effect; rc={result.returncode}\n"
+        assert "3221225472" in combined, (
+            f"abort output must show the 3GiB default slack in effect; rc={result.returncode}\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
     finally:
@@ -1376,10 +1450,10 @@ def test_flux_memory_preflight_refuses_when_cgroup_budget_below_requirement():
     # drive the decision. Fixture v2 cgroup root via the
     # MEM_PREFLIGHT_CGROUP_ROOT seam: limit 1GiB (1073741824), usage
     # 900MiB (943718400) → remaining 130023424 bytes. The checkpoint is an
-    # HONEST ~16B stub and the PRODUCTION default slack (13GiB) is kept
-    # (MEM_PREFLIGHT_SLACK_BYTES=None → unset) — required ≈ 13GiB exceeds
-    # the CGROUP budget (124MiB) long before the host matters; the cgroup
-    # is what must refuse the run. The refusal output must expose the
+    # HONEST ~16B stub and the PRODUCTION default slack (3GiB since D-007)
+    # is kept (MEM_PREFLIGHT_SLACK_BYTES=None → unset) — required ≈ 3GiB
+    # exceeds the CGROUP budget (124MiB) long before the host matters; the
+    # cgroup is what must refuse the run. The refusal output must expose the
     # cgroup arithmetic: the remaining value 130023424 has to appear, and
     # the trainer launch must not start.
     root = _build_root()
@@ -1463,9 +1537,9 @@ def test_flux_memory_preflight_fails_closed_when_cgroup_usage_unreadable():
     # through to the host-only decision (host MemAvailable says nothing
     # about what this cgroup is actually allowed to use). Fixture v2 root
     # via the seam: memory.max = 2GiB (finite), memory.current MISSING;
-    # production default slack (MEM_PREFLIGHT_SLACK_BYTES=None → 13GiB)
-    # and an empty stub checkpoint. Discriminators: the refusal must carry
-    # the fail-closed marker AND the fixture's limit value (a host-only
+    # production default slack (MEM_PREFLIGHT_SLACK_BYTES=None → 3GiB since
+    # D-007) and an empty stub checkpoint. Discriminators: the refusal must
+    # carry the fail-closed marker AND the fixture's limit value (a host-only
     # fallback — the regression this guards — would abort with the generic
     # budget message and never print 2147483648, and with a small enough
     # slack would proceed to the launch instead).
@@ -1503,6 +1577,161 @@ def test_flux_memory_preflight_fails_closed_when_cgroup_usage_unreadable():
         assert "2147483648" in combined, (
             "the refusal must expose the fixture's finite cgroup limit "
             f"(2GiB = 2147483648) — proof the seam root was read; rc={result.returncode}\n{combined}"
+        )
+    finally:
+        _cleanup(root)
+
+
+def _run_flux_launch_plan(root: Path) -> tuple[subprocess.CompletedProcess, list[str]]:
+    """Shared driver for the D-007 two-pass launch-plan pins: HEALTHY venv
+    (cu130 marker — no rebuild noise), PATH-shimmed python3, stub venv
+    interpreter and stub accelerate. The run reaches the trainer launch
+    (stub exit 7). The log holds EVERY python/accelerate invocation in
+    order: the venv stub interpreter logs 'venv-python cwd=... <args>' (so a
+    cache pass run through the kohya venv python — the only interpreter that
+    can run kohya tools — is visible, and the stub ALSO dumps its own
+    KOHYA_SKIP_TEXT_ENCODERS as a 'venv-env ...' line for exactly those
+    cache-pass invocations — the N2 cache-pass env probe), the accelerate
+    stub logs its launch args AND the KOHYA_SKIP_TEXT_ENCODERS value its
+    own process env carries (the launch-env probe: what the trainer
+    actually sees, agnostic to export vs inline-prefix spelling)."""
+    (root / "kohya" / "requirements.txt").write_text("accelerate\n-e .\n", encoding="utf-8")
+    (root / "kohya" / "pyproject.toml").write_text('[project]\nname = "sd-scripts"\n', encoding="utf-8")
+    _seed_flavored_venv(root, flavor="cu130")
+    shim_dir, log, _mode = _install_python3_venv_shim(root)
+    result = _run_script(
+        root,
+        MODEL_ID,
+        "flux",
+        STEPS=STEPS_SMOKE,
+        PATH=f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
+    )
+    lines = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    return result, lines
+
+
+def test_flux_cache_pass_runs_before_trainer_launch():
+    # D-007 two-pass memory design, run-plan half: the flux path must run
+    # the STANDALONE text-encoder output cache pass
+    # (tools/cache_text_encoder_outputs.py — its flux branch loads ONLY
+    # clip_l + t5xxl, no DiT, no VAE) BEFORE launching flux_train_network.py,
+    # so the trainer can then run TE-free (KOHYA_SKIP_TEXT_ENCODERS=1 + the
+    # shim stubs; upstream load_target_model loads both TEs unconditionally
+    # at :141/:153 and would otherwise pay ~11GB RAM for encoders the
+    # complete cache makes dead weight). Pin: a cache_text_encoder_outputs.py
+    # invocation exists in the launch log, ordered before the accelerate
+    # flux_train_network.py launch, and is bound to the run config — the
+    # SAME rendered dataset TOML (--dataset_config) or an explicit dataset
+    # flag (--train_data_dir), plus the rendered TOML (--config_file) or
+    # explicit model paths (--clip*/--t5xxl) if the standalone's argparse
+    # rejects training-only TOML sections. The run must still end at the
+    # trainer launch stub (rc 7): the cache pass is additive, not a
+    # replacement.
+    root = _build_root()
+    try:
+        result, lines = _run_flux_launch_plan(root)
+        launch_idx = [
+            i for i, ln in enumerate(lines)
+            if ln.startswith("accelerate ") and "flux_train_network.py" in ln
+        ]
+        assert launch_idx, (
+            "the run never reached the accelerate trainer launch — the cache "
+            f"pass broke the plan; rc={result.returncode}\nlog:\n{lines}\n"
+            f"stderr:\n{result.stderr}"
+        )
+        cache_idx = [i for i, ln in enumerate(lines) if "cache_text_encoder_outputs.py" in ln]
+        assert cache_idx, (
+            "no cache_text_encoder_outputs.py invocation in the flux run plan — "
+            "the D-007 two-pass design requires the TE cache pass BEFORE the "
+            f"trainer\nlog:\n{lines}\nstderr:\n{result.stderr}"
+        )
+        assert min(cache_idx) < min(launch_idx), (
+            "the cache pass must be invoked BEFORE flux_train_network.py is "
+            f"launched (two-pass, D-007)\ncache lines: {[lines[i] for i in cache_idx]}\n"
+            f"launch line: {lines[launch_idx[0]]}"
+        )
+        cache_line = lines[cache_idx[0]]
+        assert "--dataset_config" in cache_line or "--train_data_dir" in cache_line, (
+            "the cache pass must consume the rendered dataset config "
+            "(--dataset_config \"${RENDERED_DATASET}\") or an explicit dataset "
+            f"flag (--train_data_dir); got: {cache_line!r}"
+        )
+        assert (
+            "--config_file" in cache_line
+            or "--clip" in cache_line
+            or "--t5xxl" in cache_line
+        ), (
+            "the cache pass must be bound to the rendered TOML (--config_file) "
+            "or the explicit model paths (--clip_l/--t5xxl) when training-only "
+            f"TOML sections are rejected; got: {cache_line!r}"
+        )
+        # the two-pass run still ends at the trainer launch stub
+        assert "flux_train_network.py exited with code 7" in result.stderr, (
+            f"rc={result.returncode}\nstderr:\n{result.stderr}\nlog:\n{lines}"
+        )
+        assert result.returncode == 7
+    finally:
+        _cleanup(root)
+
+
+def test_flux_trainer_launch_carries_skip_text_encoders_env():
+    # D-007 trainer half: flux_train_network.py must be launched with
+    # KOHYA_SKIP_TEXT_ENCODERS=1 so the compat shim stubs load_clip_l /
+    # load_t5xxl instead of loading the TEs into RAM (the cache pass already
+    # produced the on-disk outputs; with network_train_unet_only LoRA
+    # get_models_for_text_encoding (:206-213) returns None, so the stubs are
+    # never encoded through — and the shim's encode/forward guard trips a
+    # loud RuntimeError if the cache is incomplete). Observed at the launch
+    # boundary via the accelerate stub's own env dump — export or inline
+    # prefix both satisfy it; RED today = UNSET.
+    root = _build_root()
+    try:
+        result, lines = _run_flux_launch_plan(root)
+        env_lines = [ln for ln in lines if ln.startswith("accelerate-env ")]
+        assert env_lines, f"harness launch-env probe missing from the log\nlog:\n{lines}"
+        assert any("KOHYA_SKIP_TEXT_ENCODERS=1" in ln for ln in env_lines), (
+            "the trainer launch must carry KOHYA_SKIP_TEXT_ENCODERS=1 (the "
+            f"shim gate for the stubbed text encoders); saw: {env_lines}\n"
+            f"rc={result.returncode}\nstderr:\n{result.stderr}"
+        )
+    finally:
+        _cleanup(root)
+
+
+def test_flux_cache_pass_runs_without_skip_text_encoders_env():
+    # D-007 cache-pass half (round-10 finding N2, regression pin): the TE
+    # cache pass runs as PLAIN venv python and must NOT carry
+    # KOHYA_SKIP_TEXT_ENCODERS in its environment — the cache writer needs
+    # the REAL clip_l/t5xxl loaders; if the trainer's env-prefix ever became
+    # an export (or the prefix were moved above the cache invocation), the
+    # shim gate would stub the TEs INSIDE the cache pass and the "cache"
+    # would be garbage. Observed at the process boundary via the venv stub's
+    # own env dump (the 'venv-env' line, emitted only for
+    # cache_text_encoder_outputs.py invocations — mirrors the accelerate-env
+    # probe; the trainer-launch pin above keeps asserting =1 there, so the
+    # two pins together pin the two-pass env POLARITY).
+    root = _build_root()
+    try:
+        result, lines = _run_flux_launch_plan(root)
+        cache_lines = [
+            ln for ln in lines
+            if ln.startswith("venv-python ") and "cache_text_encoder_outputs.py" in ln
+        ]
+        assert cache_lines, (
+            "no cache_text_encoder_outputs.py venv-python invocation in the "
+            f"run plan; rc={result.returncode}\nlog:\n{lines}\n"
+            f"stderr:\n{result.stderr}"
+        )
+        venv_env_lines = [ln for ln in lines if ln.startswith("venv-env ")]
+        assert venv_env_lines, (
+            "harness cache-pass env probe missing from the log — the venv "
+            f"stub must dump the env at the cache invocation; log:\n{lines}"
+        )
+        assert all("KOHYA_SKIP_TEXT_ENCODERS=UNSET" in ln for ln in venv_env_lines), (
+            "the TE cache pass must run WITHOUT KOHYA_SKIP_TEXT_ENCODERS in "
+            "its env (the cache writer loads the real text encoders; the "
+            f"gate is trainer-scoped); saw: {venv_env_lines}\n"
+            f"rc={result.returncode}\nstderr:\n{result.stderr}"
         )
     finally:
         _cleanup(root)

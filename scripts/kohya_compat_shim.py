@@ -38,13 +38,26 @@ flux_train_network.py:129, if it runs at all, touches only the non-fp8
 remainder (same-dtype Tensor.to() allocates nothing — worst case ≈
 +~2.5GB, not a full-DiT spike).
 
+D-007 TE-skip gate (two-pass memory design): the trainer invocation sets
+KOHYA_SKIP_TEXT_ENCODERS=1 (train_lora.sh env-prefixes the accelerate
+launch; the TE cache pass runs WITHOUT it). With the env present and
+NON-EMPTY, patch_flux_utils additionally wraps flux_utils.load_clip_l and
+flux_utils.load_t5xxl to return a STUB instead of loading from disk —
+upstream flux_train_network.py loads CLIP-L (:141) and T5XXL (:153)
+unconditionally even with a complete on-disk cache, and with
+network_train_unet_only LoRA get_models_for_text_encoding (:206-213)
+returns None, so the TEs are pure dead weight in the trainer (~11GB RAM).
+The stub carries the surface the cache path touches (real bf16 .dtype,
+self-returning eval/to/train) and a loud encode/forward tripwire; the DiT
+loader (load_flow_model) stays wrapped and live under the gate either way.
+
 This shim is installed into the kohya venv's site-packages by the bootstrap
 in scripts/train_lora.sh; a sitecustomize.py next to it imports this module
 and calls install() in EVERY python process of the venv, and install()
 registers a sys.meta_path finder that patches library.flux_utils right after
 its first import — wrapping BOTH sd-loading entry points (load_flow_model
-and load_t5xxl; clip_l/ae are untouched) so every loader hands out a fixed
-state dict.
+and load_t5xxl; clip_l/ae are untouched outside the D-007 gate) so every
+loader hands out a fixed state dict.
 
 torch is imported lazily (inside the functions that need it): CI parses and
 imports this file without torch installed.
@@ -53,6 +66,7 @@ imports this file without torch installed.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 
 __all__ = [
@@ -84,6 +98,67 @@ _TARGET_DTYPE_NAME = "bfloat16"
 # fp32 roundtrip: multiply and cast are elementwise ops.
 _DEQUANT_CHUNK_ELEMS = 4_000_000
 _DEQUANT_CHUNK_ROWS = 256
+
+# D-007 TE-skip gate (two-pass memory design): the TRAINER invocation sets
+# this env var (train_lora.sh env-prefixes KOHYA_SKIP_TEXT_ENCODERS=1 onto
+# the accelerate launch); the TE cache pass runs WITHOUT it and needs the
+# REAL loaders. Read at patch time (call time), not import time.
+_SKIP_TEXT_ENCODERS_ENV = "KOHYA_SKIP_TEXT_ENCODERS"
+
+
+def _skip_text_encoders():
+    """True when the gate is present AND non-empty: an ambient EMPTY variable
+    must never stub the TEs on a non-two-pass run (polarity pinned by
+    tests/test_kohya_compat_shim.py::test_skip_te_env_absent_or_empty_uses_real_loaders)."""
+    return bool(os.environ.get(_SKIP_TEXT_ENCODERS_ENV, ""))
+
+
+class _SkippedTextEncoder:
+    """D-007 TE-skip stub: stands in for a text encoder the two-pass trainer
+    run never loads. Upstream flux_train_network.py still LOADS both TEs
+    unconditionally (:141 CLIP-L, :153 T5XXL) even with a complete on-disk
+    cache; with network_train_unet_only LoRA they are never encoded through
+    (get_models_for_text_encoding :206-213 returns None), so the stub exposes
+    exactly the surface the cache path touches:
+      * .dtype — a REAL torch dtype (bfloat16): the fp8 dtype check at
+        flux_train_network.py:157-160 reads it;
+      * eval()/to()/train() — no-ops returning self (:144/:154 and
+        :246-247/:284-286);
+      * encode()/forward() — LOUD tripwire: RuntimeError mentioning the
+        text encoder cache, so an incomplete cache or stub misuse fails the
+        run instead of silently training on garbage.
+    torch is imported lazily (this module must stay importable without it)."""
+
+    def __init__(self, name):
+        import torch  # lazy: real bf16 dtype sentinel
+
+        self.name = name
+        self.dtype = torch.bfloat16
+
+    def eval(self):
+        return self
+
+    def to(self, *args, **kwargs):
+        return self
+
+    def train(self, mode=True):
+        return self
+
+    def encode(self, *args, **kwargs):
+        raise RuntimeError(
+            f"KOHYA_SKIP_TEXT_ENCODERS: {self.name} is stubbed — the text encoder "
+            "cache must be complete before training (run the TE cache pass "
+            "tools/cache_text_encoder_outputs.py first, or unset "
+            "KOHYA_SKIP_TEXT_ENCODERS to load the real encoders)"
+        )
+
+    def forward(self, *args, **kwargs):
+        raise RuntimeError(
+            f"KOHYA_SKIP_TEXT_ENCODERS: {self.name} is stubbed — the text encoder "
+            "cache must be complete before training (run the TE cache pass "
+            "tools/cache_text_encoder_outputs.py first, or unset "
+            "KOHYA_SKIP_TEXT_ENCODERS to load the real encoders)"
+        )
 
 
 def strip_comfyui_prefix(sd, in_place=False):
@@ -274,7 +349,16 @@ def patch_flux_utils(mod):
         ~12GB DiT-sd, ~28.1GB for ~17GB; estimates — the trainer's memory
         preflight measures the real checkpoint bytes and available memory).
     The original load_safetensors is restored in a finally block, win or
-    lose; load_clip_l and load_ae stay untouched (no scaled-fp8 there).
+    lose; load_clip_l and load_ae stay untouched (no scaled-fp8 there) —
+    except under the D-007 gate below, which stubs BOTH text-encoder loaders.
+
+    D-007 TE-skip gate: when KOHYA_SKIP_TEXT_ENCODERS is present and
+    NON-EMPTY (the two-pass trainer invocation sets it; the TE cache pass
+    runs WITHOUT it and gets the real loaders), load_clip_l AND load_t5xxl
+    are additionally wrapped to return a _SkippedTextEncoder WITHOUT
+    invoking the underlying loaders at all — nothing is read from disk, no
+    sd-fixup swap happens for the TEs. The DiT path (load_flow_model) stays
+    wrapped and live either way: the trainer still holds DiT + ~3GB (D-007).
     """
     import torch  # lazy: torch.bfloat16 target for the T5 path
 
@@ -297,6 +381,22 @@ def patch_flux_utils(mod):
     # T5: explicit bf16 (TE-cache quality).
     mod.load_flow_model = _make_patched(mod.load_flow_model, None)
     mod.load_t5xxl = _make_patched(mod.load_t5xxl, torch.bfloat16)
+
+    if _skip_text_encoders():
+        # D-007 two-pass memory design: with the complete TE cache from pass 1
+        # (tools/cache_text_encoder_outputs.py) the trainer must not pay for
+        # the text encoders — upstream loads them unconditionally (:141/:153)
+        # and with network_train_unet_only LoRA never encodes through them.
+        # Both TE loaders return the stub WITHOUT touching disk (and without
+        # the sd-fixup swap); the DiT loader above stays live.
+        def _make_te_stub_loader(name):
+            def _stub_loader(*args, **kwargs):
+                return _SkippedTextEncoder(name)
+
+            return _stub_loader
+
+        mod.load_clip_l = _make_te_stub_loader("clip_l")
+        mod.load_t5xxl = _make_te_stub_loader("t5xxl")
     return mod
 
 

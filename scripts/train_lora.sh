@@ -289,10 +289,14 @@ if [[ "${ARCH}" == "flux" ]]; then
   # < measured_ckpt_bytes + SLACK — budget = min(MemAvailable,
   # cgroup_limit - cgroup_usage) for a finite limit, and a finite limit with
   # unreadable usage fails CLOSED (never silently host-only).
-  # SLACK defaults to 13GB (T5 9.4GB + CLIP 1.7GB + ~1.9GB headroom), must be
-  # a non-negative integer, and is overridable via the
-  # MEM_PREFLIGHT_SLACK_BYTES seam (tests set 0 — threshold = measured bytes
-  # only).
+  # SLACK defaults to 3GiB (D-007 two-pass recalibration): the TE cache pass
+  # (tools/cache_text_encoder_outputs.py, peak ~12.3GB — dominated by this
+  # same ckpt+slack formula) keeps the text encoders OUT of the trainer, so
+  # the trainer runs TE-free — DiT + ~3GB overhead; the old 13GB encoded the
+  # T5 9.4GB + CLIP 1.7GB + ~1.9GB headroom co-residency that no longer
+  # exists (design calibration, NOT gate weakening). Must be a non-negative
+  # integer, and is overridable via the MEM_PREFLIGHT_SLACK_BYTES seam
+  # (tests set 0 — threshold = measured bytes only).
   FLUX_DIT="${FLUX_DIT}" python3 - <<'PY'
 import json
 import os
@@ -413,7 +417,7 @@ if not os.path.isfile(ckpt_path):
 ckpt_bytes, header_len, tensors = ckpt_tensor_bytes(ckpt_path)
 limit, usage, cgroup_src = cgroup_state()
 avail, swap = meminfo()
-raw_slack = os.environ.get("MEM_PREFLIGHT_SLACK_BYTES", 13 * 1024**3)
+raw_slack = os.environ.get("MEM_PREFLIGHT_SLACK_BYTES", 3 * 1024**3)
 try:
     slack = int(raw_slack)
 except (TypeError, ValueError):
@@ -537,9 +541,49 @@ PY
   export HF_HOME="${ROOT}/runtime/hf-cache"
   mkdir -p "${HF_HOME}"
 
+  # TE cache pass (spec 010 D-007, two-pass memory design): the standalone
+  # cache writer tools/cache_text_encoder_outputs.py runs as PLAIN venv python
+  # (its own accelerator — NOT accelerate launch) BEFORE the trainer, loads
+  # ONLY clip_l + t5xxl (no DiT/VAE — its flux branch) and writes the caption
+  # embeddings to disk, so the trainer can then run TE-free under
+  # KOHYA_SKIP_TEXT_ENCODERS=1 (below). Explicit CLI flags MIRROR the rendered
+  # TOML values — the cache format must match the trainer's expectations
+  # exactly: --pretrained_model_name_or_path is the DiT (state analysis picks
+  # dev → T5 token length 512, the same default the trainer derives);
+  # t5xxl_max_token_length / apply_t5_attn_mask / text_encoder_batch_size are
+  # deliberately NOT passed because the TOML does not set them (absent ==
+  # identical defaults in both passes); --mixed_precision bf16 matches the
+  # trainer launch. The tool force-enables cache_text_encoder_outputs(_to_disk)
+  # itself; the flag is spelled out for explicitness. --config_file is NOT
+  # used for this pass: the rendered TOML carries training-only keys
+  # (network_module, optimizer_type, ...) outside the cache writer's parser.
+  # FAIL-FAST: a non-zero cache pass aborts the run — the trainer must never
+  # launch on an incomplete cache (the shim's stub tripwire is the in-depth
+  # guard; this is the script-level one). Runs WITHOUT the D-007 env gate:
+  # the cache pass needs the REAL text-encoder loaders.
+  echo "TE-CACHE-PASS start: ${KOHYA}/tools/cache_text_encoder_outputs.py (loads CLIP-L + T5-XXL only)" >&2
+  te_cache_rc=0
+  "${KOHYA_VENV}/bin/python" "${KOHYA}/tools/cache_text_encoder_outputs.py" \
+    --flux \
+    --pretrained_model_name_or_path "${FLUX_DIT}" \
+    --clip_l "${FLUX_CLIP_L}" \
+    --t5xxl "${FLUX_T5XXL}" \
+    --dataset_config "${RENDERED_DATASET}" \
+    --cache_text_encoder_outputs_to_disk \
+    --mixed_precision bf16 || te_cache_rc=$?
+  if [[ "${te_cache_rc}" -ne 0 ]]; then
+    echo "TE-CACHE-PASS failed (rc=${te_cache_rc}): refusing to launch the trainer without a complete text-encoder cache." >&2
+    exit "${te_cache_rc}"
+  fi
+  echo "TE-CACHE-PASS ok (rc=0)" >&2
+
   cd "${KOHYA}"
   train_rc=0
-  "${KOHYA_VENV}/bin/accelerate" launch \
+  # KOHYA_SKIP_TEXT_ENCODERS=1 (D-007) gates the compat shim: in THIS trainer
+  # process the shim stubs both TE loaders instead of loading ~11GB of dead
+  # weight (the cache pass above already wrote the on-disk outputs). Scoped
+  # to this invocation only via env-prefix — never set for the cache pass.
+  KOHYA_SKIP_TEXT_ENCODERS=1 "${KOHYA_VENV}/bin/accelerate" launch \
     --num_processes 1 \
     --num_machines 1 \
     --mixed_precision bf16 \
