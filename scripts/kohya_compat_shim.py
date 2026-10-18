@@ -121,6 +121,20 @@ def _skip_text_encoders():
     return bool(os.environ.get(_SKIP_TEXT_ENCODERS_ENV, ""))
 
 
+class _PlaceholderParam:
+    """Zero-size placeholder 'parameter' for the D-007 stub (defect #6,
+    train-1792365662): carries the REAL dtype sentinel and nothing else —
+    the training-loop start log (train_network.py:1521-1525) reads only
+    `.dtype` off the third parameter. Zero footprint by construction (no
+    storage, no autograd, nothing optimizable) and NOT a torch.Tensor, so
+    no traversal or optimizer surface can accidentally pick it up."""
+
+    __slots__ = ("dtype",)
+
+    def __init__(self, dtype):
+        self.dtype = dtype
+
+
 class _SkippedTextEncoder:
     """D-007 TE-skip stub: stands in for a text encoder the two-pass trainer
     run never loads. Upstream flux_train_network.py still LOADS both TEs
@@ -135,13 +149,27 @@ class _SkippedTextEncoder:
     before this surface existed):
       * .dtype — a REAL torch dtype (bfloat16): the fp8 dtype check at
         flux_train_network.py:157-160 reads it;
+      * .device — a REAL torch.device("cpu") sentinel (defect #6,
+        train-1792365662): train_network.py:1263 gates the whole TE
+        fp8-cast + prepare_text_encoder_fp8 block on
+        `t_enc.device.type != "cpu"`; cpu is CORRECT for a weightless
+        stub — nothing to cast, the on-disk cache already holds the TE
+        outputs — so the block is skipped entirely;
       * eval()/to()/train() — no-ops returning self (:144/:154 and
         :246-247/:284-286);
-      * named_modules()/named_parameters()/named_buffers()/parameters()/
-        buffers() — EMPTY iterables; state_dict() — a FRESH empty dict;
-        requires_grad_() — a self-returning no-op: the traversal yields
-        NOTHING, i.e. ZERO TE LoRA modules — the designed skip under
-        network_train_unet_only (the intended empty TE-LoRA set);
+      * parameters() — >=3 PLACEHOLDER params carrying the bf16 sentinel
+        (defect #6, train-1792365662): train_network.py:1521-1525 at
+        training-loop start skips two "embeddings" and reads the THIRD
+        param's .dtype — StopIteration there kills the run. Placeholders
+        are zero-size dtype stand-ins (no memory, nothing optimizable);
+      * named_modules()/named_parameters()/named_buffers()/buffers() —
+        EMPTY iterables, UNCHANGED and LOAD-BEARING: the named_* traversal
+        must yield NOTHING — zero TE LoRA targets is the security-relevant
+        contract (lora_flux.py:819, prod train-1792334532: "0 modules" as
+        designed); parameters() deliberately DIVERGES from
+        named_parameters() (dtype-log loop vs optimization/traversal);
+      * state_dict() — a FRESH empty dict; requires_grad_() — a
+        self-returning no-op;
       * encode()/forward() — LOUD tripwire, UNCHANGED by the traversal
         surface: RuntimeError mentioning the text encoder cache, so an
         incomplete cache or stub misuse fails the run instead of silently
@@ -149,10 +177,24 @@ class _SkippedTextEncoder:
     torch is imported lazily (this module must stay importable without it)."""
 
     def __init__(self, name):
-        import torch  # lazy: real bf16 dtype sentinel
+        import torch  # lazy: real bf16 dtype sentinel + cpu device sentinel
 
         self.name = name
         self.dtype = torch.bfloat16
+        # P10 (train-1792365662): train_network.py:1263 gates the WHOLE TE
+        # fp8-cast + prepare_text_encoder_fp8 block on
+        # `t_enc.device.type != "cpu"`. cpu is the CORRECT sentinel for a
+        # weightless stub — nothing to cast (no weights), and the on-disk
+        # cache already holds the TE outputs — so the block is skipped
+        # entirely.
+        self.device = torch.device("cpu")
+        # REVISED surface (train-1792365662): train_network.py:1521-1525
+        # (training-loop start log) iterates parameters(), skips two
+        # "embeddings", reads the THIRD param's .dtype — the stub must
+        # yield >=3 placeholders carrying the bf16 sentinel (StopIteration
+        # here kills the run at loop start). Zero-size: no memory, nothing
+        # optimizable; the named_* traversal stays EMPTY.
+        self._placeholder_params = tuple(_PlaceholderParam(torch.bfloat16) for _ in range(3))
 
     def eval(self):
         return self
@@ -180,7 +222,13 @@ class _SkippedTextEncoder:
         return iter(())
 
     def parameters(self, *args, **kwargs):
-        return iter(())
+        # REVISED (train-1792365662): feeds train_network.py:1521-1525's
+        # third-param dtype read — yields the stored placeholders (fresh
+        # iterator per call from the tuple). Deliberately DIVERGES from
+        # named_parameters(): the named_* methods feed optimization and
+        # traversal (must stay empty — zero TE LoRA targets), parameters()
+        # feeds the dtype-log loop.
+        return iter(self._placeholder_params)
 
     def buffers(self, *args, **kwargs):
         return iter(())

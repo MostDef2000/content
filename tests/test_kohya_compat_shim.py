@@ -79,13 +79,18 @@ flux_utils.load_t5xxl to return a STUB instead of loading from disk: real
 surface the cache path touches at :144/:154/:246-247/:284-286), and any
 encode/forward call raising RuntimeError containing "text encoder cache"
 (guard against an incomplete cache / stub misuse). Since train-1792334532
-the stub ALSO exposes the network-creation traversal surface with EMPTY
-results — named_modules/named_parameters/named_buffers/parameters/buffers
-yield nothing, state_dict() == {}, requires_grad_ returns self — because
-networks/lora_flux.py create_modules (:819, reached from :947 "create
-LoRA for Text Encoder 1") TRAVERSES the text encoder even under
-network_train_unet_only, and yielding zero modules is exactly the
-designed skip (zero TE LoRA; pinned by P9). With the env absent or
+the stub ALSO exposes the network-creation traversal surface —
+named_modules/named_parameters/named_buffers/buffers yield NOTHING
+(the LoRA-targeting surface: zero yielded modules = zero TE LoRA = the
+designed skip; pinned by P9) and state_dict() == {} / requires_grad_
+returns self — because networks/lora_flux.py create_modules (:819,
+reached from :947 "create LoRA for Text Encoder 1") TRAVERSES the text
+encoder even under network_train_unet_only. REVISED by train-1792365662:
+parameters() must yield >=3 bf16-dtype placeholder params (the
+training-loop start log at train_network.py:1521-1525 reads the third),
+and the stub carries .device with .type == "cpu" (the :1263 gate that
+skips the fp8 cast block for a weightless stub; pinned by P10). With the
+env absent or
 EMPTY the real loaders pass through untouched; the DiT path
 (load_flow_model) stays wrapped and live under the gate either way. The
 behavioral pins inject a FAKE torch module via sys.modules — the gate
@@ -201,11 +206,23 @@ def _fake_torch_installed():
     class _FakeTensor:  # isinstance target only — never constructed here
         pass
 
+    class _FakeDevice:
+        """torch.device(...) stand-in (train-1792365662 stub .device pin):
+        additive so a fix may legitimately build the device via
+        torch.device("cpu") under the fake; existing pins never touch it."""
+
+        def __init__(self, spec):
+            self.type = str(spec).split(":")[0]
+
+        def __repr__(self):
+            return f"device(type='{self.type}')"
+
     fake.bfloat16 = _FakeDtype("bfloat16")
     fake.float32 = _FakeDtype("float32")
     fake.float8_e4m3fn = _FakeDtype("float8_e4m3fn")
     fake.float8_e5m2 = _FakeDtype("float8_e5m2")
     fake.Tensor = _FakeTensor
+    fake.device = _FakeDevice
     saved = sys.modules.get("torch")
     sys.modules["torch"] = fake
     try:
@@ -1270,16 +1287,28 @@ def test_skip_te_stub_exposes_empty_network_traversal_surface():
     # modules and the TE-target match list decides which get LoRA; the
     # designed skip under network_train_unet_only means ZERO TE LoRA
     # modules, so the stub's traversal must yield NOTHING across the
-    # whole module-traversal surface (named_modules/named_parameters/
-    # named_buffers/parameters/buffers return EMPTY iterables,
-    # state_dict() == {}, requires_grad_(...) returns self) — on BOTH
-    # stubs (clip_l and t5xxl are traversed the same way). The
+    # LOAD-BEARING named_* surface (named_modules/named_parameters/
+    # named_buffers/buffers return EMPTY iterables, state_dict() == {},
+    # requires_grad_(...) returns self) — on BOTH stubs (clip_l and t5xxl
+    # are traversed the same way). The
     # encode/forward tripwires stay exactly as pinned by
     # test_skip_te_env_wraps_clip_l_and_t5xxl_with_stubs — this pin ADDS
     # traversal surface, and re-checks one tripwire to prove the addition
     # did not swallow it. Landed RED-first against the pre-traversal
     # stub; PERMANENT guard — its red signature if the surface is ever
     # removed: AttributeError on named_modules, the exact prod frame.
+    #
+    # CONTRACT REVISION (prod train-1792365662, probe #7): the original
+    # "parameters() EMPTY" assertion was WRONG — it predated the
+    # training-loop evidence. train_network.py:1521-1525 (training-loop
+    # start log) does params_itr = t_enc.parameters(); next(); next()
+    # (skipping two "embeddings"); param_3rd = next(); then reads
+    # param_3rd.dtype — so parameters() must yield AT LEAST 3 placeholder
+    # params, each carrying .dtype == torch.bfloat16 (StopIteration here
+    # kills the run at loop start). The security-relevant emptiness is
+    # the named_* traversal (zero TE LoRA targets — "0 modules" CONFIRMED
+    # in prod) and stays UNTOUCHED; buffers()/named_buffers() emptiness
+    # also stands (the loop reads only parameters()).
     assert SHIM_PATH.is_file()
     with _env(KOHYA_SKIP_TEXT_ENCODERS="1"), _fake_torch_installed() as fake_torch:
         shim = _load_shim()
@@ -1306,7 +1335,22 @@ def test_skip_te_stub_exposes_empty_network_traversal_surface():
             )
             assert list(stub.named_parameters()) == [], label
             assert list(stub.named_buffers()) == [], label
-            assert list(stub.parameters()) == [], label
+            # REVISED by train-1792365662: parameters() must yield >=3
+            # placeholder params with the bf16 dtype sentinel — the
+            # training-loop start log reads the THIRD (see docstring).
+            params = list(stub.parameters())
+            assert len(params) >= 3, (
+                f"{label}: parameters() must yield >=3 placeholder params — "
+                "train_network.py:1521-1525 skips two 'embeddings' and "
+                f"logs the third's dtype; got {len(params)} (fewer -> "
+                "StopIteration kills the run at training-loop start)"
+            )
+            for i, p in enumerate(params[:3]):
+                assert p.dtype is fake_torch.bfloat16, (
+                    f"{label}: placeholder param #{i} must carry the real "
+                    "bf16 dtype sentinel (read at train_network.py:1525); "
+                    f"got: {getattr(p, 'dtype', None)!r}"
+                )
             assert list(stub.buffers()) == [], label
             assert stub.state_dict() == {}, label
             assert stub.requires_grad_(False) is stub, (
@@ -1331,6 +1375,44 @@ def test_skip_te_stub_exposes_empty_network_traversal_surface():
                         f"{label}.{method}() must still raise RuntimeError "
                         "after the traversal surface was added"
                     )
+
+
+def test_skip_te_stub_exposes_cpu_device_for_fp8_cast_gate():
+    # P10 (prod train-1792365662, probe #7 — landed RED-first against the pre-device stub: AttributeError on
+    # .device): this run MILESTONED — TE LoRA "0 modules" as designed
+    # (the empty named_* traversal holds), DiT "create LoRA for FLUX all
+    # blocks: 304 modules", optimizer prep started — then
+    # train_network.py:1263 died on
+    #     if t_enc.device.type != "cpu" and self.cast_text_encoder(args):
+    # because the stub exposes no .device. Contract: the stub must expose
+    # a device whose .type == "cpu" — the gate then skips the WHOLE fp8
+    # cast + prepare_text_encoder_fp8 block, which is exactly right for a
+    # weightless stub (nothing to cast; the on-disk cache already holds
+    # the TE outputs). A real torch.device("cpu") is an acceptable
+    # implementation (the fake torch carries a device stand-in for
+    # it) — the pin asserts only the observable stub.device.type == "cpu"
+    # on BOTH stubs. Landed RED-first; PERMANENT guard — red signature if
+    # removed: the exact prod AttributeError on .device at :1263.
+    assert SHIM_PATH.is_file()
+    with _env(KOHYA_SKIP_TEXT_ENCODERS="1"), _fake_torch_installed():
+        shim = _load_shim()
+        mod = _fake_flux_utils_with_counters()
+        shim.patch_flux_utils(mod)
+
+        clip = mod.load_clip_l("clip_l.safetensors", None, "cpu")
+        t5 = mod.load_t5xxl(
+            "t5xxl_fp8_e4m3fn_scaled.safetensors", None, "cpu", disable_mmap=False
+        )
+
+        for label, stub in (("clip_l", clip), ("t5xxl", t5)):
+            dev = stub.device
+            assert getattr(dev, "type", None) == "cpu", (
+                f"{label}: stub.device.type must be 'cpu' — "
+                "train_network.py:1263 gates the fp8 cast / "
+                "prepare_text_encoder_fp8 block on it (cpu -> skipped, the "
+                "correct path for a weightless stub); got: "
+                f"{getattr(dev, 'type', None)!r} (device: {dev!r})"
+            )
 
 
 def test_skip_te_env_absent_or_empty_uses_real_loaders():
