@@ -49,6 +49,20 @@ Two test layers:
     VERIFY it; they would have failed against the old bf16-forcing code);
     the bit-exact pin stays target-agnostic.
 
+Dtype-hygiene pins (train-1792332693, probe #5): the ostris scaled-fp8
+T5 stores SOME tensors non-fp8 — notably the token embedding in fp16 —
+and Pass 2's else-branch passed every non-fp8 tensor through regardless
+of target, so the T5 path (load_t5xxl, dtype=None + assign=True, no
+post-cast) produced a mixed-dtype model: Half activations against
+dequanted bf16 weights crash the first T5 attention
+(modeling_t5.py:304 via strategy_flux). Fix contract: with target NOT
+None, floating-point non-fp8 tensors are cast to the target; int/bool/
+uint8 are NEVER cast; target=None (the flow path) keeps byte-identical
+passthrough. P7/P8 run on a FAKE torch with dtype-tracking tensors
+(no numerics) so they are CI-visible without torch — P7 pins the target
+cast (fp16 embed must land bf16), P8 pins the gating (target=None must
+cast NOTHING — the D-006/D-007 fp8-preserve defense).
+
 The sitecustomize ACTIVATION defect (reviewer F1 — import alone never
 calls install()) is pinned behaviorally on the prod path in
 tests/test_train_lora_flux.py::test_flux_bootstrap_installs_compat_shim_into_site_packages.
@@ -771,6 +785,208 @@ def test_apply_sd_fixups_composed():
     assert torch.equal(qkv.to(torch.float32), expected.to(torch.float32))
     assert torch.equal(out["final.linear"], plain)
     assert torch.equal(out["text_embedder.emb"], emb)
+
+
+# ---------------------------------------------------------------------------
+# train-1792332693 dtype pins — fake torch WITH dtype-tracking tensors, so
+# these run (and can be RED) in torch-less CI, unlike the torch-gated
+# dequant pins above (which skip here). The pins assert dtypes only, never
+# numerics, so the fake carries shape/dtype bookkeeping and no math.
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _fake_torch_with_tensors():
+    """P7/P8 harness: the shared _fake_torch_installed never constructs
+    tensors; the dequant paths touch torch.empty and tensor surfaces
+    (reshape/view/numel/dim/getitem/setitem/mul/to). This extended fake
+    tracks ONLY dtype and shape — every derived tensor keeps the dtype
+    chain honest, values are irrelevant — with the same
+    sys.modules injection/restore discipline, so the shim's lazy
+    `import torch` resolves the fake inside dequant_scaled_fp8_sd."""
+    fake = types.ModuleType("torch")
+
+    class _FakeDtype:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __repr__(self) -> str:
+            return f"torch.{self.name}"
+
+    for _name in (
+        "bfloat16", "float32", "float64", "float16", "int64", "uint8",
+        "bool", "float8_e4m3fn", "float8_e5m2",
+    ):
+        setattr(fake, _name, _FakeDtype(_name))
+
+    class _FakeTensor:
+        def __init__(self, dtype, shape):
+            self.dtype = dtype
+            self.shape = tuple(shape)
+
+        def numel(self):
+            n = 1
+            for s in self.shape:
+                n *= s
+            return n
+
+        def dim(self):
+            return len(self.shape)
+
+        def is_floating_point(self):
+            # torch semantics: fp8 dtypes ARE floating point (the shim's
+            # fp8 branch handles them before any float-cast gate; the
+            # method exists so a method-based fix implementation is not
+            # forced into a dtype-set comparison by the harness)
+            return self.dtype in (
+                fake.bfloat16, fake.float32, fake.float64, fake.float16,
+                fake.float8_e4m3fn, fake.float8_e5m2,
+            )
+
+        def to(self, dtype):
+            return _FakeTensor(dtype, self.shape)
+
+        def reshape(self, *args):
+            return _FakeTensor(self.dtype, (self.numel(),))
+
+        def view(self, *args):
+            return _FakeTensor(self.dtype, (self.numel(),))
+
+        def __getitem__(self, index):
+            return _FakeTensor(self.dtype, self.shape)
+
+        def __mul__(self, other):
+            return _FakeTensor(self.dtype, self.shape)
+
+        def __setitem__(self, index, value):
+            pass  # dtype-tracking fake: element writes are irrelevant
+
+    fake.Tensor = _FakeTensor
+    fake.empty = lambda shape, dtype=None: _FakeTensor(dtype, shape)
+    saved = sys.modules.get("torch")
+    sys.modules["torch"] = fake
+    try:
+        yield fake
+    finally:
+        if saved is None:
+            sys.modules.pop("torch", None)
+        else:
+            sys.modules["torch"] = saved
+
+
+def _mixed_scaled_fp8_sd(torch) -> dict:
+    """The ostris t5xxl_fp8_e4m3fn_scaled shape (train-1792332693):
+    paired fp8 tensors with scalar scales (e4m3fn AND e5m2), a STRAY
+    unpaired fp8, the fp16 token-embedding stand-in (the defect tensor),
+    a bf16 attention weight, an int64 step counter, a bool mask and the
+    top-level scaled_fp8 marker."""
+    T = torch.Tensor
+    return {
+        "qkv": T(torch.float8_e4m3fn, (4,)),
+        "qkv.scale_weight": T(torch.float32, ()),
+        "mlp": T(torch.float8_e5m2, (4,)),
+        "mlp.scale_weight": T(torch.float32, ()),
+        "stray_fp8": T(torch.float8_e4m3fn, (4,)),
+        "embed_tokens": T(torch.float16, (4,)),
+        "attn_bf16": T(torch.bfloat16, (4,)),
+        "shared_step": T(torch.int64, (4,)),
+        "bool_mask": T(torch.bool, (4,)),
+        "scaled_fp8": T(torch.uint8, ()),
+    }
+
+
+def test_dequant_target_bf16_casts_stray_floats_to_target():
+    # P7 (prod train-1792332693, probe #5 — landed RED-first against the
+    # pre-fix shim; PERMANENT contract guard): the cache pass cleared
+    # CLIP (encode complete) and died at the T5's first attention —
+    # "expected mat1 and mat2 to have the same dtype, but got: c10::Half
+    # != c10::BFloat16" (modeling_t5.py:304 via strategy_flux T5 encode).
+    # Mechanism: the ostris scaled-fp8 checkpoint stores SOME tensors
+    # non-fp8 — notably the token embedding in fp16 — and Pass 2's
+    # else-branch passed every non-fp8 tensor through UNCHANGED
+    # regardless of target; load_t5xxl runs with dtype=None and
+    # assign=True (no post-cast), so the model came out mixed-dtype:
+    # fp16 embedding -> Half activations against bf16 dequanted weights.
+    # Fix contract: with target NOT None, floating-point non-fp8 tensors
+    # are cast to the target (value.to(target)); int/bool/uint8 are NEVER
+    # cast; both modes (copy + in_place) behave identically. Red
+    # signature if the cast branch is ever removed: the fp16 embedding
+    # comes back fp16.
+    assert SHIM_PATH.is_file()
+    with _fake_torch_with_tensors() as torch:
+        shim = _load_shim()
+
+        sd = _mixed_scaled_fp8_sd(torch)
+        out = shim.dequant_scaled_fp8_sd(sd, target=torch.bfloat16)
+        # fp8 handling (paired + stray) — already target-cast, unchanged:
+        assert out["qkv"].dtype is torch.bfloat16
+        assert out["mlp"].dtype is torch.bfloat16
+        assert out["stray_fp8"].dtype is torch.bfloat16
+        # THE FIX HALF — non-fp8 floats follow the target too:
+        assert out["embed_tokens"].dtype is torch.bfloat16, (
+            "train-1792332693: a stray fp16 float tensor must be cast to "
+            "the bf16 target (the ostris T5 stores the token embedding in "
+            "fp16; Half activations against dequanted bf16 weights crash "
+            f"the first T5 attention); got: {out['embed_tokens'].dtype}"
+        )
+        assert out["attn_bf16"].dtype is torch.bfloat16
+        # never-cast classes keep their dtype:
+        assert out["shared_step"].dtype is torch.int64
+        assert out["bool_mask"].dtype is torch.bool
+        # housekeeping: marker and scale keys gone; copy mode leaves the
+        # input dict untouched (the fp16 entry still fp16 there):
+        assert "scaled_fp8" not in out
+        assert not any(k.endswith(".scale_weight") for k in out)
+        assert sd["embed_tokens"].dtype is torch.float16, (
+            "copy mode must not mutate the input tensors"
+        )
+
+        # in_place mode: SAME outcome, input consumed as before:
+        sd2 = _mixed_scaled_fp8_sd(torch)
+        out2 = shim.dequant_scaled_fp8_sd(sd2, in_place=True, target=torch.bfloat16)
+        assert out2["embed_tokens"].dtype is torch.bfloat16, (
+            f"in_place mode must cast identically to copy mode; got: "
+            f"{out2['embed_tokens'].dtype}"
+        )
+        assert out2["shared_step"].dtype is torch.int64
+        assert out2["bool_mask"].dtype is torch.bool
+        assert set(sd2) == set(), (
+            f"in_place must consume the input as before; left: {set(sd2)}"
+        )
+
+
+def test_dequant_target_none_never_casts_anything():
+    # P8 (the GATING half of the fix — green-by-construction against the
+    # pre-fix shim, disclosed the way P4/P6 were; its bite is against the
+    # NEW branch): target=None is the D-006/D-007 flow-path contract
+    # (fp8-preserve, train-1792249442 RAM reality) — NOTHING may be cast:
+    # paired fp8 re-quantizes into its OWN fp8 dtype (e4m3fn AND e5m2
+    # alike), the stray fp8 stays fp8, the fp16 embedding stays fp16, the
+    # bf16 stays bf16, int/bool untouched. Discriminator: a fix that
+    # casts non-fp8 floats UNCONDITIONALLY (dropping the
+    # `target is not None` gate) flips the fp16/bf16 passthrough
+    # assertions here — silently dragging the flow checkpoint (whose
+    # fp8-preserve end-state kohya consumes directly) into a cast world
+    # it must never enter. This pin defends the gate; P7 defends the
+    # cast.
+    assert SHIM_PATH.is_file()
+    with _fake_torch_with_tensors() as torch:
+        shim = _load_shim()
+        sd = _mixed_scaled_fp8_sd(torch)
+        out = shim.dequant_scaled_fp8_sd(sd)  # default target=None
+        assert out["qkv"].dtype is torch.float8_e4m3fn
+        assert out["mlp"].dtype is torch.float8_e5m2
+        assert out["stray_fp8"].dtype is torch.float8_e4m3fn
+        assert out["embed_tokens"].dtype is torch.float16, (
+            "target=None (flow path) must NOT cast the fp16 embedding — "
+            "the D-006/D-007 fp8-preserve contract; got: "
+            f"{out['embed_tokens'].dtype}"
+        )
+        assert out["attn_bf16"].dtype is torch.bfloat16
+        assert out["shared_step"].dtype is torch.int64
+        assert out["bool_mask"].dtype is torch.bool
+        assert "scaled_fp8" not in out
+        assert not any(k.endswith(".scale_weight") for k in out)
 
 
 def test_patch_flux_utils_wraps_load_safetensors_and_restores():

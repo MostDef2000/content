@@ -15,6 +15,14 @@ of meta tensor" at unet.to("cpu").
 The ostris scaled-fp8 T5 (t5xxl_fp8_e4m3fn_scaled.safetensors) additionally
 carries per-tensor `*.scale_weight` keys kohya ignores — raw fp8 values get
 assigned as weights (numerically wrong text-encoder outputs).
+train-1792332693 — the dequant Pass 2 else-branch passed non-fp8 tensors
+through UNCHANGED regardless of target: the same ostris checkpoint stores
+its token embedding in fp16, so with target=torch.bfloat16 (the T5 path)
+the model assembled mixed-dtype (fp8 tensors -> bf16 via dequant, the fp16
+embedding stayed fp16; load_t5xxl casts nothing afterwards) and the first
+T5 attention matmul died `mat1 Half != mat2 BFloat16`. Fixed by casting
+non-fp8 floating tensors to the target (ints/bools/uint8 untouched;
+target=None flow path byte-identical).
 
 Memory profile (two prod SIGKILLs, both silent deaths by the OOM signature):
 train-1792246674 — full-tensor fp32 intermediates on the ~17GB fp8 sd piled
@@ -267,7 +275,13 @@ def dequant_scaled_fp8_sd(sd, in_place=False, target=None):
       kept in its own fp8 dtype when target=None, fp32-roundtripped into
       the target dtype otherwise (ComfyUI-style checkpoints store some
       tensors unscaled);
-    * everything else passes through unchanged.
+    * with an explicit target, every other non-fp8 FLOATING tensor is cast
+      to it too (defect #4, train-1792332693: the ostris scaled-fp8 T5
+      stores the token embedding in fp16 — unchanged passthrough against
+      bf16-dequanted weights died `mat1 Half != mat2 BFloat16` at the
+      first T5 attention); ints/bools/uint8 are never cast;
+    * with target=None (the flow path) everything else passes through
+      unchanged — byte-identical fp8-preserve behavior.
 
     Default (copy) mode returns a NEW dict, input untouched. in_place=True
     is the consuming mode (train-1792246674 OOM fix): each tensor and its
@@ -301,7 +315,23 @@ def dequant_scaled_fp8_sd(sd, in_place=False, target=None):
         if isinstance(value, torch.Tensor) and value.dtype in _fp8_dtypes(torch):
             out[key] = _to_target(torch, value, target)
         else:
-            out[key] = value
+            # Defect #4 (prod train-1792332693): with an explicit target, a
+            # non-fp8 FLOATING tensor must follow it — the ostris scaled-fp8
+            # T5 stores the token embedding in fp16 while the fp8 tensors
+            # dequantize into bf16 (load_t5xxl runs with dtype=None and
+            # assign=True, no post-cast), so unchanged passthrough assembled
+            # a mixed-dtype model and the first T5 attention matmul died
+            # `mat1 Half != mat2 BFloat16`. Ints/bools/uint8 are NEVER cast;
+            # target=None (the D-006/D-007 fp8-preserve flow path) keeps the
+            # byte-identical passthrough (P8).
+            if (
+                target is not None
+                and isinstance(value, torch.Tensor)
+                and value.is_floating_point()
+            ):
+                out[key] = value.to(target)
+            else:
+                out[key] = value
     return out
 
 
@@ -310,8 +340,10 @@ def apply_sd_fixups(sd, in_place=False, target=None):
     FIRST (tensor and its .scale_weight pair share the prefix, so they stay
     paired under the final name), then the scaled-fp8 dequant. in_place=True
     threads the consuming mode through the chain (memory fix); target=None
-    re-quantizes fp8 into each tensor's own dtype (flow path), a torch dtype
-    object (torch.bfloat16) casts results there (T5 path)."""
+    re-quantizes fp8 into each tensor's own dtype and passes everything else
+    through unchanged (flow path), a torch dtype object (torch.bfloat16)
+    casts dequanted AND non-fp8 floating results there — ints/bools/uint8
+    untouched (T5 path, defect #4 train-1792332693)."""
     return dequant_scaled_fp8_sd(
         strip_comfyui_prefix(sd, in_place=in_place), in_place=in_place, target=target
     )
