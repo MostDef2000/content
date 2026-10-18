@@ -34,6 +34,28 @@ Wrapper contract pinned here (argv: python cache_pass_wrapper.py
   P1c usage guard — invoked with no arguments the wrapper exits non-zero
       and fails FAST: the tool module is never imported/executed.
 
+Second upstream defect (train-1792323801 — the weighted_captions fix let
+the cache pass reach the NEXT landmine): tools/cache_latents.py:33 calls
+flux_utils.check_flux_state_dict_diffusers_schnell(path), an attribute
+that does NOT exist in library/flux_utils @690ea7f9 (renamed API: the
+trainer uses the 4-tuple flux_utils.analyze_checkpoint_state(path) ->
+(is_diffusers, is_schnell, (n_double, n_single), keys),
+flux_train_network.py:171). The compat patch HAS LANDED in the wrapper:
+after exec_module, if the loaded tool module has a flux_utils attribute
+whose object LACKS check_flux_state_dict_diffusers_schnell, the wrapper
+adds an adapter lambda path: flux_utils.analyze_checkpoint_state(path)[:3]
+onto THAT object (module-attribute patch — visible to cache_latents
+through the same module object; the old 3-tuple contract keeps is_schnell
+at index 1 and the call site 3-unpacks, so the [:3] slice is
+load-bearing). These pins are the patch's PERMANENT CONTRACT GUARD:
+  P3 adapter applied when missing — the call-site succeeds through the
+      adapter, delegating to analyze_checkpoint_state with the exact [:3]
+      slice (rc 0, marker proves injection);
+  P4 existing attr preserved — when the tool's flux_utils ALREADY
+      defines check_flux_state_dict_diffusers_schnell (upstream someday
+      fixes the rename), the wrapper must NOT override it (sentinel
+      returned unchanged, analyze never touched through an adapter).
+
 Sandbox-safe and torch-free BY DESIGN: a FAKE tool module (written to a
 tmp dir by the tests) mirrors exactly the upstream surface the wrapper
 touches — including the store_true/default=False spelling of
@@ -127,10 +149,121 @@ def cache_to_disk(args):
         raise RuntimeError("fake cache_to_disk failed (train-1792313236 stand-in)")
 '''
 
+# P3 fake — train-1792323801 call-site stand-in: module-global flux_utils
+# EXPOSES ONLY the renamed 4-tuple API (analyze_checkpoint_state, the
+# exact shape of library/flux_utils @690ea7f9 per flux_train_network.py:171)
+# and LACKS check_flux_state_dict_diffusers_schnell. cache_to_disk performs
+# the tools/cache_latents.py:33 call shape and records the RAW result list,
+# so the marker discriminates: no adapter -> AttributeError (nothing
+# recorded); correct adapter -> [False, True, [2, 3]] ([:3] slice,
+# is_schnell at index 1); unsliced 4-tuple adapter -> a fourth element
+# appears and the equality fails.
+_FAKE_TOOL_MISSING_CHECK_SRC = '''"""Fake tool whose flux_utils lacks check_flux_state_dict_diffusers_schnell."""
+import argparse
+import json
+import os
+from types import SimpleNamespace
 
-def _make_fixture(root: Path) -> tuple[Path, Path]:
+MARKER = os.environ["FAKE_TOOL_MARKER"]
+
+
+def setup_parser():
+    parser = argparse.ArgumentParser(prog="fake_cache_text_encoder_outputs")
+    parser.add_argument("--flux", action="store_true")
+    parser.add_argument("--weighted_captions", action="store_true", default=False)
+    parser.add_argument("--dataset_config", type=str, default=None)
+    return parser
+
+
+def _read_config_from_file(args, parser):
+    return args
+
+
+args_util = SimpleNamespace(read_config_from_file=_read_config_from_file)
+
+
+def _analyze_checkpoint_state(path):
+    # renamed-API shape @690ea7f9: (is_diffusers, is_schnell,
+    # (n_double, n_single), keys) — distinctive values so a slice is visible
+    return (False, True, (2, 3), ["k"])
+
+
+flux_utils = SimpleNamespace(analyze_checkpoint_state=_analyze_checkpoint_state)
+
+
+def cache_to_disk(args):
+    # tools/cache_latents.py:33 call shape: module-global flux_utils name
+    result = flux_utils.check_flux_state_dict_diffusers_schnell("ignored-path")
+    with open(MARKER, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "called": True,
+            "is_schnell": result[1],
+            "result": list(result),
+        }) + "\\n")
+'''
+
+# P4 fake — polarity half: flux_utils ALREADY defines
+# check_flux_state_dict_diffusers_schnell (sentinel tuple, the "upstream
+# someday fixes the rename" world). analyze_checkpoint_state COUNTS its
+# calls into the marker record: an over-riding wrapper (unconditional
+# adapter) would replace the sentinel AND reach analyze through the
+# adapter — both observable. A correct no-override leaves result == the
+# sentinel and analyze_calls == 0.
+_FAKE_TOOL_SENTINEL_CHECK_SRC = '''"""Fake tool whose flux_utils already provides the check attr."""
+import argparse
+import json
+import os
+from types import SimpleNamespace
+
+MARKER = os.environ["FAKE_TOOL_MARKER"]
+ANALYZE_CALLS = 0
+
+
+def setup_parser():
+    parser = argparse.ArgumentParser(prog="fake_cache_text_encoder_outputs")
+    parser.add_argument("--flux", action="store_true")
+    parser.add_argument("--weighted_captions", action="store_true", default=False)
+    parser.add_argument("--dataset_config", type=str, default=None)
+    return parser
+
+
+def _read_config_from_file(args, parser):
+    return args
+
+
+args_util = SimpleNamespace(read_config_from_file=_read_config_from_file)
+
+
+def _analyze_checkpoint_state(path):
+    global ANALYZE_CALLS
+    ANALYZE_CALLS += 1
+    return (False, True, (2, 3), ["k"])
+
+
+def _check(path):
+    return ("sentinel", "preserved", "upstream")
+
+
+flux_utils = SimpleNamespace(
+    analyze_checkpoint_state=_analyze_checkpoint_state,
+    check_flux_state_dict_diffusers_schnell=_check,
+)
+
+
+def cache_to_disk(args):
+    raw = flux_utils.check_flux_state_dict_diffusers_schnell("ignored-path")
+    with open(MARKER, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "called": True,
+            "result": list(raw),
+            "analyze_calls": ANALYZE_CALLS,
+        }) + "\\n")
+'''
+
+
+def _make_fixture(root: Path, src: str = _FAKE_TOOL_SRC) -> tuple[Path, Path]:
     tool = root / "fake_cache_text_encoder_outputs.py"
-    tool.write_text(_FAKE_TOOL_SRC, encoding="utf-8")
+    tool.write_text(src, encoding="utf-8")
     return tool, root / "marker.jsonl"
 
 
@@ -261,6 +394,99 @@ def test_wrapper_usage_guard_no_args_fails_fast_without_importing_tool():
             "fail-fast means the tool module is NOT imported/executed — "
             f"the import sentinel {marker.name}.imported exists; "
             f"stderr:\n{result.stderr}"
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_wrapper_injects_flux_check_adapter_when_missing():
+    # P3 (train-1792323801, adapter-contract guard): the weighted_
+    # captions fix let the cache pass reach the NEXT upstream defect —
+    # tools/cache_latents.py:33 calls flux_utils.check_flux_state_dict_
+    # diffusers_schnell(path), which library/flux_utils @690ea7f9 does NOT
+    # define (renamed API: analyze_checkpoint_state -> 4-tuple
+    # (is_diffusers, is_schnell, (n_double, n_single), keys), the spelling
+    # the trainer itself uses at flux_train_network.py:171). The landed
+    # compat patch: after exec_module, if the tool module has a
+    # flux_utils attribute whose object LACKS the check, the wrapper adds
+    # lambda path: flux_utils.analyze_checkpoint_state(path)[:3] onto that
+    # object (module-attribute patch — the same object the tool's call
+    # sites resolve, so cache_latents sees it). Fake: flux_utils exposes
+    # ONLY the 4-tuple analyze; cache_to_disk performs the real call shape
+    # and records the RAW result. This pin guards the adapter contract:
+    # injection when missing, delegation to analyze_checkpoint_state with
+    # the load-bearing [:3] slice (the call site 3-unpacks). Its red
+    # signature if the patch is ever removed: AttributeError inside
+    # cache_to_disk -> rc != 0, marker never written. The raw-result
+    # assertion pins the slice semantics: is_schnell stays at index 1
+    # (True here) and an unsliced 4-tuple adapter is caught by the extra
+    # element.
+    root = Path(tempfile.mkdtemp(prefix="cache-pass-wrapper-"))
+    try:
+        tool, marker = _make_fixture(root, src=_FAKE_TOOL_MISSING_CHECK_SRC)
+        result = _run_wrapper(tool, marker, ["--flux"])
+        assert result.returncode == 0, (
+            "the wrapper must compat-patch the missing check so the tool's "
+            "cache_latents.py:33 call-site succeeds; rc="
+            f"{result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert marker.is_file(), (
+            "the marker must prove the adapter was injected and the call "
+            f"succeeded; rc={result.returncode}\nstderr:\n{result.stderr}"
+        )
+        records = _marker_records(marker)
+        assert len(records) == 1, records
+        rec = records[0]
+        assert rec["called"] is True, rec
+        assert rec["is_schnell"] is True, (
+            "the adapter's result must keep is_schnell at index 1 (the old "
+            f"3-tuple contract); got: {rec}"
+        )
+        assert rec["result"] == [False, True, [2, 3]], (
+            "the adapter must delegate to analyze_checkpoint_state and slice "
+            f"[:3] — (is_diffusers, is_schnell, (n_double, n_single)); an "
+            f"unsliced 4-tuple is a contract break; got: {rec['result']}"
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_wrapper_preserves_existing_flux_check_attribute():
+    # P4 (polarity half of the compat patch): when the loaded tool's
+    # flux_utils ALREADY defines check_flux_state_dict_diffusers_schnell
+    # (upstream someday fixes the rename), the wrapper must NOT override
+    # it — the sentinel must survive untouched. The fake's
+    # analyze_checkpoint_state counts calls into the marker record, so an
+    # over-riding implementation (unconditional adapter) is caught twice:
+    # the sentinel AND analyze_calls flips to 1. The compat patch landed
+    # WITH the missing-check guard, so this pin is the PERMANENT polarity
+    # guard against the over-riding regression (an unconditional setattr
+    # would replace the sentinel and route analyze) — the no-override
+    # half of the P3/P4 pair, landed together as the train-1792323801
+    # fix.
+    root = Path(tempfile.mkdtemp(prefix="cache-pass-wrapper-"))
+    try:
+        tool, marker = _make_fixture(root, src=_FAKE_TOOL_SENTINEL_CHECK_SRC)
+        result = _run_wrapper(tool, marker, ["--flux"])
+        assert result.returncode == 0, (
+            f"a tool whose flux_utils provides the check must run untouched; "
+            f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert marker.is_file(), (
+            f"cache_to_disk must have recorded the raw check result; "
+            f"rc={result.returncode}\nstderr:\n{result.stderr}"
+        )
+        records = _marker_records(marker)
+        assert len(records) == 1, records
+        rec = records[0]
+        assert rec["result"] == ["sentinel", "preserved", "upstream"], (
+            "the wrapper must NOT override an existing "
+            f"check_flux_state_dict_diffusers_schnell — the sentinel must be "
+            f"returned unchanged; got: {rec['result']}"
+        )
+        assert rec["analyze_calls"] == 0, (
+            "the existing check must be called directly, never routed "
+            f"through an adapter onto analyze_checkpoint_state; got: {rec}"
         )
     finally:
         shutil.rmtree(root, ignore_errors=True)
