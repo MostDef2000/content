@@ -56,6 +56,35 @@ load-bearing). These pins are the patch's PERMANENT CONTRACT GUARD:
       fixes the rename), the wrapper must NOT override it (sentinel
       returned unchanged, analyze never touched through an adapter).
 
+Third upstream defect (train-1792329792 — probe #3): with the adapter in
+place the cache pass reaches the first CLIP forward and dies there —
+RuntimeError "Expected all tensors to be on the same device, but got
+index is on cpu, different from other tensors on cuda:0"
+(strategy_flux.py:71 -> clip_text_model.py:53 -> HF position_embedding).
+Mechanism (@690ea7f9): tools/cache_text_encoder_outputs.py:134/:138 call
+flux_utils.load_clip_l(args.clip_l, weight_dtype, accelerator.device) /
+load_t5xxl(args.t5xxl, None, accelerator.device) (module-attribute
+access); inside load_clip_l, `with init_empty_weights():` creates the
+NON-PERSISTENT position_ids buffer on CPU (init_empty_weights does not
+meta-ify buffers by default), load_state_dict(..., strict=False,
+assign=True) puts the parameters on accelerator.device, and there is NO
+module .to() afterwards — the buffer stays CPU forever. Fix contract:
+the wrapper sanitizes the loaders it wraps — after the original returns,
+ref = next(model.parameters()).device, and every submodule buffer that
+is not None, not is_meta and sits on a different device is
+re-materialized with buf.to(ref) into m._buffers; matching buffers are
+left as the SAME objects. Pins:
+  P5  clip_l sanitizer — the cpu position_ids buffers at the ROOT and in
+      a nested CHILD module (the real defect lives in the HF
+      position_embedding submodule) must land on the parameter device
+      ("cuda:0") through the wrapped load_clip_l — pins the modules()
+      walk, not just a root _buffers poke;
+  P5b t5xxl sanitizer — same through the wrapped load_t5xxl;
+  P6  matching-buffer polarity — buffers already on the parameter device
+      (root AND nested child) must NOT be re-materialized (object
+      identity preserved; the fake
+      tags every .to(), so a rewrite-everything sanitizer flips the tag).
+
 Sandbox-safe and torch-free BY DESIGN: a FAKE tool module (written to a
 tmp dir by the tests) mirrors exactly the upstream surface the wrapper
 touches — including the store_true/default=False spelling of
@@ -261,6 +290,124 @@ def cache_to_disk(args):
 '''
 
 
+# P5/P5b/P6 fake — loader-device stand-in for the train-1792329792 split:
+# flux_utils exposes load_clip_l/load_t5xxl with the REAL signature
+# (path, dtype, device, disable_mmap kwarg); each returns a FakeModel whose
+# PARAMETERS sit on the loader's device (assign=True semantics) while the
+# non-persistent position_ids BUFFER lands on FAKE_BUFFER_DEVICE ("cpu" by
+# default — init_empty_weights leaves buffers on CPU; P6 sets "cuda:0" to
+# model the already-matching case) — at the ROOT and in a nested CHILD
+# module (the real defect class: the HF position_embedding submodule holds
+# position_ids), so the sanitizer's modules() walk is pinned, not just a
+# root _buffers poke. FakeTensor.to() returns a NEW object
+# with a ".moved" tag: the marker record's tag distinguishes "sanitizer
+# skipped a matching buffer" (tag stays "orig", same object) from
+# "sanitizer re-materialized it" (tag ".moved"). cache_to_disk performs the
+# real flux-branch call shape (module-attribute access, :134/:138) and
+# records loader/param_device/buffer_device/buffer_tag per loader.
+_FAKE_TOOL_LOADER_DEVICE_SRC = '''"""Fake tool exercising the flux_utils loader call sites (:134/:138)."""
+import argparse
+import json
+import os
+from types import SimpleNamespace
+
+MARKER = os.environ["FAKE_TOOL_MARKER"]
+BUFFER_DEVICE = os.environ.get("FAKE_BUFFER_DEVICE", "cpu")
+
+
+class FakeTensor:
+    def __init__(self, device, tag="orig"):
+        self.device = device
+        self.tag = tag
+        self.is_meta = False
+
+    def to(self, device):
+        return FakeTensor(device, tag=self.tag + ".moved")
+
+
+class FakeModule:
+    """Nested submodule with its OWN non-persistent buffer — the
+    train-1792329792 defect class lives in a SUBMODULE (the HF
+    position_embedding holds position_ids), so the sanitizer's modules()
+    walk is discriminatively pinned: a root-only variant leaves THIS
+    buffer on cpu and fails P5/P5b."""
+
+    def __init__(self, buffer_device):
+        self._buffers = {"position_ids": FakeTensor(buffer_device)}
+
+    def modules(self):
+        return [self]
+
+
+class FakeModel:
+    def __init__(self, param_device, buffer_device):
+        self._params = [FakeTensor(param_device, tag="param")]
+        self._buffers = {"position_ids": FakeTensor(buffer_device)}
+        self.child = FakeModule(buffer_device)
+
+    def parameters(self):
+        return iter(self._params)
+
+    def modules(self):
+        return [self, self.child]
+
+    def named_modules(self):
+        return [("", self), ("child", self.child)]
+
+    def children(self):
+        return [self.child]
+
+    def buffers(self):
+        return iter(list(self._buffers.values()) + list(self.child._buffers.values()))
+
+
+def setup_parser():
+    parser = argparse.ArgumentParser(prog="fake_cache_text_encoder_outputs")
+    parser.add_argument("--flux", action="store_true")
+    parser.add_argument("--weighted_captions", action="store_true", default=False)
+    parser.add_argument("--dataset_config", type=str, default=None)
+    parser.add_argument("--clip_l", type=str, default=None)
+    parser.add_argument("--t5xxl", type=str, default=None)
+    return parser
+
+
+def _read_config_from_file(args, parser):
+    return args
+
+
+args_util = SimpleNamespace(read_config_from_file=_read_config_from_file)
+
+
+def _load_clip_l(path, dtype, device, disable_mmap=None):
+    return FakeModel(device, BUFFER_DEVICE)
+
+
+def _load_t5xxl(path, dtype, device, disable_mmap=None):
+    return FakeModel(device, BUFFER_DEVICE)
+
+
+flux_utils = SimpleNamespace(load_clip_l=_load_clip_l, load_t5xxl=_load_t5xxl)
+
+
+def cache_to_disk(args):
+    # real call shape: module-attribute access + disable_mmap kwarg
+    clip = flux_utils.load_clip_l(args.clip_l, None, "cuda:0", disable_mmap=False)
+    t5 = flux_utils.load_t5xxl(args.t5xxl, None, "cuda:0", disable_mmap=False)
+    with open(MARKER, "a", encoding="utf-8") as fh:
+        for name, model in (("clip_l", clip), ("t5xxl", t5)):
+            buf = model._buffers["position_ids"]
+            child_buf = model.child._buffers["position_ids"]
+            fh.write(json.dumps({
+                "loader": name,
+                "param_device": next(model.parameters()).device,
+                "buffer_device": buf.device,
+                "buffer_tag": buf.tag,
+                "child_buffer_device": child_buf.device,
+                "child_buffer_tag": child_buf.tag,
+            }) + "\\n")
+'''
+
+
 def _make_fixture(root: Path, src: str = _FAKE_TOOL_SRC) -> tuple[Path, Path]:
     tool = root / "fake_cache_text_encoder_outputs.py"
     tool.write_text(src, encoding="utf-8")
@@ -273,6 +420,7 @@ def _run_wrapper(
     flags: list[str],
     *,
     raise_: bool = False,
+    env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run the wrapper in a fresh interpreter with a minimal, controlled
     env (no inherited state; the marker path is the fake tool's only
@@ -281,6 +429,8 @@ def _run_wrapper(
     env["FAKE_TOOL_MARKER"] = str(marker)
     if raise_:
         env["FAKE_TOOL_RAISE"] = "1"
+    if env_extra:
+        env.update(env_extra)
     argv = [sys.executable, str(WRAPPER)]
     if tool is not None:
         argv += [str(tool), *flags]
@@ -488,6 +638,151 @@ def test_wrapper_preserves_existing_flux_check_attribute():
             "the existing check must be called directly, never routed "
             f"through an adapter onto analyze_checkpoint_state; got: {rec}"
         )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_wrapper_sanitizes_clip_l_cpu_buffer_onto_param_device():
+    # P5 (train-1792323801 adapter worked; train-1792329792 is the NEXT
+    # landmine — landed RED-first against the pre-wrap tree; PERMANENT
+    # guard for the loader wrap): the cache pass now reaches the first
+    # CLIP forward and dies
+    # with "Expected all tensors to be on the same device, but got index
+    # is on cpu, different from other tensors on cuda:0"
+    # (strategy_flux.py:71 -> clip_text_model.py:53 -> HF
+    # position_embedding). Mechanism (@690ea7f9):
+    # tools/cache_text_encoder_outputs.py:134 calls
+    # flux_utils.load_clip_l(args.clip_l, weight_dtype, accelerator.device)
+    # via MODULE-ATTRIBUTE access; inside, `with init_empty_weights():`
+    # leaves the non-persistent position_ids buffer on CPU
+    # (init_empty_weights does not meta-ify buffers by default),
+    # load_state_dict(..., assign=True) puts the parameters on
+    # accelerator.device, and NO module .to() follows — the buffer stays
+    # CPU forever. Fix contract: the wrapper sanitizes the wrapped
+    # load_clip_l — after the original returns, ref =
+    # next(model.parameters()).device; every submodule buffer that is not
+    # None, not is_meta and sits on a different device is re-materialized
+    # with buf.to(ref) into m._buffers. Fake: load_clip_l returns a model
+    # with cuda:0 params and a cpu position_ids buffer at the ROOT and in
+    # a nested CHILD module (the real defect lives in the HF
+    # position_embedding SUBMODULE, so the modules() walk is pinned, not
+    # just a root _buffers poke); cache_to_disk performs the real call
+    # shape and records both buffers. Red signature if the wrap is ever
+    # removed: buffers stay "cpu" (root and child alike). The root-buffer
+    # assertion pins the mismatch re-materialization; the child-buffer
+    # assertion pins the submodule walk.
+    root = Path(tempfile.mkdtemp(prefix="cache-pass-wrapper-"))
+    try:
+        tool, marker = _make_fixture(root, src=_FAKE_TOOL_LOADER_DEVICE_SRC)
+        result = _run_wrapper(
+            tool, marker,
+            ["--flux", "--clip_l", "clip_l.safetensors", "--t5xxl", "t5xxl.safetensors"],
+        )
+        assert result.returncode == 0, (
+            "the loader call sites must run through the wrapper; "
+            f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        records = {rec["loader"]: rec for rec in _marker_records(marker)}
+        assert set(records) == {"clip_l", "t5xxl"}, records
+        clip = records["clip_l"]
+        assert clip["param_device"] == "cuda:0", clip
+        assert clip["buffer_device"] == "cuda:0", (
+            "the sanitizer must re-materialize the mismatched position_ids "
+            "buffer onto the parameter device (train-1792329792: a CPU "
+            "buffer against cuda:0 params crashes the first CLIP forward "
+            "at the HF position-embedding lookup); got: "
+            f"{clip}\nthis is the pin's red signature if the load_clip_l "
+            "wrap is ever removed."
+        )
+        assert clip["child_buffer_device"] == "cuda:0", (
+            "the sanitizer must WALK SUBMODULES (model.modules()) — the "
+            "real position_ids lives in the nested HF position_embedding, "
+            "so a root-only sanitizer variant leaves the child buffer on "
+            f"cpu and the prod crash survives; got: {clip}"
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_wrapper_sanitizes_t5xxl_cpu_buffer_onto_param_device():
+    # P5b: the same sanitizer contract on the SECOND loader —
+    # tools/cache_text_encoder_outputs.py:138 calls
+    # flux_utils.load_t5xxl(args.t5xxl, None, accelerator.device) and the
+    # T5 position_ids buffer splits exactly like CLIP's (assign=True
+    # params on cuda:0, init_empty_weights CPU buffer, no post-.to()).
+    # Landed RED-first against the pre-wrap tree; PERMANENT guard — its
+    # red signature if the load_t5xxl wrap is ever removed is both
+    # buffers (root and nested child) staying "cpu".
+    root = Path(tempfile.mkdtemp(prefix="cache-pass-wrapper-"))
+    try:
+        tool, marker = _make_fixture(root, src=_FAKE_TOOL_LOADER_DEVICE_SRC)
+        result = _run_wrapper(
+            tool, marker,
+            ["--flux", "--clip_l", "clip_l.safetensors", "--t5xxl", "t5xxl.safetensors"],
+        )
+        assert result.returncode == 0, (
+            f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        records = {rec["loader"]: rec for rec in _marker_records(marker)}
+        assert set(records) == {"clip_l", "t5xxl"}, records
+        t5 = records["t5xxl"]
+        assert t5["param_device"] == "cuda:0", t5
+        assert t5["buffer_device"] == "cuda:0", (
+            "the sanitizer must re-materialize the mismatched T5 position_ids "
+            "buffer onto the parameter device too (load_t5xxl is wrapped "
+            f"under the same contract as load_clip_l); got: {t5}\n"
+            "this is the pin's red signature if the load_t5xxl wrap is "
+            "ever removed."
+        )
+        assert t5["child_buffer_device"] == "cuda:0", (
+            "the T5 sanitizer must WALK SUBMODULES too — a root-only "
+            "variant leaves the nested child buffer on cpu; got: "
+            f"{t5}"
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_wrapper_leaves_matching_buffers_untouched():
+    # P6 (polarity guard for the sanitizer): only MISMATCHED, non-meta
+    # buffers may be re-materialized; a buffer already on the parameter
+    # device must survive as the SAME object — at the ROOT and in the
+    # nested CHILD module. The fake tags every .to() materialization
+    # ".moved", so a rewrite-everything sanitizer (unconditional
+    # buf.to(ref)) flips the tag even though the device already matches —
+    # that is this pin's bite. The sanitizer landed WITH the mismatch
+    # guard, so this is the PERMANENT polarity guard against the
+    # rewrite-everything regression (it was green-by-construction against
+    # the pre-wrap tree, disclosed the way P4 was, and landed alongside
+    # P5/P5b as the no-touch half of the trio).
+    root = Path(tempfile.mkdtemp(prefix="cache-pass-wrapper-"))
+    try:
+        tool, marker = _make_fixture(root, src=_FAKE_TOOL_LOADER_DEVICE_SRC)
+        result = _run_wrapper(
+            tool, marker,
+            ["--flux", "--clip_l", "clip_l.safetensors", "--t5xxl", "t5xxl.safetensors"],
+            env_extra={"FAKE_BUFFER_DEVICE": "cuda:0"},
+        )
+        assert result.returncode == 0, (
+            f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        records = {rec["loader"]: rec for rec in _marker_records(marker)}
+        assert set(records) == {"clip_l", "t5xxl"}, records
+        for name in ("clip_l", "t5xxl"):
+            rec = records[name]
+            assert rec["buffer_device"] == "cuda:0", rec
+            assert rec["buffer_tag"] == "orig", (
+                f"{name}: a buffer already on the param device must be left "
+                "alone — object identity preserved (a re-materialized "
+                f"buffer carries the '.moved' tag); got: {rec}"
+            )
+            assert rec["child_buffer_device"] == "cuda:0", rec
+            assert rec["child_buffer_tag"] == "orig", (
+                f"{name}: the MATCHING nested-submodule buffer must be left "
+                "alone too — walking submodules must not turn into "
+                "rewriting everything; got: "
+                f"{rec}"
+            )
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

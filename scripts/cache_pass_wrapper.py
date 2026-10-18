@@ -25,7 +25,8 @@ WHAT IT DOES: replicates the tool's __main__ flow —
 — with the weighted_captions insertion between read_config_from_file and
 cache_to_disk (`args.weighted_captions = None`, the only FLUX-passable
 value for the :62 assert — the FIRST upstream defect) plus the compat
-patch for the SECOND upstream defect documented below. Downstream
+patch for the SECOND upstream defect and the loader wraps for the THIRD
+upstream defect, both documented below. Downstream
 is_weighted consumers are truthiness-only checks (strategy_sdxl.py:270,
 strategy_lumina.py:241 @690ea7f9), so None is safe.
 
@@ -45,6 +46,25 @@ module object; the [:3] slice restores the old 3-tuple contract, so
 is_schnell stays at index 1). ONLY-IF-MISSING: an existing attribute is
 never overridden — if upstream someday fixes the rename, the tool's own
 implementation must win.
+
+THIRD upstream defect (prod train-1792329792 — the rename adapter let the
+cache pass reach the NEXT landmine, the first CLIP forward): the tool loads
+the text encoders via `flux_utils.load_clip_l(...)`/`load_t5xxl(...)`
+(module-attribute calls, tools/cache_text_encoder_outputs.py:134/:138);
+library/flux_utils @690ea7f9 builds both models under `init_empty_weights()`
+(:345/:400), which does NOT meta-ify non-persistent buffers — position_ids
+is created on CPU — then `load_state_dict(..., assign=True)` (:353/:408)
+places the PARAMETERS on accelerator.device, and no module `.to()` follows:
+the CPU buffer survives into the forward pass and dies on a device mismatch.
+The wrapper therefore sanitizes at load time: it wraps the tool's
+flux_utils load_clip_l/load_t5xxl attributes (when present) so every
+returned model gets its mismatched non-meta buffers re-materialized onto
+the parameter device (`ref = next(model.parameters()).device`;
+`m._buffers[name] = buf.to(ref)`). ALWAYS-ACTIVE-WHEN-PRESENT (unlike the
+only-if-missing defect-#2 adapter): it is a wrap of an existing function
+and a harmless no-op if upstream ever fixes the buffer placement (buffers
+already on the parameter device are left untouched — the _buffers entry is
+not rewritten).
 
 USAGE:
     python3 cache_pass_wrapper.py TOOL_PATH [TOOL_FLAGS...]
@@ -86,6 +106,31 @@ _USAGE = (
     "unreachable from CLI/TOML otherwise; train-1792313236) and calls "
     "cache_to_disk(args)."
 )
+
+
+def _sanitize_module_buffers(model):
+    """Defect-#3 contract (train-1792329792): re-materialize every
+    non-meta buffer that sits off the parameter device onto that device.
+    Matching buffers are left untouched (the _buffers entry is NOT
+    rewritten), so an already-correct model is a strict no-op (P6)."""
+    ref = next(model.parameters()).device
+    for m in model.modules():
+        for name, buf in list(m._buffers.items()):
+            if buf is not None and not buf.is_meta and buf.device != ref:
+                m._buffers[name] = buf.to(ref)
+
+
+def _wrap_loader_with_buffer_sanitize(orig):
+    """Defect-#3 wrap (train-1792329792): call the original flux_utils
+    loader, then sanitize the returned model's buffers onto the parameter
+    device before the tool ever sees it."""
+
+    def _wrapped_loader(*args, **kwargs):
+        model = orig(*args, **kwargs)
+        _sanitize_module_buffers(model)
+        return model
+
+    return _wrapped_loader
 
 
 def main(argv):
@@ -136,6 +181,26 @@ def main(argv):
             return fu.analyze_checkpoint_state(path)[:3]
 
         fu.check_flux_state_dict_diffusers_schnell = _check_flux_state_dict_diffusers_schnell
+
+    # THIRD upstream defect wrap (prod train-1792329792): the tool loads
+    # the text encoders via `flux_utils.load_clip_l(...)`/`load_t5xxl(...)`
+    # — module-attribute calls (tools/cache_text_encoder_outputs.py:134/
+    # :138) — and library/flux_utils @690ea7f9 builds those models under
+    # init_empty_weights() (:345/:400), which does NOT meta-ify non-
+    # persistent buffers (position_ids is created on CPU), then
+    # load_state_dict(..., assign=True) (:353/:408) puts only the
+    # PARAMETERS on accelerator.device; no module `.to()` follows, so the
+    # CPU buffer survives into the first CLIP forward and dies on a device
+    # mismatch. Wrap both loaders when present — ALWAYS-ACTIVE (a wrap of
+    # an existing function, NOT only-if-missing like defect #2): returned
+    # models get their mismatched non-meta buffers re-materialized onto
+    # the parameter device; already-matching buffers are left untouched
+    # (harmless no-op if upstream ever fixes the placement, P6).
+    if fu is not None:
+        if hasattr(fu, "load_clip_l"):
+            fu.load_clip_l = _wrap_loader_with_buffer_sanitize(fu.load_clip_l)
+        if hasattr(fu, "load_t5xxl"):
+            fu.load_t5xxl = _wrap_loader_with_buffer_sanitize(fu.load_t5xxl)
 
     # Exact replication of the upstream __main__ block (tool @690ea7f9
     # lines 226-229): setup_parser -> parse_args -> read_config_from_file.
