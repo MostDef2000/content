@@ -504,9 +504,14 @@ def _lora_arch(path: Path) -> str | None:
     """Detect LoRA architecture from safetensors header tensor keys.
 
     ai-toolkit names: SDXL deltas carry "unet" (lora_unet_*), FLUX carry
-    "transformer" (lora_transformer_*). Returns "sdxl" | "flux", or None
-    when the file is missing/truncated/corrupt/ambiguous (fail-open: the
-    caller keeps current behaviour instead of a false 400).
+    "transformer" (lora_transformer_*). kohya (sd-scripts) FLUX LoRAs —
+    the W3 trainer, prod candidates-1792384501 — name tensors
+    lora_unet_double_blocks_*/single_blocks_*/img_mod_lin (also
+    txt_mod_lin variants), so the word "unet" alone is NOT an sdxl
+    discriminator: the FLUX-specific tokens are checked FIRST, and only
+    if none match does "unet" mean ai-toolkit SDXL. Returns "sdxl" |
+    "flux", or None when the file is missing/truncated/corrupt/ambiguous
+    (fail-open: the caller keeps current behaviour instead of a false 400).
     """
     try:
         with open(path, "rb") as fh:
@@ -526,6 +531,21 @@ def _lora_arch(path: Path) -> str | None:
         return None
     if not isinstance(parsed, dict):
         return None
+    # FLUX-specific discriminators FIRST (prod candidates-1792384501): the
+    # kohya (sd-scripts) W3 trainer names FLUX tensors
+    # lora_unet_double_blocks_*/lora_unet_single_blocks_* (also
+    # img_mod_lin/txt_mod_lin variants) — the word "unet" is present in
+    # kohya FLUX keys too, so it must not win the classification.
+    if any(
+        "double_blocks" in key
+        or "single_blocks" in key
+        or "img_mod_lin" in key
+        or "txt_mod_lin" in key
+        for key in parsed
+    ):
+        return "flux"
+    # ai-toolkit naming (unchanged): SDXL deltas carry "unet", FLUX carry
+    # "transformer" — reached only when NO kohya FLUX token matched.
     if any("unet" in key for key in parsed):
         return "sdxl"
     if any("transformer" in key for key in parsed):

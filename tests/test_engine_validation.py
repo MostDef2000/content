@@ -554,6 +554,75 @@ def test_lora_arch_detection():
         _reset_lora_stub()
 
 
+def test_lora_arch_kohya_flux_naming_is_flux():
+    # prod candidates-1792384501 (W3 acceptance): the FIRST LoRA trained
+    # by kohya sd-scripts (spec 010 W3 trainer) produced a valid
+    # FLUX+LoRA image (rc=0 — a REAL FLUX LoRA), yet manager _lora_arch
+    # (main.py:503) reported "sdxl" for it, and /api/jobs/group +
+    # /api/jobs/post (engine=flux) now reject the freshly trained LoRA
+    # with «LoRA — SDXL (Pony) архитектура» (/api/jobs/candidates is
+    # unaffected — no sniff). Mechanism: the sniffer was written for
+    # ai-toolkit naming (SDXL "lora_unet_*", FLUX "lora_transformer_*")
+    # and checks any("unet" in key) FIRST — while kohya (sd-scripts)
+    # names FLUX tensors lora_unet_double_blocks_*/lora_unet_single_
+    # blocks_* (the word "unet" is present in FLUX keys too). Fix
+    # direction (code worker): FLUX-specific discriminators FIRST —
+    # kohya FLUX keys contain "double_blocks"/"single_blocks" (also
+    # img_mod_lin/txt_mod_lin variants for other trainers); only if none
+    # match, fall back to "unet"→sdxl / "transformer"→flux; else None
+    # (fail-open unchanged). Landed RED-first against the pre-fix sniffer
+    # (base ce26d5e): the kohya keys hit any("unet" in key) → "sdxl" —
+    # the exact prod misclassification. PERMANENT guard: red signature
+    # (assert 'sdxl' == 'flux') if the FLUX-token-first order is reverted.
+    try:
+        _write_flux_stub(["lora_unet_double_blocks_0_img_mod_lin.lora_down.weight"])
+        assert main._lora_arch(main.LORAS_DIR / _FLUX_LORA) == "flux", (
+            "kohya (sd-scripts) FLUX LoRA keys carry BOTH 'unet' and "
+            "'double_blocks' — the FLUX discriminator must win over the "
+            "ai-toolkit 'unet' heuristic (prod candidates-1792384501 "
+            "misclassified the freshly trained LoRA as sdxl)"
+        )
+        _write_flux_stub(["lora_unet_single_blocks_19_modulation_lin.lora_down.weight"])
+        assert main._lora_arch(main.LORAS_DIR / _FLUX_LORA) == "flux", (
+            "the kohya single_blocks key must classify as flux too"
+        )
+        _write_flux_stub([
+            "lora_unet_double_blocks_0_img_mod_lin.lora_down.weight",
+            "lora_unet_single_blocks_19_modulation_lin.lora_down.weight",
+            "lora_unet_txt_norm.weight",
+        ])
+        assert main._lora_arch(main.LORAS_DIR / _FLUX_LORA) == "flux", (
+            "a full kohya FLUX header must classify as flux"
+        )
+    finally:
+        _remove_flux_stub()
+
+
+def test_lora_arch_ai_toolkit_mapping_and_failopen_unchanged():
+    # Sibling guard for the fix reorder — GREEN today (it mirrors the
+    # landed ai-toolkit behavior), its bite is against the fix: putting
+    # the kohya FLUX discriminators first must NOT break the existing
+    # mappings. ai-toolkit SDXL keys (no double_blocks/single_blocks)
+    # stay "sdxl"; lora_transformer_* stays "flux"; an absent FLUX-slot
+    # file stays None (fail-open: callers keep current behavior instead
+    # of a false 400).
+    try:
+        _write_flux_stub(["lora_unet_down_blocks_0_attentions_0_to_k.lora_down.weight"])
+        assert main._lora_arch(main.LORAS_DIR / _FLUX_LORA) == "sdxl", (
+            "ai-toolkit SDXL naming must keep classifying sdxl after the "
+            "kohya-FLUX discriminator lands"
+        )
+        _write_flux_stub(["lora_transformer_blocks_0_attn.to_k.lora_down.weight"])
+        assert main._lora_arch(main.LORAS_DIR / _FLUX_LORA) == "flux", (
+            "ai-toolkit FLUX naming must keep classifying flux"
+        )
+    finally:
+        _remove_flux_stub()
+    assert main._lora_arch(main.LORAS_DIR / _FLUX_LORA) is None, (
+        "absent FLUX-slot file -> None (fail-open unchanged)"
+    )
+
+
 def test_active_model_summary_engine():
     # Dual-arch: "engine" reports which LoRA slot is deployed on disk — sdxl
     # whenever the sdxl-slot file exists (even if its header sniffs another
