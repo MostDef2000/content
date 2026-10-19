@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import random
@@ -435,10 +436,47 @@ def _safe_post_name(value: str) -> str:
     return _safe_name(raw)  # dot/hidden names → 400 as well
 
 
+def _move_to_trash(src: Path, dst: Path) -> None:
+    """Move src to its trash destination dst (shared by delete_model,
+    wipe_model_dataset, delete_model_post and delete_model_dataset_image).
+    Prod topology
+    (train-1792396861): /workspace/models and /workspace/runtime live on
+    DIFFERENT mounts, and os.replace is atomic only on the SAME filesystem —
+    cross-device moves die with EXDEV (Errno 18), reproduced live. Two
+    validator-required guards:
+
+      * EXDEV-ONLY fallback (validator condition): the shutil.move
+        copy+delete fallback runs ONLY when exc.errno == errno.EXDEV —
+        any other OSError (permissions, I/O, ...) is re-raised as-is to
+        the per-site 500 wrappers, so an operator-visible failure can
+        never be masked by a silently-succeeding fallback;
+      * existing-dst rejection (validator requirement): a pre-existing
+        destination raises FileExistsError(EEXIST) — shutil.move would
+        otherwise silently NEST the source into an existing directory.
+        delete_model's timestamped dst has no "-2"/"-3" collision
+        suffixing; the suffix loops in delete_model_post /
+        wipe_model_dataset prevent collisions upstream, and this explicit
+        check closes the hole at helper level for every caller (the move
+        becomes loud — a 500 — instead of nested).
+
+    The per-site `except OSError -> HTTPException(500)` wrappers then fire
+    when the fast path fails with a non-EXDEV error OR when both
+    mechanisms fail. No API/behavior change otherwise."""
+    if os.path.exists(dst):
+        raise FileExistsError(errno.EEXIST, f"trash destination already exists: {dst}")
+    try:
+        os.replace(src, dst)  # atomic same-fs fast path
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise  # not a cross-device condition — surface it, do not fall back
+        shutil.move(str(src), str(dst))  # EXDEV fallback (copy+delete)
+
+
 def delete_model_post(workspace: Path, model_id: str, name: str, kind: str) -> str:
     """Soft-delete one post folder: models/<id>/<kind_dir>/<name>/ →
-    runtime/trash/posts/<kind>-<name>-<unixts>/ (atomic os.replace, parents
-    created, "-2"/"-3" suffix on collision). kind "public" → "posts",
+    runtime/trash/posts/<kind>-<name>-<unixts>/ (_move_to_trash: os.replace
+    fast path, shutil.move cross-device fallback; parents created, "-2"/"-3"
+    suffix on collision). kind "public" → "posts",
     "private" → "posts-private". Raises HTTPException(422) for an invalid
     kind, HTTPException(400) for an unsafe/traversal name and
     HTTPException(404) when the post folder is missing. Returns the name."""
@@ -458,7 +496,7 @@ def delete_model_post(workspace: Path, model_id: str, name: str, kind: str) -> s
         trash_path = trash_dir / f"{base_name}-{attempt}"
         attempt += 1
     try:
-        os.replace(post_dir, trash_path)  # atomic same-filesystem move (soft delete)
+        _move_to_trash(post_dir, trash_path)
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"could not move post to trash: {exc}")
     return name
@@ -815,7 +853,7 @@ async def delete_model(model_id: str, confirm: str = "") -> dict[str, Any]:
         TRASH_DIR.mkdir(parents=True, exist_ok=True)
         trash_path = TRASH_DIR / f"{model_id}-{int(time.time())}"
         try:
-            os.replace(model_dir, trash_path)  # atomic same-filesystem move (soft delete)
+            _move_to_trash(model_dir, trash_path)
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"could not move model to trash: {exc}")
     reg["models"] = [m for m in reg.get("models", []) if str(m.get("id")) != model_id]
@@ -1115,8 +1153,9 @@ async def upload_model_dataset(
 @app.delete("/api/models/{model_id}/dataset")
 async def wipe_model_dataset(model_id: str, confirm: str = "") -> dict[str, Any]:
     """Bulk soft-delete (feature 006): move the whole dataset images/ dir into
-    runtime/trash/dataset/<model_id>-wipe-<ts>/ (atomic os.replace, manifest
-    copied along) and reset to an empty manifest. Registered before the
+    runtime/trash/dataset/<model_id>-wipe-<ts>/ (_move_to_trash: os.replace
+    fast path, shutil.move cross-device fallback; manifest copied along) and
+    reset to an empty manifest. Registered before the
     single-image delete route so both paths stay unambiguous."""
     async with _manifest_lock:
         _model_or_404(model_id)
@@ -1146,7 +1185,7 @@ async def wipe_model_dataset(model_id: str, confirm: str = "") -> dict[str, Any]
                 trash_dir = DATASET_TRASH / f"{base_name}-{attempt}"
                 attempt += 1
             try:
-                os.replace(image_dir, trash_dir)  # atomic same-filesystem move
+                _move_to_trash(image_dir, trash_dir)
             except OSError as exc:
                 raise HTTPException(status_code=500, detail=f"could not move dataset to trash: {exc}")
             manifest_path = _dataset_manifest_path(model_id)
@@ -1182,9 +1221,9 @@ async def delete_model_dataset_image(model_id: str, filename: str) -> dict[str, 
         trash_dir = DATASET_TRASH / f"{model_id}-{int(time.time())}"
         trash_dir.mkdir(parents=True, exist_ok=True)
         try:
-            os.replace(image_path, trash_dir / filename)
+            _move_to_trash(image_path, trash_dir / filename)
             if caption_path.is_file():
-                os.replace(caption_path, trash_dir / caption_path.name)
+                _move_to_trash(caption_path, trash_dir / caption_path.name)
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"could not move image to trash: {exc}")
         manifest = _load_manifest(model_id)
