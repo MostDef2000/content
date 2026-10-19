@@ -25,15 +25,16 @@ dispatch-воркфлоу (deploy lane A: подтверждение владе�
 
 ## Source authorization
 
-Полная видимая область работ (scope) предъявляется в сообщении ассистента;
-авторизация — точная фраза `commit approved` в **следующем** сообщении
-пользователя. Приём возобновляет только ту же самую принятую область и не
-создаёт новой. Серверные мутации выполняются не через source authorization:
-деплой, исполняемый GitHub deploy-workflow репозитория (dispatch по
-протоколу DEPLOY-TRIGGER после подтверждения владельца — lane A),
-handoff-цикла не требует; ручные серверные изменения вне воркфлоу (SSH:
-compose up руками, скачивание моделей, Caddy, фаервол) — только через
-SYSADMIN-HANDOFF.
+Общие правила допуска — в глобальном уставе `~/.config/opencode/AGENTS.md`
+(первоисточник: profiles/global/** в репо-мастерской ai-playground); фраза
+допуска — `commit approved`; она никогда не авторизует серверные мутации и
+деплои.
+
+Рутинные деплои кода — через GitHub deploy-workflow (dispatch по протоколу
+DEPLOY-TRIGGER после подтверждения владельца — lane A, см.
+`.github/workflows/deploy.yml`); всё остальное (bootstrap, миграции, секреты,
+nginx, фаервол, ручной SSH: compose up, скачивание моделей, Caddy) — только
+через SYSADMIN-HANDOFF.
 
 ## Hard rules
 
