@@ -1,9 +1,14 @@
 # Caddyfile for the Valery Model Manager UI
-# Deployed on the RU host (82.146.37.153) — ZeroTier member (10.123.239.101),
-# has a route to the GPU server. NL host is NOT used (not in ZeroTier).
-# Reverse-proxies to the GPU server over the ZeroTier private network.
+# Deployed on the lifesim host (135.106.195.18) — public edge for
+# 3d.mostdef.ru (TLS + basicauth, HTTP/2 + HSTS).
+# Reverse-proxies to the GPU server (10.123.239.102) over the ZeroTier
+# private network (path lifesim → GPU verified 2026-10-22). NL host is NOT used.
+# История: до инцидента 2026-10-17 фронт жил на РУ-хосте (82.146.37.153,
+# ZeroTier 10.123.239.101, nginx); РУ-хост уничтожен провайдером 2026-10-22 —
+# все РУ-упоминания в этом файле исторические.
 #
-# Домен: 3d.mostdef.ru — A-запись должна указывать на 82.146.37.153.
+# Домен: 3d.mostdef.ru — A-запись указывает на публичный IP lifesim
+# (135.106.195.18).
 #
 # Generate a basicauth hash:
 #   caddy hash-password 'your-strong-password'

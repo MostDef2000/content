@@ -4,14 +4,20 @@ Status: Active
 
 Проект: локальная генерация консистентной взрослой AI-модели (Valery) —
 ComfyUI + FLUX.1-dev FP8 + LoRA + веб-пульт (`manager`).
-GitHub: `MostDef2000/content` (private). Инфраструктура: GPU-сервер (ZeroTier
-`10.123.239.102`, за NAT) + РУ-хост (`82.146.37.153`, ZeroTier 10.123.239.101,
-nginx-фронт + домен `3d.mostdef.ru`; Caddy установлен, но отключён). NL-хост не
-используется. Серверные действия: рутинные деплои кода — через
-dispatch-воркфлоу (deploy lane A: подтверждение владельца в чате →
-`gh workflow run`, см. `.github/workflows/deploy.yml`); всё остальное (bootstrap,
-миграции, секреты, nginx, фаервол) — только через сисадмин-агента
-(`SYSADMIN-HANDOFF v1`, модель полос в AGENTS.md песочницы).
+GitHub: `MostDef2000/content` (private). Инфраструктура (пост-инцидентная
+топология, проверена пробами 2026-10-22): GPU-сервер (ZeroTier `10.123.239.102`,
+за NAT) + публичный край — Caddy на lifesim (`135.106.195.18`, домен
+`3d.mostdef.ru`, TLS + basicauth), upstream на GPU-manager по ZeroTier. Доступ
+к GPU-хосту — только через SSH-обёртку с lifesim (порт 22024, пользователь
+`seaspeedadmin`); прямой SSH на GPU запрещён; каталог `valery/` на GPU-хосте —
+don't-touch. РУ-хост (`82.146.37.153`, ZeroTier 10.123.239.101, nginx-фронт)
+уничтожен провайдером 2026-10-22 после инцидента 2026-10-17 — все РУ-упоминания
+исторические. NL-хост не используется. Серверные действия: рутинные деплои
+кода — через dispatch-воркфлоу (deploy lane A: подтверждение владельца в чате →
+`gh workflow run`, см. `.github/workflows/deploy.yml`; транспорт маршрута через
+РУ мёртв — перепайка на lifesim отдельная задача, `deploy.yml` не переписывался);
+всё остальное (bootstrap, миграции, секреты, Caddy, фаервол) — только через
+сисадмин-агента (`SYSADMIN-HANDOFF v1`, модель полос в AGENTS.md песочницы).
 
 ## Canonical entry points
 
@@ -32,9 +38,9 @@ dispatch-воркфлоу (deploy lane A: подтверждение владе�
 
 Рутинные деплои кода — через GitHub deploy-workflow (dispatch по протоколу
 DEPLOY-TRIGGER после подтверждения владельца — lane A, см.
-`.github/workflows/deploy.yml`); всё остальное (bootstrap, миграции, секреты,
-nginx, фаервол, ручной SSH: compose up, скачивание моделей, Caddy) — только
-через SYSADMIN-HANDOFF.
+`.github/workflows/deploy.yml`; транспорт через РУ мёртв, маршрут в перепайке);
+всё остальное (bootstrap, миграции, секреты, Caddy, фаервол, ручной SSH:
+compose up, скачивание моделей) — только через SYSADMIN-HANDOFF.
 
 ## Hard rules
 

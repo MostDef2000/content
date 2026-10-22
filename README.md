@@ -9,21 +9,21 @@
 ## Архитектура
 
 ```
-[Браузер] ──HTTPS+basicauth──> [РУ-ХОСТ: nginx (3d.mostdef.ru)] ──ZeroTier──> [GPU-ХОСТ: manager :8000]
+[Браузер] ──HTTPS+basicauth──> [LIFESIM: Caddy (3d.mostdef.ru, 135.106.195.18)] ──ZeroTier──> [GPU-ХОСТ: manager :8000]
                                                                                   │ docker.sock / compose
                                                                                   ▼
                                                                           ComfyUI :8188 (flux1-dev-fp8, kontext)
                                                                           ai-toolkit venv (обучение LoRA)
 ```
 
-- **GPU-сервер** (RTX 5070 12 ГБ, драйвер 595.91, CUDA 13.2, ZeroTier-адрес не публикуется): ComfyUI + `manager` (FastAPI) + ai-toolkit.
-- **РУ-хост** (публичный VPS, ZeroTier-адреса не публикуются): nginx vhost с TLS (Let's Encrypt) + `basicauth`, reverse-proxy на `GPU-ХОСТ:8000` по ZeroTier. Caddy установлен, но отключён (конфликт 80/443 с nginx) — `deploy/Caddyfile` хранится как референс.
-- Публично торчит только nginx. `8188` и `8000` закрыты фаерволом (8000 разрешён только с РУ-хоста по ZeroTier).
+- **GPU-сервер** (RTX 5070 12 ГБ, драйвер 595.91, CUDA 13.2, ZeroTier `10.123.239.102`, за NAT): ComfyUI + `manager` (FastAPI) + ai-toolkit.
+- **lifesim-хост** (публичный, `135.106.195.18`): Caddy vhost с TLS (Let's Encrypt, сертификат выпущен 2026-10-22, действует до 2027-01-20; HTTP/2 + HSTS) + `basicauth`, reverse-proxy на `GPU-ХОСТ:8000` по ZeroTier.
+- Публично торчит только Caddy на lifesim. `8188` и `8000` наружу закрыты (GPU за NAT; `8000` доступен только по ZeroTier — с lifesim).
 
 ## Требования
 
-- GPU-сервер: Docker + Compose v2, `nvidia-container-toolkit`, ZeroTier-доступен VPS.
-- РУ-хост: nginx (TLS + basicauth), домен `3d.mostdef.ru` с A-записью на публичный IP РУ-хоста.
+- GPU-сервер: Docker + Compose v2, `nvidia-container-toolkit`, ZeroTier-доступен lifesim.
+- lifesim-хост: Caddy (TLS + basicauth), домен `3d.mostdef.ru` с A-записью на публичный IP lifesim (`135.106.195.18`).
 - ~40 ГБ диска под веса+venv (data-том `/opt/sea-speed-worker`, 623 ГБ свободно).
 - Принять лицензию https://huggingface.co/black-forest-labs/FLUX.1-dev и токен https://huggingface.co/settings/tokens.
 
@@ -80,7 +80,7 @@ Per-model layout (фаза 1 редизайна — specs/002, specs/003):
 - `runtime/input`, `runtime/output` — монтируются в ComfyUI
 - `runtime/trash/` — удалённые модели (мягкое удаление, восстановимо)
 - `runtime/backup/` — бэкапы миграции
-- `deploy/Caddyfile` — референс конфига (живой фронт на РУ — nginx, см. AUDIT.md §10)
+- `deploy/Caddyfile` — референс конфига (живой фронт — Caddy на lifesim, см. AUDIT.md, аудит 2026-10-22)
 
 Разовая миграция со старого single-model layout (корневые `reference/`,
 `dataset/`, `posts/`): `python scripts/migrate_to_registry.py` — идемпотентна,
@@ -88,7 +88,7 @@ Per-model layout (фаза 1 редизайна — specs/002, specs/003):
 
 ## Безопасность
 
-- Только Caddy с `basicauth`+HTTPS снаружи; приложение не публикуется напрямую.
+- Только Caddy на lifesim с `basicauth`+HTTPS снаружи; приложение не публикуется напрямую.
 - `manager` монтирует `/var/run/docker.sock` — запускать от выделенного пользователя, не давать сокет никому кроме `manager`.
 - Никаких токенов/паролей в репозитории; `.env` в `.gitignore`.
 - Персонаж только взрослый вымышленный, без реальных людей и несовершеннолетних.
@@ -99,7 +99,7 @@ Per-model layout (фаза 1 редизайна — specs/002, specs/003):
 ```bash
 curl localhost:8188/system_stats     # ComfyUI
 curl localhost:8000/api/status        # manager
-# с РУ-хоста: curl -u user:pass https://3d.mostdef.ru/api/status
+curl https://3d.mostdef.ru/api/status # публично: без auth → 401, с auth → 200 (comfy_up: true)
 # прямой http://GPU_IP:8000 и :8188 из интернета — должны быть закрыты
 ```
 
@@ -111,12 +111,20 @@ docker compose down
 
 ## Deploy (GitHub Actions → GPU-бокс)
 
-Обновление работающего стека на GPU-сервере — dispatch-воркфлоу
-`.github/workflows/deploy.yml` по проверенному паттерну sea-speed
-(deploy-ubuntu-worker.yml). Транспорт: GitHub-hosted runner не видит ZeroTier,
-поэтому SSH с runner на РУ-хост (82.146.37.153) и дальше ProxyJump на GPU-бокс
-(ZeroTier 10.123.239.102). Хост-ключи закреплены (pinned) в repo variables,
-`ssh-keyscan` не используется.
+> ⚠️ **DEPLOY ROUTE STALE — requires re-wiring to lifesim (separate task, pending).**
+> Транспорт текущего `.github/workflows/deploy.yml` — SSH с runner на РУ-хост
+> (82.146.37.153) и дальше ProxyJump на GPU-бокс (ZeroTier 10.123.239.102) —
+> мёртв вместе с РУ-хостом: инцидент 2026-10-17, хост уничтожен провайдером
+> 2026-10-22. До перепайки dispatch-деплой не работает; `deploy.yml` намеренно
+> не переписывался. Описание воркфлоу ниже сохранено как исторический референс
+> для задачи перепайки.
+
+Историческое описание (транспорт через РУ): обновление работающего стека на
+GPU-сервере — dispatch-воркфлоу `.github/workflows/deploy.yml` по проверенному
+паттерну sea-speed (deploy-ubuntu-worker.yml). Транспорт: GitHub-hosted runner
+не видит ZeroTier, поэтому SSH с runner на РУ-хост и дальше ProxyJump на
+GPU-бокс. Хост-ключи закреплены (pinned) в repo variables, `ssh-keyscan` не
+используется.
 
 Поток:
 
