@@ -36,20 +36,18 @@ services:
     environment:
       COMFY_URL: http://comfyui:8188
       WORKSPACE: /workspace
-    # Issue #16: runtime- и per-model данные gitignored — свежий клон lane-A
-    # (/opt/content) их не содержит, менеджер «слеп» к рабочим данным; биндим
-    # каталоги сервера напрямую. Per-model маунты — временно, до #17 (DATA_ROOT).
-    # До #17 операционные запреты (см. issue #16, комментарий 6206133465):
-    # новые модели НЕ создавать (данные уйдут в эфемерный чекаут), удаление
-    # моделей не выполнять (os.replace в trash = кросс-fs EXDEV).
+      # Issue #17: per-model DATA (reference/dataset/posts/posts-private/
+      # lora-output) and the runtime tree (jobs/loras/trash/output/input)
+      # resolve under VALERY_DATA_ROOT; WORKSPACE stays the tracked checkout.
+      VALERY_DATA_ROOT: /data
     volumes:
       - .:/workspace
-      - /opt/sea-speed-worker/valery/runtime:/workspace/runtime
-      - /opt/sea-speed-worker/valery/models/valery23/dataset:/workspace/models/valery23/dataset
-      - /opt/sea-speed-worker/valery/models/valery23/posts:/workspace/models/valery23/posts
-      - /opt/sea-speed-worker/valery/models/valery23/posts-private:/workspace/models/valery23/posts-private
-      - /opt/sea-speed-worker/valery/models/valery23/reference:/workspace/models/valery23/reference
-      - /opt/sea-speed-worker/valery/models/valery23/lora/output:/workspace/models/valery23/lora/output
+      # Data volume: /data maps 1:1 onto the prod valery tree
+      # (/opt/sea-speed-worker/valery/{models/<model_id>,runtime}), plus the
+      # per-model mounts of #16 are gone. The ai-toolkit bind below stays:
+      # train_lora.sh reads the toolkit via its checkout path
+      # (TOOLKIT=${ROOT}/ai-toolkit = /workspace/ai-toolkit), not DATA_ROOT.
+      - /opt/sea-speed-worker/valery:/data
       - /opt/sea-speed-worker/valery/ai-toolkit:/workspace/ai-toolkit
       - /opt/sea-speed-worker/valery/kohya:/workspace/kohya
       - /var/run/docker.sock:/var/run/docker.sock

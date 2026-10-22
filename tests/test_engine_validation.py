@@ -78,15 +78,20 @@ finally:
 # In a shared pytest process management.main's module-level paths freeze at
 # first import (first file's temp WORKSPACE). Re-point them at THIS file's
 # temp WORKSPACE before the seeds below and re-bind per module at run time.
+# Issue #17 two-root model: per-model DATA (and the runtime tree) live under
+# DATA_ROOT; registry/library and the per-model configs stay in the checkout
+# (WORKSPACE/models/).
 def _bind_paths() -> None:
     ws = Path(_TMP_WORKSPACE.name)
+    data = ws / "data"  # distinct VALERY_DATA_ROOT inside the same temp tree
     main.WORKSPACE = ws
-    main.JOBS_DIR = ws / "runtime" / "jobs"
-    main.MODELS_DIR = ws / "models"
+    main.DATA_ROOT = data
+    main.REPO_MODELS_DIR = ws / "models"
+    main.JOBS_DIR = data / "runtime" / "jobs"
     main.REGISTRY_PATH = ws / "models" / "registry.json"
     main.LIBRARY_PATH = ws / "models" / "library.json"
-    main.LORAS_DIR = ws / "runtime" / "models" / "loras"
-    main.TRASH_DIR = ws / "runtime" / "trash"
+    main.LORAS_DIR = data / "runtime" / "models" / "loras"
+    main.TRASH_DIR = data / "runtime" / "trash"
     main.DATASET_TRASH = main.TRASH_DIR / "dataset"
 
 
@@ -137,16 +142,19 @@ main.REGISTRY_PATH.write_text(
 )
 main.LORAS_DIR.mkdir(parents=True, exist_ok=True)
 (main.LORAS_DIR / f"{MODEL_ID}.safetensors").write_bytes(b"")  # empty stub: existence is what matters
-_MODEL_DIR = main.MODELS_DIR / MODEL_ID
-_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-(_MODEL_DIR / "character.json").write_text(
+# Tracked configs live in the checkout (WORKSPACE/models/<id>); the data
+# side of this model (posts/loras/etc.) is seeded per-test under main.DATA_ROOT.
+_MODEL_CONFIG_DIR = main._model_config_dir(MODEL_ID)
+_MODEL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+(_MODEL_CONFIG_DIR / "character.json").write_text(
     json.dumps({"name": "Valery", "age": 23, "appearance": {"face": "oval face", "build": "athletic"}}),
     encoding="utf-8",
 )
-(_MODEL_DIR / "prompt_profile.json").write_text(
+(_MODEL_CONFIG_DIR / "prompt_profile.json").write_text(
     json.dumps({"version": 1, "face": "oval face", "body": "athletic", "style": "", "negative": "", "scenes": {}}),
     encoding="utf-8",
 )
+_MODEL_DIR = main.DATA_ROOT / "models" / MODEL_ID  # per-model DATA (reference/posts/...)
 
 
 def _write_lora_stub(keys: list[str]) -> None:
@@ -927,6 +935,8 @@ def _run_generate_post(caption: str, name: str) -> dict:
 
     with tempfile.TemporaryDirectory(prefix="gw-post-") as tmp:
         root = Path(tmp) / "repo"
+        data = Path(tmp) / "data"  # VALERY_DATA_ROOT (#17): per-model posts + runtime loras
+        data.mkdir()
         out_root = Path(tmp) / "comfy-output"
         model_id = "pm1"
         (root / "models" / model_id).mkdir(parents=True)
@@ -949,7 +959,7 @@ def _run_generate_post(caption: str, name: str) -> dict:
         (root / "models" / model_id / "character.json").write_text(
             json.dumps({"name": "Valery", "age": 23}), encoding="utf-8"
         )
-        loras = root / "runtime" / "models" / "loras"
+        loras = data / "runtime" / "models" / "loras"
         loras.mkdir(parents=True)
         (loras / f"{model_id}-flux.safetensors").write_bytes(b"")  # flux preflight: the FLUX slot must exist
         (root / "comfy").mkdir(parents=True)
@@ -973,9 +983,11 @@ def _run_generate_post(caption: str, name: str) -> dict:
             return [{"subfolder": "", "filename": "photo.png"}]
 
         original_root = queue_workflow.ROOT
+        original_data_root = queue_workflow.DATA_ROOT
         original_out_root = queue_workflow.OUTPUT_ROOT
         original_queue = queue_workflow.queue_and_wait
         queue_workflow.ROOT = root
+        queue_workflow.DATA_ROOT = data
         queue_workflow.OUTPUT_ROOT = out_root
         queue_workflow.queue_and_wait = _fake_queue
         try:
@@ -994,7 +1006,7 @@ def _run_generate_post(caption: str, name: str) -> dict:
                     url="http://127.0.0.1:9",
                 )
             )
-            destination = root / "models" / model_id / "posts" / name
+            destination = data / "models" / model_id / "posts" / name
             caption_path = destination / "caption.txt"
             return {
                 "destination": destination,
@@ -1008,6 +1020,7 @@ def _run_generate_post(caption: str, name: str) -> dict:
             }
         finally:
             queue_workflow.ROOT = original_root
+            queue_workflow.DATA_ROOT = original_data_root
             queue_workflow.OUTPUT_ROOT = original_out_root
             queue_workflow.queue_and_wait = original_queue
 
@@ -1040,12 +1053,14 @@ def _run_generate_post_sdxl(*, with_lora: bool, lora_strength: float = 0.65) -> 
     stubbed queue_and_wait; return the workflow facts captured at queue time
     plus the created post folder (snapshot taken before the temp tree is
     cleaned up). The SDXL checkpoint preflight reads the module-level
-    SDXL_CKPT_PATH (bound to the real ROOT at import time), so it is patched
-    to a stub in the temp tree as well."""
+    SDXL_CKPT_PATH (bound to the real DATA_ROOT at import time), so it is
+    patched to a stub in the temp tree as well."""
     import argparse
 
     with tempfile.TemporaryDirectory(prefix="gw-post-sdxl-") as tmp:
         root = Path(tmp) / "repo"
+        data = Path(tmp) / "data"  # VALERY_DATA_ROOT (#17): per-model posts + runtime loras/ckpt
+        data.mkdir()
         out_root = Path(tmp) / "comfy-output"
         (root / "models" / SDXL_MODEL_ID).mkdir(parents=True)
         (root / "models" / "registry.json").write_text(
@@ -1057,11 +1072,11 @@ def _run_generate_post_sdxl(*, with_lora: bool, lora_strength: float = 0.65) -> 
         (root / "models" / SDXL_MODEL_ID / "character.json").write_text(
             json.dumps({"name": "Valery", "age": 23}), encoding="utf-8"
         )
-        loras = root / "runtime" / "models" / "loras"
+        loras = data / "runtime" / "models" / "loras"
         loras.mkdir(parents=True)
         if with_lora:
             (loras / f"{SDXL_MODEL_ID}.safetensors").write_bytes(b"")  # existence is what matters
-        ckpt = root / "runtime" / "models" / "checkpoints" / "ponyDiffusionV6XL.safetensors"
+        ckpt = data / "runtime" / "models" / "checkpoints" / "ponyDiffusionV6XL.safetensors"
         ckpt.parent.mkdir(parents=True)
         ckpt.write_bytes(b"")  # sdxl preflight: the checkpoint must exist
         (root / "comfy").mkdir(parents=True)
@@ -1094,10 +1109,12 @@ def _run_generate_post_sdxl(*, with_lora: bool, lora_strength: float = 0.65) -> 
             return [{"subfolder": "", "filename": "photo.png"}]
 
         original_root = queue_workflow.ROOT
+        original_data_root = queue_workflow.DATA_ROOT
         original_out_root = queue_workflow.OUTPUT_ROOT
         original_queue = queue_workflow.queue_and_wait
         original_ckpt = queue_workflow.SDXL_CKPT_PATH
         queue_workflow.ROOT = root
+        queue_workflow.DATA_ROOT = data
         queue_workflow.OUTPUT_ROOT = out_root
         queue_workflow.queue_and_wait = _fake_queue
         queue_workflow.SDXL_CKPT_PATH = ckpt
@@ -1117,7 +1134,7 @@ def _run_generate_post_sdxl(*, with_lora: bool, lora_strength: float = 0.65) -> 
                     url="http://127.0.0.1:9",
                 )
             )
-            destination = root / "models" / SDXL_MODEL_ID / "posts" / "sdxl-post"
+            destination = data / "models" / SDXL_MODEL_ID / "posts" / "sdxl-post"
             return {
                 "destination_exists": destination.is_dir(),
                 "has_photo": (destination / "photo.png").is_file(),
@@ -1127,6 +1144,7 @@ def _run_generate_post_sdxl(*, with_lora: bool, lora_strength: float = 0.65) -> 
             }
         finally:
             queue_workflow.ROOT = original_root
+            queue_workflow.DATA_ROOT = original_data_root
             queue_workflow.OUTPUT_ROOT = original_out_root
             queue_workflow.queue_and_wait = original_queue
             queue_workflow.SDXL_CKPT_PATH = original_ckpt
@@ -1325,8 +1343,10 @@ def test_expand_empty_library_exits_before_network():
             raise AssertionError("queue_and_wait must not be called with an empty library")
 
         original_root = queue_workflow.ROOT
+        original_data_root = queue_workflow.DATA_ROOT
         original_queue = queue_workflow.queue_and_wait
         queue_workflow.ROOT = tmp_root  # не писать в реальный репозиторий
+        queue_workflow.DATA_ROOT = tmp_root  # (#17) runtime/input и dataset тоже под DATA_ROOT
         queue_workflow.queue_and_wait = _no_network
         try:
             try:
@@ -1337,6 +1357,7 @@ def test_expand_empty_library_exits_before_network():
                 raise AssertionError("SystemExit expected for expand with an empty scene library")
         finally:
             queue_workflow.ROOT = original_root
+            queue_workflow.DATA_ROOT = original_data_root
             queue_workflow.queue_and_wait = original_queue
 
 

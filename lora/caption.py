@@ -12,6 +12,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
+# Issue #17 two-root split: ROOT stays the checkout (tracked registry +
+# character.json reads); the dataset manifest, images dir and .txt caption
+# writes are per-model DATA and resolve under VALERY_DATA_ROOT with the
+# prod-mirroring "models" segment — DATA_ROOT/models/<id>/ (default ROOT —
+# back-compat for local single-root runs; the manager passes its own root down).
+DATA_ROOT = Path(os.environ.get("VALERY_DATA_ROOT", str(ROOT))).resolve()
+
 # prompts.py (guardrail validation) lives at the repo root, next to lora/.
 sys.path.insert(0, str(ROOT))
 import prompts  # noqa: E402
@@ -61,8 +68,10 @@ def base_caption(model_id: str) -> str:
 
 
 def manifest_path(model_id: str) -> Path:
-    """Per-model dataset manifest, next to images/ (not inside)."""
-    return ROOT / "models" / model_id / "dataset" / "manifest.json"
+    """Per-model dataset manifest, next to images/ (not inside). DATA root,
+    under the "models" segment (DATA_ROOT/models/<id>/ — 1:1 with the prod
+    host tree /opt/sea-speed-worker/valery/models/<id>)."""
+    return DATA_ROOT / "models" / model_id / "dataset" / "manifest.json"
 
 
 def load_manifest(model_id: str, image_dir: Path) -> dict:
@@ -142,7 +151,7 @@ def main() -> int:
     args = parser.parse_args()
 
     model_id = resolve_model_id(args.model)
-    image_dir = ROOT / "models" / model_id / "dataset" / "images"
+    image_dir = DATA_ROOT / "models" / model_id / "dataset" / "images"
     image_dir.mkdir(parents=True, exist_ok=True)
     images = sorted(path for path in image_dir.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES)
     if not images:

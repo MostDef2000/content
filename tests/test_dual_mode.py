@@ -46,10 +46,11 @@ def _run(coro):
 
 
 def _make_model_files() -> None:
-    """models/<id>/posts/p.jpg and models/<id>/posts-private/secret.jpg in the
-    temp WORKSPACE (import of main must already have happened)."""
-    posts = main.MODELS_DIR / MODEL_ID / "posts"
-    private = main.MODELS_DIR / MODEL_ID / "posts-private"
+    """DATA_ROOT/models/<id>/posts/p.jpg and DATA_ROOT/models/<id>/posts-private/secret.jpg
+    in the temp data root (#17 two-root split, per-model DATA under the
+    "models" segment; import of main must already have happened)."""
+    posts = main.DATA_ROOT / "models" / MODEL_ID / "posts"
+    private = main.DATA_ROOT / "models" / MODEL_ID / "posts-private"
     posts.mkdir(parents=True, exist_ok=True)
     private.mkdir(parents=True, exist_ok=True)
     (posts / "p.jpg").write_bytes(b"\xff\xd8\xff stub jpg")

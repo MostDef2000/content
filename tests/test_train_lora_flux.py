@@ -152,6 +152,12 @@ def _build_root(
         marker = root / "kohya" / "flux_train_network.py"
         marker.parent.mkdir(parents=True)
         marker.touch()
+    # Issue #17 two-root layout: the dataset is per-model DATA and lives
+    # under the DATA root passed as the 3rd/2nd positional arg, WITH the
+    # prod-mirroring "models/" segment (DATA_ROOT/models/<id>, 1:1 with
+    # /opt/sea-speed-worker/valery/models/<id>); the fixtures run without
+    # VALERY_DATA_ROOT, so DATA_ROOT == ROOT and the runtime tree below
+    # stays on the same root too.
     dataset = root / "models" / MODEL_ID / "dataset" / "images"
     dataset.mkdir(parents=True)
     for i in range(15):  # the script requires >=15 images and captions 1:1
@@ -212,7 +218,14 @@ def _extract_function(name: str) -> str:
 def _run_deploy(root: Path) -> subprocess.CompletedProcess:
     driver = root / "deploy-driver.sh"
     driver.write_text(
-        "set -uo pipefail\n" + _extract_function("deploy_flux_lora") + f'\ndeploy_flux_lora "{MODEL_ID}" "{root}"\n',
+        "set -uo pipefail\n"
+        # The extracted function resolves the deploy slot via the script's
+        # global DATA_ROOT; define it exactly as train_lora.sh does (#17).
+        # Fixtures run without VALERY_DATA_ROOT, so it resolves to the root
+        # passed as the function's data-root argument.
+        + f'DATA_ROOT="${{VALERY_DATA_ROOT:-{root}}}"\n'
+        + _extract_function("deploy_flux_lora")
+        + f'\ndeploy_flux_lora "{MODEL_ID}" "{root}"\n',
         encoding="utf-8",
     )
     return subprocess.run(["bash", str(driver)], capture_output=True, text=True, cwd=root)
@@ -1981,13 +1994,17 @@ def test_compose_manager_binds_kohya_checkout():
     # The script resolves KOHYA="${ROOT}/kohya" = /workspace/kohya in the
     # manager container; without this bind every flux run exits 2. Fix #16
     # style check: the exact bind string in manager.volumes, and the
-    # ai-toolkit bind it was added next to stays (SDXL trainer).
+    # ai-toolkit bind it was added next to stays (SDXL trainer — TOOLKIT=
+    # ${ROOT}/ai-toolkit, likewise a checkout-path read, not DATA_ROOT).
+    # Issue #17: the /data volume (VALERY_DATA_ROOT) must stay mounted for
+    # the per-model data and the runtime tree the script routes there.
     import yaml
 
     doc = yaml.safe_load((REPO_ROOT / "compose.yaml").read_text(encoding="utf-8"))
     volumes = doc["services"]["manager"]["volumes"]
     assert "/opt/sea-speed-worker/valery/kohya:/workspace/kohya" in volumes, volumes
     assert "/opt/sea-speed-worker/valery/ai-toolkit:/workspace/ai-toolkit" in volumes, volumes
+    assert "/opt/sea-speed-worker/valery:/data" in volumes, volumes
 
 
 if __name__ == "__main__":

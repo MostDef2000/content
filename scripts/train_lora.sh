@@ -6,33 +6,40 @@ TOOLKIT="${ROOT}/ai-toolkit"
 # kohya sd-scripts checkout for the FLUX trainer (spec 010): bind-mounted at
 # /workspace/kohya in the manager container (compose manager volumes).
 KOHYA="${ROOT}/kohya"
-# kohya venv lives OUTSIDE the checkout, on the persistent rw runtime mount:
-# the kohya clone ships a HOST uv-venv (venv/) that is broken inside the
-# container, and the checkout itself is host-owned — so the self-healing
-# bootstrap needs a writable, persistent location of its own (spec 010).
-KOHYA_VENV="${ROOT}/runtime/kohya-venv"
+# DATA_ROOT (issue #17): per-model data (<DATA_ROOT>/models/<id>/dataset, lora
+# output) and the writable runtime tree (kohya-venv, models, loras) resolve
+# under VALERY_DATA_ROOT (compose: /data, 1:1 with the prod valery tree —
+# per-model data at <DATA_ROOT>/models/<id>, 1:1 with
+# /opt/sea-speed-worker/valery/models/<id>); ROOT stays the tracked checkout.
+DATA_ROOT="${VALERY_DATA_ROOT:-${ROOT}}"
+# kohya venv lives OUTSIDE the checkout, on the persistent rw runtime tree
+# under DATA_ROOT: the kohya clone ships a HOST uv-venv (venv/) that is
+# broken inside the container, and the checkout itself is host-owned — so
+# the self-healing bootstrap needs a writable, persistent location of its
+# own (spec 010).
+KOHYA_VENV="${DATA_ROOT}/runtime/kohya-venv"
 
 # Copy the newest *.safetensors checkpoint of the given arch from
-# models/<model id>/lora/output/<model id>_<arch>_v1/ into the runtime slot
-# where ComfyUI/manager load the character LoRA:
-#   sdxl → runtime/models/loras/<model id>.safetensors
-#   flux → runtime/models/loras/<model id>-flux.safetensors
+# <DATA_ROOT>/models/<model id>/lora/output/<model id>_<arch>_v1/ into the runtime
+# slot where ComfyUI/manager load the character LoRA:
+#   sdxl → <DATA_ROOT>/runtime/models/loras/<model id>.safetensors
+#   flux → <DATA_ROOT>/runtime/models/loras/<model id>-flux.safetensors
 # The templates name the training config exactly "<model id>_<arch>_v1", so
 # only that checkpoint subfolder is searched (the neighbouring arch's run can
 # never win the "newest file" race). Args:
-#   copy_lora_output MODEL_ID ARCH [ROOT]
-# Third arg overrides ROOT for fixture testing.
+#   copy_lora_output MODEL_ID ARCH [DATA_ROOT]
+# Third arg overrides DATA_ROOT for fixture testing.
 copy_lora_output() {
   local model_id="$1"
   local arch="$2"
-  local root="${3:-${ROOT}}"
-  local out_dir="${root}/models/${model_id}/lora/output"
+  local data_root="${3:-${DATA_ROOT}}"
+  local out_dir="${data_root}/models/${model_id}/lora/output"
   local config_dir="${out_dir}/${model_id}_${arch}_v1"
   local dest
   if [[ "${arch}" == "flux" ]]; then
-    dest="${root}/runtime/models/loras/${model_id}-flux.safetensors"
+    dest="${DATA_ROOT}/runtime/models/loras/${model_id}-flux.safetensors"
   else
-    dest="${root}/runtime/models/loras/${model_id}.safetensors"
+    dest="${DATA_ROOT}/runtime/models/loras/${model_id}.safetensors"
   fi
   local newest
   newest="$(find "${config_dir}" -type f -name '*.safetensors' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2- || true)"
@@ -93,18 +100,18 @@ render_kohya_toml() {
 }
 
 # Deploy the newest FLUX kohya checkpoint to the registry FLUX slot:
-#   runtime/models/loras/<model id>-flux.safetensors
+#   <DATA_ROOT>/runtime/models/loras/<model id>-flux.safetensors
 # The DASH form is the contract of management/main.py `_lora_name_for_engine`
 # (registry slot "lora_flux") — do NOT switch to underscores. tmp + mv keeps
 # the copy atomic so a concurrent ComfyUI load never sees a partial file.
 # Args:
-#   deploy_flux_lora MODEL_ID [ROOT]
+#   deploy_flux_lora MODEL_ID [DATA_ROOT]
 deploy_flux_lora() {
   local model_id="$1"
-  local root="${2:-${ROOT}}"
-  local out_dir="${root}/models/${model_id}/lora/output/${model_id}_flux_v1"
+  local data_root="${2:-${DATA_ROOT}}"
+  local out_dir="${data_root}/models/${model_id}/lora/output/${model_id}_flux_v1"
   local dest
-  dest="${root}/runtime/models/loras/${model_id}-flux.safetensors"
+  dest="${DATA_ROOT}/runtime/models/loras/${model_id}-flux.safetensors"
   local newest tmp
   newest="$(find "${out_dir}" -type f -name '*.safetensors' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2- || true)"
   if [[ -z "${newest}" ]]; then
@@ -185,7 +192,7 @@ else
   RENDERED="${ROOT}/runtime/train/${MODEL_ID}.yaml"
 fi
 
-DATASET_DIR="${ROOT}/models/${MODEL_ID}/dataset/images"
+DATASET_DIR="${DATA_ROOT}/models/${MODEL_ID}/dataset/images"
 
 if [[ ! -d "${DATASET_DIR}" ]]; then
   echo "Dataset directory not found for model '${MODEL_ID}': ${DATASET_DIR}" >&2
@@ -238,7 +245,7 @@ if [[ "${ARCH}" == "flux" ]]; then
   # The FLUX trainer loads four LOCAL single-file checkpoints (no HF
   # auto-download in sd-scripts), resolved from the shared ComfyUI runtime
   # layout that scripts/download_models.sh fills. Fail fast with the fix.
-  MODELS_DIR="${ROOT}/runtime/models"
+  MODELS_DIR="${DATA_ROOT}/runtime/models"
   FLUX_DIT="$(resolve_existing \
     "${MODELS_DIR}/checkpoints/flux1-dev-fp8.safetensors" \
     "${MODELS_DIR}/checkpoints/flux1-dev.safetensors")" || {
@@ -261,7 +268,7 @@ if [[ "${ARCH}" == "flux" ]]; then
     exit 2
   }
 
-  FLUX_OUTPUT_DIR="${ROOT}/models/${MODEL_ID}/lora/output/${MODEL_ID}_flux_v1"
+  FLUX_OUTPUT_DIR="${DATA_ROOT}/models/${MODEL_ID}/lora/output/${MODEL_ID}_flux_v1"
 
   mkdir -p "${FLUX_OUTPUT_DIR}" "$(dirname "${RENDERED}")"
   render_kohya_toml "${TEMPLATE}" "${RENDERED}"

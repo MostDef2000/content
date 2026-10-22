@@ -9,8 +9,10 @@ Run either way:
     python tests/test_dataset_manifest.py
 
 The tests never touch the real repo models/ tree or the server WORKSPACE:
-caption.py resolves manifest/character paths through its module-level ROOT,
-which is temporarily pointed at a tempfile directory per test.
+caption.py resolves its checkout reads (registry, character.json) through the
+module-level ROOT and its data paths (dataset manifest, images dir) through
+DATA_ROOT (#17 two-root split) — both are temporarily pointed at tempfile
+directories per test.
 """
 
 from __future__ import annotations
@@ -38,19 +40,24 @@ FIXED_TS = 1767225600  # 2026-01-01T00:00:00Z — deterministic image mtimes
 
 @contextmanager
 def temp_model_root():
-    """Point caption.ROOT at a tempfile dir for the duration of the block."""
-    original = caption.ROOT
+    """Point caption.ROOT (checkout reads) and caption.DATA_ROOT (#17: dataset
+    manifest + images) at a tempfile dir for the duration of the block."""
+    original_root = caption.ROOT
+    original_data_root = caption.DATA_ROOT
     with tempfile.TemporaryDirectory(prefix="content-manifest-tests-") as tmp:
         caption.ROOT = Path(tmp)
+        caption.DATA_ROOT = Path(tmp)
         try:
             yield Path(tmp)
         finally:
-            caption.ROOT = original
+            caption.ROOT = original_root
+            caption.DATA_ROOT = original_data_root
 
 
 def _make_model(root: Path, *, manifest: dict | None) -> Path:
     """Create models/<id>/dataset/images with a.jpg+b.jpg (fixed mtimes) and an
-    optional manifest.json; return the image dir (passed explicitly to the loader)."""
+    optional manifest.json next to them — the #17 DATA-root layout (with the
+    "models" segment); return the image dir (passed explicitly to the loader)."""
     image_dir = root / "models" / MODEL_ID / "dataset" / "images"
     image_dir.mkdir(parents=True, exist_ok=True)
     for name in ("a.jpg", "b.jpg"):
@@ -163,7 +170,9 @@ def test_save_manifest_round_trip():
         data["images"][0]["tag"] = "explicit"
 
         caption.save_manifest(MODEL_ID, data)
-        # saved next to images/, exactly where the loader reads it back from
+        # saved next to images/ under DATA_ROOT/models/ (#17: with the
+        # prod-mirroring "models" segment),
+        # exactly where the loader reads it back from
         assert caption.manifest_path(MODEL_ID) == (
             root / "models" / MODEL_ID / "dataset" / "manifest.json"
         )

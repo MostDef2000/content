@@ -24,8 +24,9 @@ Run either way:
 
 WORKSPACE is pointed at a tempfile directory BEFORE management.main is
 imported (same protocol as tests/test_reference_persistence.py); all paths
-below are derived from main.WORKSPACE so the tests never depend on the real
-layout.
+below are derived from main.WORKSPACE/main.DATA_ROOT so the tests never
+depend on the real layout. #17 two-root split: posts are per-model DATA
+(under VALERY_DATA_ROOT) and the trash lives in that data root's runtime/.
 """
 
 from __future__ import annotations
@@ -55,8 +56,8 @@ finally:
         os.environ["WORKSPACE"] = _PREV_WORKSPACE
 
 MODEL_ID = "postmodel"  # satisfies ^[a-z0-9][a-z0-9-]{1,62}$
-MODEL_DIR = main.WORKSPACE / "models" / MODEL_ID
-TRASH_POSTS = main.WORKSPACE / "runtime" / "trash" / "posts"
+MODEL_DIR = main.DATA_ROOT / "models" / MODEL_ID  # per-model DATA (#17, "models" segment)
+TRASH_POSTS = main.DATA_ROOT / "runtime" / "trash" / "posts"
 PHOTO_BYTES = b"\xff\xd8\xff stub jpg"
 
 
@@ -65,7 +66,7 @@ def _run(coro):
 
 
 def _make_post(kind: str, name: str) -> Path:
-    """models/<id>/<posts|posts-private>/<name>/ with photo.jpg + caption.txt."""
+    """DATA_ROOT/models/<id>/<posts|posts-private>/<name>/ with photo.jpg + caption.txt."""
     kind_dir = "posts" if kind == "public" else "posts-private"
     post_dir = MODEL_DIR / kind_dir / name
     post_dir.mkdir(parents=True, exist_ok=True)
@@ -88,7 +89,7 @@ def _trash_matches(prefix: str) -> list[Path]:
 
 def test_delete_model_post_happy_path_public():
     post_dir = _make_post("public", "post_pub")
-    saved = main.delete_model_post(main.WORKSPACE, MODEL_ID, "post_pub", "public")
+    saved = main.delete_model_post(main.DATA_ROOT, MODEL_ID, "post_pub", "public")
     assert saved == "post_pub"
     assert not post_dir.exists()  # the original folder is gone
     moved = _trash_matches("public-post_pub")
@@ -99,7 +100,7 @@ def test_delete_model_post_happy_path_public():
 
 def test_delete_model_post_private_kind():
     post_dir = _make_post("private", "pp_1")
-    saved = main.delete_model_post(main.WORKSPACE, MODEL_ID, "pp_1", "private")
+    saved = main.delete_model_post(main.DATA_ROOT, MODEL_ID, "pp_1", "private")
     assert saved == "pp_1"
     assert not post_dir.exists()
     moved = _trash_matches("private-pp_1")
@@ -110,7 +111,7 @@ def test_delete_model_post_private_kind():
 def test_delete_model_post_missing_post_404():
     (MODEL_DIR / "posts").mkdir(parents=True, exist_ok=True)  # empty folder, no posts
     try:
-        main.delete_model_post(main.WORKSPACE, MODEL_ID, "ghost_post", "public")
+        main.delete_model_post(main.DATA_ROOT, MODEL_ID, "ghost_post", "public")
     except main.HTTPException as exc:
         assert exc.status_code == 404, f"expected 404, got {exc.status_code}"
     else:
@@ -138,7 +139,7 @@ def test_delete_model_post_invalid_kind():
     post_dir = _make_post("public", "post_kind")
     for bad in ("tasteful", "", "PRIVATE"):
         try:
-            main.delete_model_post(main.WORKSPACE, MODEL_ID, "post_kind", bad)
+            main.delete_model_post(main.DATA_ROOT, MODEL_ID, "post_kind", bad)
         except main.HTTPException as exc:
             assert exc.status_code in (400, 422), f"{bad!r}: expected 400/422, got {exc.status_code}"
         else:
@@ -149,7 +150,7 @@ def test_delete_model_post_invalid_kind():
 def test_delete_model_post_traversal_name_400():
     sibling = _make_post("public", "x")  # the post a naive basename of "../x" would hit
     try:
-        main.delete_model_post(main.WORKSPACE, MODEL_ID, "../x", "public")
+        main.delete_model_post(main.DATA_ROOT, MODEL_ID, "../x", "public")
     except main.HTTPException as exc:
         assert exc.status_code == 400, f"expected 400, got {exc.status_code}"
     else:

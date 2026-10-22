@@ -19,7 +19,10 @@ Run either way:
 
 WORKSPACE is pointed at a tempfile directory BEFORE management.main is
 imported (same protocol as tests/test_dual_mode.py); all paths below are
-derived from main.WORKSPACE so the tests never depend on the real layout.
+derived from main.WORKSPACE/main.DATA_ROOT so the tests never depend on the
+real layout. #17 two-root split: character.json is a tracked config (checkout
+models/<id>/), the reference/dataset images are per-model DATA
+(DATA_ROOT/models/<id>/, with the prod-mirroring "models" segment).
 """
 
 from __future__ import annotations
@@ -57,14 +60,15 @@ def _run(coro):
 
 
 def _make_model() -> dict:
-    """models/<id>/{character.json, reference/candidates/cand_a.jpg,
-    dataset/images/ds_0001.jpg} in the temp WORKSPACE. Returns the original
-    character dict (for the field-preservation assertions)."""
-    model_dir = main.WORKSPACE / "models" / MODEL_ID
-    (model_dir / "reference" / "candidates").mkdir(parents=True, exist_ok=True)
-    (model_dir / "dataset" / "images").mkdir(parents=True, exist_ok=True)
-    (model_dir / "reference" / "candidates" / "cand_a.jpg").write_bytes(b"\xff\xd8\xff stub jpg")
-    (model_dir / "dataset" / "images" / "ds_0001.jpg").write_bytes(b"\xff\xd8\xff stub jpg")
+    """Two-root layout (#17): the per-model DATA (reference/candidates/,
+    dataset/images/) lives under main.DATA_ROOT while the tracked
+    character.json stays at WORKSPACE/models/<id>/ in the checkout. Returns
+    the original character dict (for the field-preservation assertions)."""
+    model_data_dir = main.DATA_ROOT / "models" / MODEL_ID
+    (model_data_dir / "reference" / "candidates").mkdir(parents=True, exist_ok=True)
+    (model_data_dir / "dataset" / "images").mkdir(parents=True, exist_ok=True)
+    (model_data_dir / "reference" / "candidates" / "cand_a.jpg").write_bytes(b"\xff\xd8\xff stub jpg")
+    (model_data_dir / "dataset" / "images" / "ds_0001.jpg").write_bytes(b"\xff\xd8\xff stub jpg")
     character = {
         "name": "Valery",
         "age": 23,
@@ -93,7 +97,7 @@ def _write_registry(model_id: str) -> None:
 
 def test_set_model_reference_writes_key_and_preserves_fields():
     original = _make_model()
-    saved = main.set_model_reference(main.WORKSPACE, MODEL_ID, "cand_a.jpg")
+    saved = main.set_model_reference(main.WORKSPACE, main.DATA_ROOT, MODEL_ID, "cand_a.jpg")
     assert saved == "cand_a.jpg"
     character = _read_character()
     assert character["reference"] == "cand_a.jpg"
@@ -103,8 +107,8 @@ def test_set_model_reference_writes_key_and_preserves_fields():
 
 def test_set_model_reference_switch_rewrites_only_reference():
     _make_model()
-    main.set_model_reference(main.WORKSPACE, MODEL_ID, "cand_a.jpg")
-    main.set_model_reference(main.WORKSPACE, MODEL_ID, "ds_0001.jpg")  # dataset/images accepted
+    main.set_model_reference(main.WORKSPACE, main.DATA_ROOT, MODEL_ID, "cand_a.jpg")
+    main.set_model_reference(main.WORKSPACE, main.DATA_ROOT, MODEL_ID, "ds_0001.jpg")  # dataset/images accepted
     character = _read_character()
     assert character["reference"] == "ds_0001.jpg"
     assert character["name"] == "Valery"
@@ -114,7 +118,7 @@ def test_set_model_reference_switch_rewrites_only_reference():
 def test_set_model_reference_missing_file_404():
     _make_model()
     try:
-        main.set_model_reference(main.WORKSPACE, MODEL_ID, "does-not-exist.jpg")
+        main.set_model_reference(main.WORKSPACE, main.DATA_ROOT, MODEL_ID, "does-not-exist.jpg")
     except main.HTTPException as exc:
         assert exc.status_code == 404, f"expected 404, got {exc.status_code}"
     else:
@@ -126,7 +130,7 @@ def test_set_model_reference_invalid_file_400():
     _make_model()
     for bad in ("", "   "):
         try:
-            main.set_model_reference(main.WORKSPACE, MODEL_ID, bad)
+            main.set_model_reference(main.WORKSPACE, main.DATA_ROOT, MODEL_ID, bad)
         except main.HTTPException as exc:
             assert exc.status_code == 400, f"{bad!r}: expected 400, got {exc.status_code}"
         else:

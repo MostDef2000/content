@@ -18,7 +18,15 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent.parent
-OUTPUT_ROOT = ROOT / "runtime" / "output"
+# Issue #17 two-root split: ROOT stays the tracked checkout (workflow JSON,
+# registry, character.json, prompt_profile.json, library.json) while the
+# per-model DATA destinations (reference/dataset/posts/LoRA output, under the
+# prod-mirroring "models" segment: DATA_ROOT/models/<id>/) and the
+# runtime tree (output/input/models/checkpoints/loras, no segment) resolve under
+# VALERY_DATA_ROOT (default ROOT — back-compat for local single-root runs;
+# the manager container sets it to its /data volume).
+DATA_ROOT = Path(os.environ.get("VALERY_DATA_ROOT", str(ROOT))).resolve()
+OUTPUT_ROOT = DATA_ROOT / "runtime" / "output"
 
 # Generation engines (Phase 4): flux = FLUX.1-dev FP8 + character LoRA;
 # sdxl = Pony Diffusion V6 XL txt2img. ComfyUI's models dir is runtime/models
@@ -26,9 +34,9 @@ OUTPUT_ROOT = ROOT / "runtime" / "output"
 # runtime/models/checkpoints/ (next to flux1-dev-fp8.safetensors) and the
 # LoRAs in runtime/models/loras/ (same dir as the character LoRAs).
 SDXL_CKPT = "ponyDiffusionV6XL.safetensors"
-SDXL_CKPT_PATH = ROOT / "runtime" / "models" / "checkpoints" / SDXL_CKPT
+SDXL_CKPT_PATH = DATA_ROOT / "runtime" / "models" / "checkpoints" / SDXL_CKPT
 UNCENSOR_LORA = "flux1-uncensored.safetensors"
-UNCENSOR_LORA_PATH = ROOT / "runtime" / "models" / "loras" / UNCENSOR_LORA
+UNCENSOR_LORA_PATH = DATA_ROOT / "runtime" / "models" / "loras" / UNCENSOR_LORA
 # Pony (SDXL) prompt scaffolding: quality-score prefix on the positive (the
 # guarded character/scene composition is kept verbatim), fixed low-quality
 # terms on the negative.
@@ -214,7 +222,7 @@ def generate_candidates(args: argparse.Namespace) -> None:
     character = load_character(model_id)
     age = int(character.get("age", prompts.AGE_FLOOR))
 
-    destination = ROOT / "models" / model_id / "reference" / "candidates"
+    destination = DATA_ROOT / "models" / model_id / "reference" / "candidates"
     destination.mkdir(parents=True, exist_ok=True)
     template = load_workflow("bootstrap")
     if args.uncensor:
@@ -255,9 +263,9 @@ def expand_dataset(args: argparse.Namespace) -> None:
     if not source.exists():
         raise FileNotFoundError(f"Reference image not found: {source}")
     # ComfyUI LoadImage reads from runtime/input — copy there sequentially (one image at a time)
-    input_dir = ROOT / "runtime" / "input"
+    input_dir = DATA_ROOT / "runtime" / "input"
     input_dir.mkdir(parents=True, exist_ok=True)
-    dataset_dir = ROOT / "models" / model_id / "dataset" / "images"
+    dataset_dir = DATA_ROOT / "models" / model_id / "dataset" / "images"
     dataset_dir.mkdir(parents=True, exist_ok=True)
 
     # Keep original as first dataset entry (reference anchor is written once —
@@ -341,7 +349,7 @@ def generate_post(args: argparse.Namespace) -> None:
     else:
         registry_lora = str(entry.get("lora") or f"{model_id}.safetensors")
     if args.engine == "flux":
-        lora_path = ROOT / "runtime" / "models" / "loras" / registry_lora
+        lora_path = DATA_ROOT / "runtime" / "models" / "loras" / registry_lora
         if not lora_path.is_file():
             raise FileNotFoundError(
                 f"LoRA for model {model_id!r} is not available: expected {lora_path} "
@@ -378,7 +386,7 @@ def generate_post(args: argparse.Namespace) -> None:
         # Character LoRA (node "40") for the Pony engine too. Unlike flux this
         # is graceful: without a trained LoRA the post runs without identity
         # (graph rewired straight from the checkpoint), not an error.
-        sdxl_lora_path = ROOT / "runtime" / "models" / "loras" / registry_lora
+        sdxl_lora_path = DATA_ROOT / "runtime" / "models" / "loras" / registry_lora
         if sdxl_lora_path.is_file():
             workflow["40"]["inputs"]["lora_name"] = registry_lora
             workflow["40"]["inputs"]["strength_model"] = args.lora_strength
@@ -405,7 +413,7 @@ def generate_post(args: argparse.Namespace) -> None:
     # Dual-mode destination (feature 005): transit folder in ComfyUI stays
     # "posts/<model_id>" — only the final per-model folder switches.
     subdir = "posts" if args.mode == "public" else "posts-private"
-    destination = ROOT / "models" / model_id / subdir / post_name
+    destination = DATA_ROOT / "models" / model_id / subdir / post_name
     destination.mkdir(parents=True, exist_ok=False)
 
     try:
@@ -511,7 +519,7 @@ def generate_group(args: argparse.Namespace) -> None:
         # ("lora_flux", fallback the canonical <id>-flux.safetensors name —
         # same rule as generate_post's flux branch).
         registry_lora = str(entry.get("lora_flux") or f"{member_id}-flux.safetensors")
-        lora_path = ROOT / "runtime" / "models" / "loras" / registry_lora
+        lora_path = DATA_ROOT / "runtime" / "models" / "loras" / registry_lora
         if not lora_path.is_file():
             raise FileNotFoundError(
                 f"LoRA for model {member_id!r} is not available: expected {lora_path} "
@@ -569,7 +577,7 @@ def generate_group(args: argparse.Namespace) -> None:
             raise ValueError("Group name must not contain a path")
         # Destination follows the primary member's per-model posts layout (005).
         subdir = "posts" if args.mode == "public" else "posts-private"
-        new_destination = ROOT / "models" / primary / subdir / name
+        new_destination = DATA_ROOT / "models" / primary / subdir / name
         new_destination.mkdir(parents=True, exist_ok=False)
         destination = new_destination
 

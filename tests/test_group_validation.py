@@ -57,15 +57,20 @@ finally:
 # In a shared pytest process management.main's module-level paths freeze at
 # first import (first file's temp WORKSPACE). Re-point them at THIS file's
 # temp WORKSPACE before the seeds below and re-bind per module at run time.
+# Issue #17 two-root model: per-model DATA (and the runtime tree) lives under
+# DATA_ROOT; registry/library and the per-model configs stay in the checkout
+# (WORKSPACE/models/).
 def _bind_paths() -> None:
     ws = Path(_TMP_WORKSPACE.name)
+    data = ws / "data"  # distinct VALERY_DATA_ROOT inside the same temp tree
     main.WORKSPACE = ws
-    main.JOBS_DIR = ws / "runtime" / "jobs"
-    main.MODELS_DIR = ws / "models"
+    main.DATA_ROOT = data
+    main.REPO_MODELS_DIR = ws / "models"
+    main.JOBS_DIR = data / "runtime" / "jobs"
     main.REGISTRY_PATH = ws / "models" / "registry.json"
     main.LIBRARY_PATH = ws / "models" / "library.json"
-    main.LORAS_DIR = ws / "runtime" / "models" / "loras"
-    main.TRASH_DIR = ws / "runtime" / "trash"
+    main.LORAS_DIR = data / "runtime" / "models" / "loras"
+    main.TRASH_DIR = data / "runtime" / "trash"
     main.DATASET_TRASH = main.TRASH_DIR / "dataset"
 
 
@@ -279,7 +284,7 @@ def test_scene_id_resolves_text_from_library():
 
 
 def test_name_collision_409():
-    (main.MODELS_DIR / "m1" / "posts" / "grp2").mkdir(parents=True)
+    (main.DATA_ROOT / "models" / "m1" / "posts" / "grp2").mkdir(parents=True)
     exc = _expect_http_status(_valid_payload(name="grp2", mode="public"), 409)
     assert exc.detail == "post name already exists", exc.detail
 

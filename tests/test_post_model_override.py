@@ -79,15 +79,20 @@ finally:
 # In a shared pytest process management.main's module-level paths freeze at
 # first import (first file's temp WORKSPACE). Re-point them at THIS file's
 # temp WORKSPACE before the seeds below and re-bind per module at run time.
+# Issue #17 two-root model: per-model DATA (posts/loras/runtime) lives under
+# DATA_ROOT; registry/library and the per-model configs stay in the checkout
+# (WORKSPACE/models/).
 def _bind_paths() -> None:
     ws = Path(_TMP_WORKSPACE.name)
+    data = ws / "data"  # distinct VALERY_DATA_ROOT inside the same temp tree
     main.WORKSPACE = ws
-    main.JOBS_DIR = ws / "runtime" / "jobs"
-    main.MODELS_DIR = ws / "models"
+    main.DATA_ROOT = data
+    main.REPO_MODELS_DIR = ws / "models"
+    main.JOBS_DIR = data / "runtime" / "jobs"
     main.REGISTRY_PATH = ws / "models" / "registry.json"
     main.LIBRARY_PATH = ws / "models" / "library.json"
-    main.LORAS_DIR = ws / "runtime" / "models" / "loras"
-    main.TRASH_DIR = ws / "runtime" / "trash"
+    main.LORAS_DIR = data / "runtime" / "models" / "loras"
+    main.TRASH_DIR = data / "runtime" / "trash"
     main.DATASET_TRASH = main.TRASH_DIR / "dataset"
 
 
@@ -182,8 +187,10 @@ main.LORAS_DIR.mkdir(parents=True, exist_ok=True)
 (main.LORAS_DIR / _M1_SDXL_LORA).write_bytes(b"")  # empty stubs: existence decides
 (main.LORAS_DIR / _M2_FLUX_LORA).write_bytes(b"")
 
-_m1_dir = main.MODELS_DIR / MODEL_ID
-_m2_dir = main.MODELS_DIR / OTHER_ID
+# character.json/prompt_profile.json are tracked configs → checkout models/<id>;
+# the LoRA stubs live in the DATA root's runtime loras dir.
+_m1_dir = main._model_config_dir(MODEL_ID)
+_m2_dir = main._model_config_dir(OTHER_ID)
 for directory in (_m1_dir, _m2_dir):
     directory.mkdir(parents=True, exist_ok=True)
 (_m1_dir / "character.json").write_text(
@@ -423,7 +430,7 @@ def test_post_guardrail_uses_selected_model_age():
 def test_post_guardrail_age_below_floor_clamped_for_selected_model():
     # The floor applies to the selected model too: m2's character age 20 must
     # be clamped to prompts.AGE_FLOOR (23), never injected as "20-year-old".
-    (main.MODELS_DIR / OTHER_ID / "character.json").write_text(
+    (main._model_config_dir(OTHER_ID) / "character.json").write_text(
         json.dumps({"name": "Mira", "age": 20}), encoding="utf-8"
     )
     try:
@@ -434,7 +441,7 @@ def test_post_guardrail_age_below_floor_clamped_for_selected_model():
         assert f"{main.prompts.AGE_FLOOR}-year-old fictional" in prompt, prompt
         assert "20-year-old" not in prompt, prompt
     finally:
-        (main.MODELS_DIR / OTHER_ID / "character.json").write_text(
+        (main._model_config_dir(OTHER_ID) / "character.json").write_text(
             json.dumps({"name": "Mira", "age": 30, "appearance": {"face": "round face", "build": "slim"}}),
             encoding="utf-8",
         )
@@ -464,20 +471,23 @@ def _generate_post_from_cmd(cmd: list[str]) -> tuple[dict, Path]:
         return [{"subfolder": "", "filename": "photo.png"}]
 
     original_root = queue_workflow.ROOT
+    original_data_root = queue_workflow.DATA_ROOT
     original_out_root = queue_workflow.OUTPUT_ROOT
     original_queue = queue_workflow.queue_and_wait
     queue_workflow.ROOT = ws
+    queue_workflow.DATA_ROOT = main.DATA_ROOT  # (#17) destinations + lora preflight under DATA_ROOT
     queue_workflow.OUTPUT_ROOT = out_root
     queue_workflow.queue_and_wait = _fake_queue
     try:
         # Mirror queue_workflow.main(): --model → resolve_model_id → model_id.
         args.model_id = queue_workflow.resolve_model_id(args.model)
         queue_workflow.generate_post(args)
-        destination = ws / "models" / args.model_id / ("posts" if args.mode == "public" else "posts-private") / args.name
+        destination = main.DATA_ROOT / "models" / args.model_id / ("posts" if args.mode == "public" else "posts-private") / args.name
         meta = json.loads((destination / "post.json").read_text(encoding="utf-8"))
         return meta, destination
     finally:
         queue_workflow.ROOT = original_root
+        queue_workflow.DATA_ROOT = original_data_root
         queue_workflow.OUTPUT_ROOT = original_out_root
         queue_workflow.queue_and_wait = original_queue
         shutil.rmtree(comfy_dir, ignore_errors=True)
@@ -503,7 +513,7 @@ def test_post_scene_meta_written_by_generate_post():
     cmd = spy.calls[-1][1]
     assert _cmd_flag(cmd, "--scene-id") == SCENE_ID, cmd
     assert _cmd_flag(cmd, "--scene-name") == SCENE_NAME, cmd
-    destination = Path(_TMP_WORKSPACE.name) / "models" / OTHER_ID / "posts" / "chain-post"
+    destination = main.DATA_ROOT / "models" / OTHER_ID / "posts" / "chain-post"
     try:
         meta, destination = _generate_post_from_cmd(cmd)
         assert destination.is_dir(), destination
@@ -538,7 +548,7 @@ def test_post_cmd_without_scene_carries_empty_scene_flags():
     cmd = spy.calls[-1][1]
     assert _cmd_flag(cmd, "--scene-id") == "", cmd
     assert _cmd_flag(cmd, "--scene-name") == "", cmd
-    destination = Path(_TMP_WORKSPACE.name) / "models" / OTHER_ID / "posts" / "no-scene-post"
+    destination = main.DATA_ROOT / "models" / OTHER_ID / "posts" / "no-scene-post"
     try:
         meta, destination = _generate_post_from_cmd(cmd)
         assert meta["scene_id"] is None, meta
@@ -556,13 +566,15 @@ def test_generate_post_older_namespace_without_scene_keys():
 
     with tempfile.TemporaryDirectory(prefix="post-model-legacy-") as tmp:
         root = Path(tmp) / "repo"
+        data = Path(tmp) / "data"  # VALERY_DATA_ROOT (#17)
+        data.mkdir()
         out_root = Path(tmp) / "comfy-output"
         (root / "models" / OTHER_ID).mkdir(parents=True)
         (root / "models" / "registry.json").write_text(_registry_json([_m2_entry()]), encoding="utf-8")
         (root / "models" / OTHER_ID / "character.json").write_text(
             json.dumps({"name": "Mira", "age": 30}), encoding="utf-8"
         )
-        loras = root / "runtime" / "models" / "loras"
+        loras = data / "runtime" / "models" / "loras"
         loras.mkdir(parents=True)
         (loras / _M2_FLUX_LORA).write_bytes(b"")
         (root / "comfy").mkdir(parents=True)
@@ -586,9 +598,11 @@ def test_generate_post_older_namespace_without_scene_keys():
             return [{"subfolder": "", "filename": "photo.png"}]
 
         original_root = queue_workflow.ROOT
+        original_data_root = queue_workflow.DATA_ROOT
         original_out_root = queue_workflow.OUTPUT_ROOT
         original_queue = queue_workflow.queue_and_wait
         queue_workflow.ROOT = root
+        queue_workflow.DATA_ROOT = data
         queue_workflow.OUTPUT_ROOT = out_root
         queue_workflow.queue_and_wait = _fake_queue
         try:
@@ -607,7 +621,7 @@ def test_generate_post_older_namespace_without_scene_keys():
                     url="http://127.0.0.1:9",
                 )
             )
-            destination = root / "models" / OTHER_ID / "posts-private" / "legacy-ns"
+            destination = data / "models" / OTHER_ID / "posts-private" / "legacy-ns"
             meta = json.loads((destination / "post.json").read_text(encoding="utf-8"))
             assert meta["scene_id"] is None, meta
             assert meta["scene_name"] is None, meta
@@ -618,6 +632,7 @@ def test_generate_post_older_namespace_without_scene_keys():
             assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", meta["created_at"]), meta
         finally:
             queue_workflow.ROOT = original_root
+            queue_workflow.DATA_ROOT = original_data_root
             queue_workflow.OUTPUT_ROOT = original_out_root
             queue_workflow.queue_and_wait = original_queue
 
@@ -635,7 +650,7 @@ def test_post_parser_scene_flags():
 
 
 def _write_post_folder(kind_dir: str, name: str, meta: dict | None, *, corrupt: bool = False) -> Path:
-    post = main.MODELS_DIR / MODEL_ID / kind_dir / name
+    post = main.DATA_ROOT / "models" / MODEL_ID / kind_dir / name
     post.mkdir(parents=True, exist_ok=True)
     (post / "photo.png").write_bytes(b"stub")
     if corrupt:

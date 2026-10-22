@@ -24,13 +24,28 @@ from fastapi.staticfiles import StaticFiles
 import prompts  # prompt assembly + adult-fictional guardrails (WORKSPACE root)
 
 WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace")).resolve()
+# Issue #17 two-root layout: WORKSPACE stays the tracked checkout (static files,
+# subprocess CWD, docker ctx, registry/library + per-model CONFIG), while every
+# per-model DATA path (reference/dataset/posts/posts-private/lora-output) and the
+# runtime tree (jobs/loras/trash/...) resolve under VALERY_DATA_ROOT. Per-model
+# DATA keeps the "models" segment — DATA_ROOT/models/<id>/ — 1:1 with the real
+# prod host tree /opt/sea-speed-worker/valery/models/<id> (the compose mount maps
+# the data volume onto /opt/sea-speed-worker/valery). Default WORKSPACE keeps
+# local single-root runs working; prod compose mounts the data volume at /data
+# (VALERY_DATA_ROOT=/data, 1:1 with /opt/sea-speed-worker/valery).
+DATA_ROOT = Path(os.environ.get("VALERY_DATA_ROOT", str(WORKSPACE))).resolve()
 COMFY_URL = os.environ.get("COMFY_URL", "http://comfyui:8188").rstrip("/")
-JOBS_DIR = WORKSPACE / "runtime" / "jobs"
-MODELS_DIR = WORKSPACE / "models"
-REGISTRY_PATH = WORKSPACE / "models" / "registry.json"
-LIBRARY_PATH = WORKSPACE / "models" / "library.json"
-LORAS_DIR = WORKSPACE / "runtime" / "models" / "loras"
-TRASH_DIR = WORKSPACE / "runtime" / "trash"  # soft-delete bin, never auto-cleaned
+JOBS_DIR = DATA_ROOT / "runtime" / "jobs"
+# Both "models" segments are intentional but DISTINCT roots (issue #17):
+#   * DATA_ROOT/models/<id> — per-model DATA on the data volume (1:1 with the
+#     prod host tree /opt/sea-speed-worker/valery/models/<id>);
+#   * REPO_MODELS_DIR = WORKSPACE/models/<id> — tracked per-model CONFIGS in
+#     the checkout (character.json, prompt_profile.json).
+REPO_MODELS_DIR = WORKSPACE / "models"  # tracked: registry/library + per-model configs
+REGISTRY_PATH = REPO_MODELS_DIR / "registry.json"
+LIBRARY_PATH = REPO_MODELS_DIR / "library.json"
+LORAS_DIR = DATA_ROOT / "runtime" / "models" / "loras"
+TRASH_DIR = DATA_ROOT / "runtime" / "trash"  # soft-delete bin, never auto-cleaned
 
 MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
@@ -81,12 +96,15 @@ async def _comfy_container() -> str | None:
     return names[0] if names else None
 
 
-async def _await_subprocess(cmd: list[str], cwd: Path) -> dict[str, Any]:
+async def _await_subprocess(
+    cmd: list[str], cwd: Path, env: dict[str, str] | None = None
+) -> dict[str, Any]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=str(cwd),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=env,
     )
     stdout, _ = await proc.communicate()
     return {
@@ -135,7 +153,7 @@ def _comfy_up() -> bool:
 
 
 def _disk_free_gb() -> float:
-    total, used, free = shutil.disk_usage(WORKSPACE)
+    total, used, free = shutil.disk_usage(DATA_ROOT)
     return round(free / (1024**3), 1)
 
 
@@ -246,8 +264,17 @@ def _active_model_or_404() -> dict[str, Any]:
 
 
 def _model_dir(model_id: str) -> Path:
-    """Per-model data dir (never created here)."""
-    return MODELS_DIR / model_id
+    """Per-model DATA dir under the data root — DATA_ROOT/models/<id> (the
+    "models" segment mirrors the prod host tree /opt/sea-speed-worker/valery/
+    models/<id>; distinct from the checkout's REPO_MODELS_DIR). Never created
+    here."""
+    return DATA_ROOT / "models" / model_id
+
+
+def _model_config_dir(model_id: str) -> Path:
+    """Per-model tracked-config dir in the checkout (character.json,
+    prompt_profile.json) — NOT data; data lives under _model_dir()."""
+    return REPO_MODELS_DIR / model_id
 
 
 def _model_subdirs(model_id: str) -> list[Path]:
@@ -265,7 +292,8 @@ def _active_model_dir(*parts: str) -> Path | None:
     model = _active_model()
     if model is None:
         return None
-    return Path(MODELS_DIR, str(model["id"]), *parts)
+    # Same shape as _model_dir: DATA_ROOT/models/<id> (+ optional subpath).
+    return Path(DATA_ROOT, "models", str(model["id"]), *parts)
 
 
 def _seed_character(name: str, age: int) -> dict[str, Any]:
@@ -326,11 +354,11 @@ def _ensure_registry() -> None:
     for sub in _model_subdirs(model_id):
         sub.mkdir(parents=True, exist_ok=True)
 
-    character_path = _model_dir(model_id) / "character.json"
+    character_path = _model_config_dir(model_id) / "character.json"
     if not character_path.exists():
         _atomic_write_json(character_path, character)
 
-    profile_path = _model_dir(model_id) / "prompt_profile.json"
+    profile_path = _model_config_dir(model_id) / "prompt_profile.json"
     if not profile_path.exists():
         try:
             profile = prompts.default_profile(character)
@@ -368,7 +396,7 @@ def _model_age(character: dict[str, Any]) -> int:
 
 def _load_character(model_id: str) -> dict[str, Any]:
     try:
-        character = json.loads((_model_dir(model_id) / "character.json").read_text(encoding="utf-8"))
+        character = json.loads((_model_config_dir(model_id) / "character.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         raise HTTPException(status_code=404, detail="character.json not found for model")
     if not isinstance(character, dict):
@@ -378,7 +406,7 @@ def _load_character(model_id: str) -> dict[str, Any]:
 
 def _load_profile(model_id: str) -> dict[str, Any]:
     try:
-        profile = json.loads((_model_dir(model_id) / "prompt_profile.json").read_text(encoding="utf-8"))
+        profile = json.loads((_model_config_dir(model_id) / "prompt_profile.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         raise HTTPException(status_code=404, detail="prompt_profile.json not found for model")
     if not isinstance(profile, dict):
@@ -396,12 +424,14 @@ def _load_library() -> dict[str, Any]:
     return lib
 
 
-def set_model_reference(workspace: Path, model_id: str, filename: str) -> str:
+def set_model_reference(workspace: Path, data_root: Path, model_id: str, filename: str) -> str:
     """Hard-persist the selected reference: set ONLY the "reference" key of
-    models/<id>/character.json (every other field is preserved) and rewrite
-    the file atomically (tempfile + os.replace, same as the other writers).
-    The file must exist on disk in the model's reference/candidates/ (the
-    source of the UI reference picker) or in dataset/images/.
+    the model's tracked character.json in the checkout (workspace/models/<id>/,
+    every other field is preserved) and rewrite the file atomically (tempfile +
+    os.replace, same as the other writers). The file must exist on disk in the
+    model's DATA reference/candidates/ (the source of the UI reference picker,
+    data_root/models/<id>/) or in its dataset/images/. Two roots because of the
+    #17 split: lookups read DATA, the write lands in the tracked config dir.
     Raises HTTPException(400) for an empty name and HTTPException(404) when
     the file or character.json is missing."""
     filename = str(filename or "").strip()
@@ -409,8 +439,8 @@ def set_model_reference(workspace: Path, model_id: str, filename: str) -> str:
         raise HTTPException(status_code=400, detail="file must be a non-empty filename")
     filename = _safe_name(filename)  # basename only — path traversal is impossible
     folders = (
-        workspace / "models" / model_id / "reference" / "candidates",
-        workspace / "models" / model_id / "dataset" / "images",
+        data_root / "models" / model_id / "reference" / "candidates",
+        data_root / "models" / model_id / "dataset" / "images",
     )
     if not any(folder.is_dir() and (folder / filename).is_file() for folder in folders):
         raise HTTPException(status_code=404, detail=f"reference file not found: {filename}")
@@ -472,11 +502,11 @@ def _move_to_trash(src: Path, dst: Path) -> None:
         shutil.move(str(src), str(dst))  # EXDEV fallback (copy+delete)
 
 
-def delete_model_post(workspace: Path, model_id: str, name: str, kind: str) -> str:
-    """Soft-delete one post folder: models/<id>/<kind_dir>/<name>/ →
-    runtime/trash/posts/<kind>-<name>-<unixts>/ (_move_to_trash: os.replace
-    fast path, shutil.move cross-device fallback; parents created, "-2"/"-3"
-    suffix on collision). kind "public" → "posts",
+def delete_model_post(data_root: Path, model_id: str, name: str, kind: str) -> str:
+    """Soft-delete one post folder: <data_root>/models/<id>/<kind_dir>/<name>/ →
+    <data_root>/runtime/trash/posts/<kind>-<name>-<unixts>/ (_move_to_trash:
+    os.replace fast path, shutil.move cross-device fallback; parents created,
+    "-2"/"-3" suffix on collision). kind "public" → "posts",
     "private" → "posts-private". Raises HTTPException(422) for an invalid
     kind, HTTPException(400) for an unsafe/traversal name and
     HTTPException(404) when the post folder is missing. Returns the name."""
@@ -484,10 +514,10 @@ def delete_model_post(workspace: Path, model_id: str, name: str, kind: str) -> s
     if kind_dir is None:
         raise HTTPException(status_code=422, detail="kind must be public or private")
     name = _safe_post_name(name)
-    post_dir = workspace / "models" / model_id / kind_dir / name
+    post_dir = data_root / "models" / model_id / kind_dir / name
     if not post_dir.is_dir():
         raise HTTPException(status_code=404, detail=f"post not found: {name}")
-    trash_dir = workspace / "runtime" / "trash" / "posts"
+    trash_dir = data_root / "runtime" / "trash" / "posts"
     trash_dir.mkdir(parents=True, exist_ok=True)
     base_name = f"{kind}-{name}-{int(time.time())}"
     trash_path = trash_dir / base_name
@@ -779,14 +809,17 @@ async def create_model(payload: dict[str, Any]) -> dict[str, Any]:
     reg = _load_registry()
     if any(str(m.get("id")) == model_id for m in reg.get("models", []) if isinstance(m, dict)):
         raise HTTPException(status_code=409, detail="model id already exists")
-    if _model_dir(model_id).exists():
+    if _model_dir(model_id).exists() or _model_config_dir(model_id).exists():
         raise HTTPException(status_code=409, detail="model folder already exists")
 
     character = _seed_character(name, age)
+    # Two-root layout (issue #17): DATA dirs under the data root, tracked
+    # configs (character.json/prompt_profile.json) in the checkout — a fresh
+    # model is fully functional with zero extra mounts.
     for sub in _model_subdirs(model_id):
         sub.mkdir(parents=True, exist_ok=True)
-    _atomic_write_json(_model_dir(model_id) / "character.json", character)
-    _atomic_write_json(_model_dir(model_id) / "prompt_profile.json", prompts.default_profile(character))
+    _atomic_write_json(_model_config_dir(model_id) / "character.json", character)
+    _atomic_write_json(_model_config_dir(model_id) / "prompt_profile.json", prompts.default_profile(character))
 
     entry = {
         "id": model_id,
@@ -849,11 +882,24 @@ async def delete_model(model_id: str, confirm: str = "") -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="model has an active job")
 
     model_dir = _model_dir(model_id)
-    if model_dir.exists():
+    config_dir = _model_config_dir(model_id)
+    if model_dir.exists() or config_dir.exists():
         TRASH_DIR.mkdir(parents=True, exist_ok=True)
         trash_path = TRASH_DIR / f"{model_id}-{int(time.time())}"
         try:
-            _move_to_trash(model_dir, trash_path)
+            if model_dir.exists():
+                _move_to_trash(model_dir, trash_path)
+            else:
+                # Config-only delete (no data dir on disk): the configs still
+                # need a landing dir under the same timestamped trash path.
+                trash_path.mkdir(parents=True)
+            if config_dir.exists():
+                # Same trash destination, nested "config/": the tracked
+                # character.json/prompt_profile.json leave the checkout while
+                # everything stays recoverable under one trash folder. Both
+                # moves route through _move_to_trash, so the EXDEV-only
+                # cross-device fallback covers both sources.
+                _move_to_trash(config_dir, trash_path / "config")
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"could not move model to trash: {exc}")
     reg["models"] = [m for m in reg.get("models", []) if str(m.get("id")) != model_id]
@@ -922,7 +968,7 @@ async def update_prompt_profile(payload: dict[str, Any]) -> dict[str, Any]:
         "negative": negative,
         "scenes": scenes,
     }
-    _atomic_write_json(_model_dir(model_id) / "prompt_profile.json", profile)
+    _atomic_write_json(_model_config_dir(model_id) / "prompt_profile.json", profile)
     return {"ok": True, "profile": profile}
 
 
@@ -932,7 +978,7 @@ async def update_model_reference(model_id: str, payload: dict[str, Any]) -> dict
     Hard persistence: only the "reference" key of character.json is updated,
     so the selection survives F5 and the 5s refresh (defect: client state only)."""
     _model_or_404(model_id)
-    reference = set_model_reference(WORKSPACE, model_id, str(payload.get("file", "")))
+    reference = set_model_reference(WORKSPACE, DATA_ROOT, model_id, str(payload.get("file", "")))
     return {"ok": True, "reference": reference}
 
 
@@ -1244,9 +1290,13 @@ async def caption_model_dataset(model_id: str) -> dict[str, Any]:
     ):
         raise HTTPException(status_code=409, detail="training is active for this model")
     async with _manifest_lock:
+        # env merged explicitly (not relied on inherit-on-None) so the caption
+        # child always sees THIS manager's effective data root, even when
+        # VALERY_DATA_ROOT was set only in the manager's environment (#17).
         result = await _await_subprocess(
             ["python", "lora/caption.py", "--model", model_id, "--force"],
             cwd=WORKSPACE,
+            env={**os.environ, "VALERY_DATA_ROOT": str(DATA_ROOT)},
         )
     output_tail = [line for line in result["output"].splitlines() if line.strip()][-20:]
     return {"ok": result["returncode"] == 0, "returncode": result["returncode"], "output_tail": output_tail}
@@ -1836,5 +1886,5 @@ async def delete_post(
     name = _safe_post_name(post_name)  # traversal/empty/dot names → 400
     if confirm != name:
         raise HTTPException(status_code=400, detail="confirm must equal the post name")
-    delete_model_post(WORKSPACE, model_id, name, kind)
+    delete_model_post(DATA_ROOT, model_id, name, kind)
     return {"ok": True, "deleted": name, "kind": kind}

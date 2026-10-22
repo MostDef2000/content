@@ -28,6 +28,13 @@ shutil.move (copy+delete across devices). All four call sites go through
 it; the existing semantics (collision "-2"/"-3" suffixes, parents
 creation, manifest copy, empty-dataset no-op) stay unchanged.
 
+#17 update: per-model DATA and the runtime trash now live together under
+VALERY_DATA_ROOT (the compose data volume), so the prod two-mount split is
+historical for new deploys; these pins stay as permanent guards of the
+helper's cross-device contract — the os.replace(EXDEV) simulation is
+unchanged. delete_model now trashes BOTH roots (data dir + nested config/
+in the same destination).
+
 These pins simulate the prod topology by patching os.replace to raise
 errno.EXDEV ONLY for destinations under the trash dir — the registry and
 manifest atomic saves (tmp+os.replace on their own mount) keep working,
@@ -103,15 +110,20 @@ finally:
 # In a shared pytest process management.main's module-level paths freeze at
 # first import (first file's temp WORKSPACE). Re-point them at THIS file's
 # temp WORKSPACE before the seeds below and re-bind per module at run time.
+# Issue #17 two-root model: per-model DATA (and the trash under its runtime/)
+# live under DATA_ROOT; registry/library and the per-model configs stay in
+# the checkout (WORKSPACE/models/).
 def _bind_paths() -> None:
     ws = Path(_TMP_WORKSPACE.name)
+    data = ws / "data"  # distinct VALERY_DATA_ROOT inside the same temp tree
     main.WORKSPACE = ws
-    main.JOBS_DIR = ws / "runtime" / "jobs"
-    main.MODELS_DIR = ws / "models"
+    main.DATA_ROOT = data
+    main.REPO_MODELS_DIR = ws / "models"
+    main.JOBS_DIR = data / "runtime" / "jobs"
     main.REGISTRY_PATH = ws / "models" / "registry.json"
     main.LIBRARY_PATH = ws / "models" / "library.json"
-    main.LORAS_DIR = ws / "runtime" / "models" / "loras"
-    main.TRASH_DIR = ws / "runtime" / "trash"
+    main.LORAS_DIR = data / "runtime" / "models" / "loras"
+    main.TRASH_DIR = data / "runtime" / "trash"
     main.DATASET_TRASH = main.TRASH_DIR / "dataset"
 
 
@@ -187,9 +199,15 @@ def _write_registry() -> None:
 
 
 def _seed_model_dir(model_id: str) -> Path:
-    model_dir = main.MODELS_DIR / model_id
-    model_dir.mkdir(parents=True, exist_ok=True)
-    (model_dir / "character.json").write_text(
+    """Seed BOTH delete_model sources (#17): the per-model DATA dir (one
+    dataset payload file) and the tracked config dir (character.json in the
+    checkout). Returns the data dir."""
+    model_dir = main._model_dir(model_id)
+    (model_dir / "dataset").mkdir(parents=True, exist_ok=True)
+    (model_dir / "dataset" / "payload.bin").write_bytes(b"DATA-PAYLOAD")
+    config_dir = main._model_config_dir(model_id)
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "character.json").write_text(
         json.dumps({"name": "Gone", "age": 24}), encoding="utf-8"
     )
     return model_dir
@@ -279,14 +297,18 @@ def test_delete_model_survives_cross_device_trash():
     # the same-fs fast path). Landed RED-first against the raw-os.replace
     # tree (red signature: EXDEV on the os.replace call -> HTTPException
     # 500, the exact prod frame). Against the routed helper this pin also
-    # proves the fallback preserved the semantics: model dir gone, folder
-    # landed in runtime/trash/ with its content, registry entry removed.
+    # proves the fallback preserved the semantics. #17 update: delete_model
+    # moves BOTH sources — the DATA dir (DATA_ROOT/models/<id>) to the timestamped
+    # trash path and the tracked config dir (WORKSPACE/models/<id>) into a
+    # nested config/ under the SAME destination, both through _move_to_trash.
     _write_registry()
     model_dir = _seed_model_dir(GONE_ID)
+    config_dir = main._model_config_dir(GONE_ID)
     with _simulate_cross_device_trash():
         result = _run(main.delete_model(GONE_ID, confirm=GONE_ID))
     assert result == {"ok": True}, result
-    assert not model_dir.exists(), "the model dir must be gone from models/"
+    assert not model_dir.exists(), "the model data dir must be gone from the data root"
+    assert not config_dir.exists(), "the tracked config dir must be gone from the checkout"
     trash_entries = sorted(
         p for p in main.TRASH_DIR.iterdir() if p.name.startswith(f"{GONE_ID}-")
     )
@@ -294,8 +316,12 @@ def test_delete_model_survives_cross_device_trash():
         "the model folder must land under runtime/trash/ via the "
         f"cross-device fallback; trash dir holds: {sorted(p.name for p in main.TRASH_DIR.iterdir())}"
     )
-    assert (trash_entries[0] / "character.json").is_file(), (
-        "the fallback must MOVE the folder content, not just create a stub"
+    assert (trash_entries[0] / "config" / "character.json").is_file(), (
+        "the tracked configs must land under config/ in the SAME trash "
+        "destination via the fallback"
+    )
+    assert (trash_entries[0] / "dataset" / "payload.bin").is_file(), (
+        "the fallback must MOVE the data content, not just create a stub"
     )
     reg = json.loads(main.REGISTRY_PATH.read_text(encoding="utf-8"))
     assert GONE_ID not in {str(m.get("id")) for m in reg["models"]}, (
@@ -341,12 +367,12 @@ def test_delete_model_post_survives_cross_device_trash():
     # and parents creation stay unchanged. Landed RED-first against the
     # raw-os.replace tree (red signature: HTTPException 500).
     _write_registry()
-    post_dir = main.WORKSPACE / "models" / MODEL_ID / "posts" / "post_x"
+    post_dir = main.DATA_ROOT / "models" / MODEL_ID / "posts" / "post_x"
     post_dir.mkdir(parents=True, exist_ok=True)
     (post_dir / "index.json").write_text("{}", encoding="utf-8")
-    trash_posts = main.WORKSPACE / "runtime" / "trash" / "posts"
+    trash_posts = main.TRASH_DIR / "posts"
     with _simulate_cross_device_trash():
-        name = main.delete_model_post(main.WORKSPACE, MODEL_ID, "post_x", "public")
+        name = main.delete_model_post(main.DATA_ROOT, MODEL_ID, "post_x", "public")
     assert name == "post_x", name
     assert not post_dir.exists(), "the post folder must be gone"
     # trash naming is "{kind}-{name}-{ts}" (same as the landed post-delete
@@ -439,13 +465,13 @@ def test_trash_move_fallback_copies_across_devices():
     _write_registry()
 
     # scenario 1: pure helper, directory move via the copy branch
-    post_dir = main.WORKSPACE / "models" / MODEL_ID / "posts" / "post_a"
+    post_dir = main.DATA_ROOT / "models" / MODEL_ID / "posts" / "post_a"
     post_dir.mkdir(parents=True, exist_ok=True)
     (post_dir / "photo.jpg").write_bytes(b"PHOTOBYTES-0123456789")
     (post_dir / "caption.txt").write_bytes(b"a caption\n")
-    trash_posts = main.WORKSPACE / "runtime" / "trash" / "posts"
+    trash_posts = main.TRASH_DIR / "posts"
     with _simulate_cross_device_trash(patch_rename=True):
-        name = main.delete_model_post(main.WORKSPACE, MODEL_ID, "post_a", "public")
+        name = main.delete_model_post(main.DATA_ROOT, MODEL_ID, "post_a", "public")
     assert name == "post_a", name
     assert not post_dir.exists(), "the copy+delete branch must remove the source"
     moved = sorted(p for p in trash_posts.iterdir() if p.name.startswith("public-post_a-"))
@@ -486,13 +512,13 @@ def test_trash_move_non_exdev_error_does_not_fall_back():
     # created. The pin's red signature against the round-18 helper was the
     # else-branch AssertionError (move completed).
     _write_registry()
-    post_dir = main.WORKSPACE / "models" / MODEL_ID / "posts" / "post_b"
+    post_dir = main.DATA_ROOT / "models" / MODEL_ID / "posts" / "post_b"
     post_dir.mkdir(parents=True, exist_ok=True)
     (post_dir / "photo.jpg").write_bytes(b"PHOTO-B")
-    trash_posts = main.WORKSPACE / "runtime" / "trash" / "posts"
+    trash_posts = main.TRASH_DIR / "posts"
     with _simulate_cross_device_trash(error=errno.EACCES):
         try:
-            name = main.delete_model_post(main.WORKSPACE, MODEL_ID, "post_b", "public")
+            name = main.delete_model_post(main.DATA_ROOT, MODEL_ID, "post_b", "public")
         except main.HTTPException as exc:
             assert exc.status_code == 500, exc.status_code
             assert "could not move post to trash" in exc.detail, exc.detail
