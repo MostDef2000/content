@@ -2,9 +2,13 @@ name: deploy
 
 # Прод-деплой content-стека (ComfyUI + manager) на GPU-бокс (ZeroTier
 # 10.123.239.102). Транспорт: GitHub-hosted runner не видит ZeroTier, поэтому
-# SSH на РУ-хост (82.146.37.153), затем ProxyJump на бокс — точный проверенный
-# паттерн sea-speed/.github/workflows/deploy-ubuntu-worker.yml (шаг
-# «Configure restricted VPS ProxyJump to Ubuntu Worker», строки 152-196).
+# SSH на lifesim (135.106.195.18, юзер content-jump), затем ProxyJump через
+# обратный туннель 127.0.0.1:22024 на бокс — паттерн sea-speed
+# .github/workflows/deploy-ubuntu-worker.yml (шаг «Configure restricted VPS
+# ProxyJump to Ubuntu Worker»). Перепайка с мёртвого РУ-хоста (82.146.37.153,
+# уничтожен провайдером 2026-10-22) выполнена 2026-10-23: юзер content-jump
+# на lifesim, враппер /usr/local/bin/content-deploy-wrapper на боксе,
+# новая ротация SSH-ключей (content-jump-lifesim/content-deploy-box-20261023).
 #
 # Модель доверия (честно):
 #   * только workflow_dispatch; вход deploy_sha — точный 40-hex SHA из main.
@@ -201,7 +205,7 @@ jobs:
           BOX_KNOWN_HOSTS: ${{ vars.CONTENT_BOX_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
-          [[ -n "$VPS_KEY" ]] || { echo "Missing CONTENT_VPS_SSH_PRIVATE_KEY (RU jump host)" >&2; exit 42; }
+          [[ -n "$VPS_KEY" ]] || { echo "Missing CONTENT_VPS_SSH_PRIVATE_KEY (jump host lifesim)" >&2; exit 42; }
           [[ -n "$BOX_KEY" ]] || { echo "Missing CONTENT_BOX_SSH_PRIVATE_KEY (GPU box)" >&2; exit 42; }
           [[ -n "$VPS_HOST" ]] || { echo "Missing CONTENT_VPS_HOST (ProxyJump)" >&2; exit 42; }
           [[ -n "$VPS_USER" ]] || { echo "Missing CONTENT_VPS_USER (ProxyJump)" >&2; exit 42; }
@@ -216,7 +220,8 @@ jobs:
       # restricted VPS ProxyJump to Ubuntu Worker»): приватные ключи во
       # временные IdentityFile, pinned known_hosts, два Host-алиаса с
       # IdentitiesOnly/BatchMode/StrictHostKeyChecking/ForwardAgent no,
-      # ProxyJump с РУ-хоста на бокс, RequestTTY no + ClearAllForwardings yes.
+      # ProxyJump с lifesim на бокс (через обратный туннель 22024),
+      # RequestTTY no + ClearAllForwardings yes.
       - name: Configure restricted VPS ProxyJump to GPU box
         env:
           VPS_KEY: ${{ secrets.CONTENT_VPS_SSH_PRIVATE_KEY }}
@@ -226,6 +231,7 @@ jobs:
           BOX_HOST: ${{ secrets.CONTENT_BOX_HOST }}
           BOX_USER: ${{ secrets.CONTENT_BOX_USER }}
           VPS_PORT: ${{ vars.CONTENT_VPS_SSH_PORT || '22' }}
+          BOX_PORT: ${{ vars.CONTENT_BOX_SSH_PORT || '22' }}
           VPS_KNOWN_HOSTS: ${{ vars.CONTENT_VPS_KNOWN_HOSTS }}
           BOX_KNOWN_HOSTS: ${{ vars.CONTENT_BOX_KNOWN_HOSTS }}
         run: |
@@ -252,7 +258,7 @@ jobs:
           Host content-gpu-box
               HostName $BOX_HOST
               User $BOX_USER
-              Port 22
+              Port $BOX_PORT
               IdentityFile $HOME/.ssh/content-gpu-deploy
               IdentitiesOnly yes
               BatchMode yes
@@ -291,7 +297,7 @@ jobs:
             echo "### Content deploy (${{ job.status }})"
             echo "- Commit: \`$DEPLOY_SHA\`"
             echo "- Trusted CI: $CI_RUN_URL (прогон ci.yml для SHA, все job'ы success)"
-            echo "- Execution: GitHub-hosted runner -> РУ-хост (ProxyJump) -> ZeroTier -> forced command content-deploy-v1"
+            echo "- Execution: GitHub-hosted runner -> lifesim (ProxyJump) -> туннель 127.0.0.1:22024 -> forced command content-deploy-v1"
             echo "- Acceptance: маркер DEPLOYMENT_ACCEPTED sha=... в транскрипте (артефакт выше)"
             echo "- Rollback: автоматический на предыдущий SHA при любой ошибке (см. deploy/deploy-wrapper)"
           } >> "$GITHUB_STEP_SUMMARY"
