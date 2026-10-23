@@ -1,7 +1,7 @@
 {
   "6": {
     "inputs": {
-      "text": "Photorealistic Instagram fashion photograph of valery23, the same fictional adult woman age 23, champagne-blonde hair, clear blue eyes, tall athletic fitness physique. Confident contemporary fitness fashion, subtly provocative but tasteful and non-explicit, realistic skin texture, natural anatomy, premium editorial lighting, no text, no logo, no other person.",
+      "text": "Photorealistic Instagram fashion photograph placeholder — replaced at runtime by queue_workflow.py with the model's guardrail-checked positive prompt.",
       "clip": ["30", 1]
     },
     "class_type": "CLIPTextEncode"

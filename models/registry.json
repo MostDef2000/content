@@ -2,15 +2,16 @@
   "version": 1,
   "models": [
     {
-      "id": "valery23",
-      "name": "Valery",
-      "age": 23,
+      "id": "afina",
+      "name": "Афина",
+      "age": 26,
       "height_cm": 178,
-      "tags": ["fitness", "editorial"],
+      "tags": ["editorial", "portrait"],
       "active": true,
-      "created": "2026-09-15T00:00:00Z",
-      "lora": "valery23.safetensors",
-      "groups": []
+      "created": "2026-10-19T09:10:44Z",
+      "lora": null,
+      "groups": [],
+      "lora_flux": "afina-flux.safetensors"
     }
   ]
 }

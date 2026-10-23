@@ -1,6 +1,6 @@
 ---
 name: LoRA training task
-about: Обучение или переподготовка LoRA персонажа valery23
+about: Обучение или переподготовка LoRA персонажа (модель из registry)
 title: "[lora] "
 labels: training
 assignees: ""
@@ -23,7 +23,7 @@ bash scripts/train_lora.sh
 
 ## Проверка
 - [ ] GPU свободен от других тяжёлых задач (busy-лок в manager)
-- [ ] чекпоинт скопирован в `runtime/models/loras/valery23.safetensors`
+- [ ] чекпоинт скопирован в `runtime/models/loras/<model_id>.safetensors` (для FLUX — `<model_id>-flux.safetensors`)
 - [ ] тестовый пост через `python scripts/queue_workflow.py post ...`
 
 ## Артефакты

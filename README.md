@@ -49,7 +49,7 @@ docker compose up -d                 # поднимает comfyui + manager
 1. **Кандидаты** — сгенерировать 8 эталонных лиц (`reference/candidates/`).
 2. Выбрать один файл в выпадающем списке **Датасет** → **Расширить датасет** (Kontext-вариации).
 3. Дописать подписи: `python lora/caption.py` (затем вручную отредактировать `dataset/images/*.txt`).
-4. **Обучить LoRA** (ai-toolkit, 12 ГБ, долго) → скопировать `models/<id>/lora/output/.../*.safetensors` в `runtime/models/loras/<id>.safetensors` (для `valery23` — `valery23.safetensors`).
+4. **Обучить LoRA** (ai-toolkit, 12 ГБ, долго) → скопировать `models/<id>/lora/output/.../*.safetensors` в `runtime/models/loras/<id>.safetensors` (FLUX-слот — `<id>-flux.safetensors`).
 5. **Сгенерировать пост** → папка `posts/<name>/photo.jpg + caption.txt`.
 
 ### Или из консоли (без UI)
