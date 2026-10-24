@@ -101,7 +101,9 @@
       в spec.md. DoD: pytest tests/test_cache_pass_wrapper.py
       tests/test_train_lora_flux.py — 4 новых пина зелёные; полный
       прогон: 192 passed, 15 skipped (сверка счётчика — в T008).
-- [ ] T006 Дымовой прогон 20 шагов на проде (старт — владелец; см. spec DoD).
+- [x] T006 Дымовой прогон 20 шагов на проде (старт — владелец; см. spec DoD).
+      > Закрыто по факту 2026-10-24: пункт перекрыт двумя полными прод-тренингами
+      > (valery23-flux 19.10, afina-flux 20.10 — полный цикл cache_pass + обучение).
 
 ## Acceptance criteria
 

@@ -1,7 +1,7 @@
 # Feature Specification: SDD Adoption
 
 - Feature: 001-sdd-adoption
-- Status: Active
+- Status: Shipped
 
 ## Product outcome
 

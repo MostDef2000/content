@@ -1,7 +1,7 @@
 # Feature Specification: Multi-model registry
 
 - Feature: 002-multi-model-registry
-- Status: Active
+- Status: Shipped
 
 ## Product outcome
 

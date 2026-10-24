@@ -1,7 +1,7 @@
 # Feature Specification: Group photos (multi-model composite)
 
 - Feature: 007-group-photos
-- Status: Active
+- Status: Shipped
 
 ## Product outcome
 

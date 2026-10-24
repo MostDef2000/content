@@ -1,7 +1,7 @@
 # Feature Specification: Explicit dataset and manifest-aware captions
 
 - Feature: 004-explicit-dataset
-- Status: Active
+- Status: Shipped
 
 ## Product outcome
 

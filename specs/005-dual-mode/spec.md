@@ -1,7 +1,7 @@
 # Feature Specification: Dual-mode posts (public/private)
 
 - Feature: 005-dual-mode
-- Status: Active
+- Status: Shipped
 
 ## Product outcome
 

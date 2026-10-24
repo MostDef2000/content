@@ -1,7 +1,7 @@
 # Feature Specification: kohya sd-scripts FLUX LoRA trainer (W3)
 
 - Feature: 010-kohya-flux-trainer
-- Status: Active
+- Status: Shipped
 - Source: SYSADMIN-HANDOFF №35R (подтверждённые факты сервера) + решение
   владельца: ai-toolkit детерминированно OOM-ится на FLUX-трейне 12 ГБ —
   ветка `arch=flux` переводится на kohya sd-scripts с экономными режимами

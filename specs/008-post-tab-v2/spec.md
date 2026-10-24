@@ -1,7 +1,7 @@
 # Feature Specification: Post tab v2 (per-post model binding, scene meta, caption cleanup)
 
 - Feature: 008-post-tab-v2
-- Status: Active
+- Status: Shipped
 - Source: issue #2 (MostDef2000/content), комментарий владельца 5707498338, пункты 10, 11, 14
 
 ## Product outcome

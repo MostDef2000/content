@@ -1,7 +1,7 @@
 # Feature Specification: Prompt profile and scene library
 
 - Feature: 003-prompt-profile-and-library
-- Status: Active
+- Status: Shipped
 
 ## Product outcome
 

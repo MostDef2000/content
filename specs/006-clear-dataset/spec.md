@@ -1,7 +1,7 @@
 # Feature Specification: Clear dataset (bulk soft-delete reset)
 
 - Feature: 006-clear-dataset
-- Status: Active
+- Status: Shipped
 
 > Примечание: отдельный контракт фичи в dispatch Фазы 3 отсутствовал; spec
 > собран по существующим паттернам репозитория (per-image soft-delete
