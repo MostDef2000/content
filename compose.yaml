@@ -49,7 +49,11 @@ services:
       dockerfile: management/Dockerfile
     gpus: all
     ports:
-      - "${MANAGER_PORT:-8000}:8000"
+      # Issue #9: bind the API to the ZeroTier interface only. A wildcard
+      # 0.0.0.0:8000 left the unauthenticated manager reachable from every
+      # ZeroTier member AND the box's LAN side; Caddy on lifesim upstreams
+      # the same ZeroTier address, so the edge path is unaffected.
+      - "10.123.239.102:${MANAGER_PORT:-8000}:8000"
     environment:
       COMFY_URL: http://comfyui:8188
       # Issue #1: docker CLI goes through the filtered socket proxy above.
