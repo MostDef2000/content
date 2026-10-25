@@ -84,9 +84,11 @@
 #
 # Известные риски (Lane C — НЕ чинить здесь, compose.yaml не трогаем; фиксация
 # по решению владельца):
-#   * manager публикует порт на всех интерфейсах ("${MANAGER_PORT:-8000}:8000"),
-#     а не на 127.0.0.1 — кандидат на сужение биндинга;
-#   * manager монтирует /var/run/docker.sock — root-эквивалентный доступ;
+#   * [FIXED 2026-10-25, issue #9] биндинг manager сужен до ZeroTier-интерфейса
+#     (MANAGER_BIND в compose.yaml, дефолт 10.123.239.102); health-пробы
+#     враппера ходят по тому же адресу;
+#   * manager монтировал /var/run/docker.sock — [FIXED 2026-10-25] теперь
+#     docker-socket-proxy с фильтром только контейнеры/посты;
 #   * ufw на боксе неактивен — решение владельца.
 # =============================================================================
 
@@ -183,6 +185,15 @@ env_port() {
   printf '%s' "$line"
 }
 
+env_value() {
+  local name="$1" default="$2" line=""
+  if [[ -f "$CONTENT_DIR/.env" ]]; then
+    line="$(grep -E "^${name}=" "$CONTENT_DIR/.env" | tail -n 1 | cut -d= -f2- || true)"
+  fi
+  [[ -n "$line" ]] || line="$default"
+  printf '%s' "$line"
+}
+
 # Живость: СТРОГО HTTP 200 (302/404 = не жив); connection refused / таймаут —
 # сервис ещё не готов. Эндпоинты выбраны по исходникам приложений:
 #   * ComfyUI: GET /system_stats — штатный API-эндпоинт ComfyUI; сам менеджер
@@ -270,7 +281,12 @@ do_rollback() {
   comfy_port="$(env_port COMFYUI_PORT 8188)"
   manager_port="$(env_port MANAGER_PORT 8000)"
   comfy_url="http://127.0.0.1:${comfy_port}/system_stats"
-  manager_url="http://127.0.0.1:${manager_port}/api/status"
+  # Health probes go over the ZeroTier address, not 127.0.0.1: the manager
+  # publishes its port bound to the ZeroTier interface only (issue #9), so
+  # localhost is no longer a valid probe target on the box. Override with
+  # MANAGER_BIND in $CONTENT_DIR/.env if the box address ever changes.
+  manager_bind="$(env_value MANAGER_BIND 10.123.239.102)"
+  manager_url="http://${manager_bind}:${manager_port}/api/status"
   if wait_for_health "$comfy_url" "$manager_url"; then
     printf 'ROLLBACK_ACCEPTED sha=%s previous=%s\n' "${DEPLOYED_SHA:-unknown}" "$prev"
   else
@@ -342,8 +358,9 @@ do_deploy() {
 
   comfy_port="$(env_port COMFYUI_PORT 8188)"
   manager_port="$(env_port MANAGER_PORT 8000)"
+  manager_bind="$(env_value MANAGER_BIND 10.123.239.102)"
   comfy_url="http://127.0.0.1:${comfy_port}/system_stats"
-  manager_url="http://127.0.0.1:${manager_port}/api/status"
+  manager_url="http://${manager_bind}:${manager_port}/api/status"
 
   log "docker compose build (comfyui + manager) — это долго"
   compose build comfyui manager
@@ -382,8 +399,9 @@ do_status() {
   compose ps || true
   comfy_port="$(env_port COMFYUI_PORT 8188)"
   manager_port="$(env_port MANAGER_PORT 8000)"
+  manager_bind="$(env_value MANAGER_BIND 10.123.239.102)"
   comfy_url="http://127.0.0.1:${comfy_port}/system_stats"
-  manager_url="http://127.0.0.1:${manager_port}/api/status"
+  manager_url="http://${manager_bind}:${manager_port}/api/status"
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$comfy_url" || true)"
   log "comfyui $comfy_url -> ${code:-000}"
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$manager_url" || true)"
