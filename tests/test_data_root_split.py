@@ -135,6 +135,29 @@ def test_registry_path_env_migrates_checkout_copy(two_roots, monkeypatch, capsys
     assert "valery23" not in json.loads(reg_path.read_text(encoding="utf-8"))
 
 
+def test_model_stats_counts_dataset_images_not_cache_pairs(two_roots):
+    """Issue #1: stats.dataset counts dataset images, not every file in
+    dataset/images — kohya trainer caches (.npz latent/TE pairs) and .txt
+    captions live there too, and the bare file count showed 368 for a
+    87-image prod dataset (ui stats must match what train_lora.sh trains on)."""
+    import management.main as main
+
+    two_roots
+    images_dir = main._dataset_image_dir(MODEL_ID)
+    images_dir.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "a.jpg",
+        "b.png",
+        "a.txt",
+        "b.txt",
+        f"{MODEL_ID}_00_1024x1280_flux.npz",
+        f"{MODEL_ID}_00_flux_te.npz",
+    ):
+        (images_dir / name).write_bytes(b"x")
+    stats = main._model_stats(MODEL_ID, None)
+    assert stats["dataset"] == 2, stats
+
+
 if __name__ == "__main__":
     # Direct runner convenience: the two_roots fixture needs pytest, so this
     # file is pytest-only.

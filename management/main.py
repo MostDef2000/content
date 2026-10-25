@@ -571,6 +571,16 @@ def _count_files(folder: Path) -> int:
     return sum(1 for p in folder.iterdir() if p.is_file())
 
 
+def _count_images(folder: Path) -> int:
+    """Count dataset images only. dataset/images also holds .txt captions and
+    trainer-side cache artifacts (.npz latent/TE caches from kohya runs), so a
+    bare file count overstates the trained set (prod showed 368 for 87
+    images). Matches the trainer's own image filter (jpg/jpeg/png)."""
+    if not folder.is_dir():
+        return 0
+    return sum(1 for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
+
+
 def _count_dirs(folder: Path) -> int:
     if not folder.is_dir():
         return 0
@@ -581,7 +591,7 @@ def _model_stats(model_id: str, lora: str | None) -> dict[str, Any]:
     base = _model_dir(model_id)
     return {
         "candidates": _count_files(base / "reference" / "candidates"),
-        "dataset": _count_files(base / "dataset" / "images"),
+        "dataset": _count_images(base / "dataset" / "images"),
         "posts": _count_dirs(base / "posts"),
         "lora_file": (LORAS_DIR / str(lora)).is_file() if lora else False,
     }
