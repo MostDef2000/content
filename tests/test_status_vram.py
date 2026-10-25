@@ -72,6 +72,7 @@ EXPECTED_KEYS = {
     "comfy_url",
     "gpu_busy",
     "disk_free_gb",
+    "disk_alert",
     "cpu_percent",
     "ram_percent",
     "vram",

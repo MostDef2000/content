@@ -158,6 +158,20 @@ def test_model_stats_counts_dataset_images_not_cache_pairs(two_roots):
     assert stats["dataset"] == 2, stats
 
 
+def test_disk_alert_flag_read_from_data_runtime(two_roots):
+    """Issue #1: /api/status surfaces the box-side capacity alert flag
+    (DATA_ROOT/runtime/DISK_ALERT, touched by the systemd timer when the
+    volume crosses 85%) — default absent means no alert."""
+    import management.main as main
+
+    two_roots
+    flag = main.DATA_ROOT / "runtime" / "DISK_ALERT"
+    assert main._disk_alert() is False
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.touch()
+    assert main._disk_alert() is True
+
+
 if __name__ == "__main__":
     # Direct runner convenience: the two_roots fixture needs pytest, so this
     # file is pytest-only.

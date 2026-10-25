@@ -176,6 +176,14 @@ def _disk_free_gb() -> float:
     return round(free / (1024**3), 1)
 
 
+def _disk_alert() -> bool:
+    """Issue #1: capacity alert flag on the data volume. A systemd timer on
+    the GPU box touches DATA_ROOT/runtime/DISK_ALERT when the volume passes
+    85% and clears it under 80% (hysteresis); surfacing it here keeps the
+    owner's alert visible at the edge without SSH access to the box."""
+    return (DATA_ROOT / "runtime" / "DISK_ALERT").is_file()
+
+
 def _cpu_percent() -> float:
     def snapshot() -> tuple[int, int]:
         with open("/proc/stat") as f:
@@ -791,6 +799,7 @@ async def status() -> dict[str, Any]:
         "comfy_url": COMFY_URL,
         "gpu_busy": busy,
         "disk_free_gb": _disk_free_gb(),
+        "disk_alert": _disk_alert(),
         "cpu_percent": cpu,
         "ram_percent": await asyncio.to_thread(_ram_percent),
         "vram": vram,

@@ -26,6 +26,23 @@ services:
     shm_size: "8gb"
     restart: unless-stopped
 
+  # Issue #1: the manager only needs to list/start/stop the comfyui
+  # container. The socket proxy exposes exactly that (containers list + POST
+  # actions + ping/version for the CLI handshake) over an internal port, so
+  # the manager never talks to the raw /var/run/docker.sock it used to mount
+  # (root inside the container + full API = host root-equivalent).
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    environment:
+      CONTAINERS: 1
+      POST: 1
+      PING: 1
+      VERSION: 1
+      LOG_LEVEL: warning
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
   manager:
     build:
       context: .
@@ -35,6 +52,8 @@ services:
       - "${MANAGER_PORT:-8000}:8000"
     environment:
       COMFY_URL: http://comfyui:8188
+      # Issue #1: docker CLI goes through the filtered socket proxy above.
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
       WORKSPACE: /workspace
       # Trainer OOM fix (2026-10-24): TE-cache/training passes died with
       # CUBLAS_STATUS_ALLOC_FAILED even on a mostly-idle GPU (61 MiB free,
@@ -60,6 +79,5 @@ services:
       - /opt/sea-speed-worker/valery:/data
       - /opt/sea-speed-worker/valery/ai-toolkit:/workspace/ai-toolkit
       - /opt/sea-speed-worker/valery/kohya:/workspace/kohya
-      - /var/run/docker.sock:/var/run/docker.sock
     shm_size: "8gb"
     restart: unless-stopped
