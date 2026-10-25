@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "face": "soft symmetric oval face, expressive brown eyes, straight dark brows, straight nose, full lips, light freckles across nose and cheeks, chestnut brown hair in soft shoulder-length waves, fair skin",
+  "body": "169 cm, slim athletic adult build, graceful posture",
+  "style": "editorial fashion photography, natural daylight, premium magazine quality, candid warm energy",
+  "negative": "blurry, distorted, watermark, extra fingers, cartoon",
+  "scenes": {
+    "profile34": "three-quarter profile portrait, head turned slightly away from camera, directional window light, her light freckles clearly visible",
+    "sideprofile": "clean side profile portrait, looking into the distance, rim lighting on hair, her light freckles visible on the cheek",
+    "overshoulder": "glancing back over her shoulder at the camera, candid captured moment, warm tones",
+    "seated": "seated relaxed on a wooden chair, knees together, full visible from knees up, soft interior light",
+    "fullbody": "full body standing pose head to toe in frame, confident relaxed stance, street style photography",
+    "laughing": "genuine open laughter, eyes nearly closed, caught mid-moment, candid documentary style, her light freckles visible",
+    "eyes_closed": "eyes closed serene expression, soft golden rim light, calm mood, her light freckles visible",
+    "goldenhour": "golden hour outdoor backlight, warm sun flare through hair, editorial magazine spread",
+    "interior": "modern apartment interior, daylight from large window, casual lounge setting, lifestyle photography",
+    "rain_window": "standing by a rainy window, drops on glass, moody blue daylight, city bokeh behind",
+    "makeup_close": "macro beauty close-up on eyes and lips, skin texture detail shot, studio beauty lighting",
+    "evening_dress": "elegant evening setting, dark green satin dress, low warm chandelier light, premium event photography"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "Афина",
+  "age": 26,
+  "height_cm": 178,
+  "identity": "fictional adult AI model",
+  "appearance": {
+    "hair": "long natural hair, soft waves",
+    "eyes": "light eyes",
+    "skin": "natural skin texture, healthy tone",
+    "face": "symmetrical oval face, soft natural features",
+    "build": "athletic adult build"
+  },
+  "body": "athletic adult build",
+  "style": "",
+  "reference_look": "",
+  "reference": "afina-01.png"
+}
