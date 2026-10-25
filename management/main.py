@@ -651,11 +651,15 @@ def _active_model_summary(model: dict[str, Any] | None) -> dict[str, Any] | None
         return None
     lora = model.get("lora")
     lora_file = bool(lora) and (LORAS_DIR / str(lora)).is_file()
+    flux_lora = model.get("lora_flux")
+    flux_lora_file = bool(flux_lora) and (LORAS_DIR / str(flux_lora)).is_file()
     return {
         "id": model.get("id"),
         "name": model.get("name"),
         "lora": lora,
         "lora_file": lora_file,
+        "lora_flux": flux_lora,
+        "lora_flux_file": flux_lora_file,
         "engine": _model_engine(model),  # recommended post engine: "sdxl" | "flux" | None
     }
 

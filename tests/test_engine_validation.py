@@ -665,16 +665,25 @@ def test_active_model_summary_engine_dualarch():
             {"id": MODEL_ID, "name": "Valery", "lora": f"{MODEL_ID}.safetensors", "lora_flux": _FLUX_LORA}
         )
         assert summary["engine"] == "sdxl", summary
+        assert summary["lora_file"] is True, summary
+        assert summary["lora_flux"] == _FLUX_LORA, summary
+        assert summary["lora_flux_file"] is True, summary
         (main.LORAS_DIR / f"{MODEL_ID}.safetensors").unlink()
         summary = main._active_model_summary(
             {"id": MODEL_ID, "name": "Valery", "lora": f"{MODEL_ID}.safetensors", "lora_flux": _FLUX_LORA}
         )
         assert summary["engine"] == "flux", summary
+        assert summary["lora_file"] is False, summary
+        assert summary["lora_flux_file"] is True, summary
         _remove_flux_stub()
         summary = main._active_model_summary(
             {"id": MODEL_ID, "name": "Valery", "lora": f"{MODEL_ID}.safetensors", "lora_flux": _FLUX_LORA}
         )
         assert summary["engine"] is None, summary
+        assert summary["lora_flux_file"] is False, summary
+        summary = main._active_model_summary({"id": MODEL_ID, "name": "Valery", "lora": f"{MODEL_ID}.safetensors"})
+        assert summary["lora_flux"] is None, summary
+        assert summary["lora_flux_file"] is False, summary
     finally:
         _reset_lora_stub()
         _remove_flux_stub()
