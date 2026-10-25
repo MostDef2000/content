@@ -36,6 +36,13 @@ services:
     environment:
       COMFY_URL: http://comfyui:8188
       WORKSPACE: /workspace
+      # Trainer OOM fix (2026-10-24): TE-cache/training passes died with
+      # CUBLAS_STATUS_ALLOC_FAILED even on a mostly-idle GPU (61 MiB free,
+      # YOLO resident) — the caching allocator could not recover the
+      # fragmented 11.5 GiB pool. expandable_segments allows segment
+      # reclamation; verified live: 1500-step FLUX train at 9.7 GiB with
+      # comfy+YOLO up.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
       # Issue #17: per-model DATA (reference/dataset/posts/posts-private/
       # lora-output) and the runtime tree (jobs/loras/trash/output/input)
       # resolve under VALERY_DATA_ROOT; WORKSPACE stays the tracked checkout.
