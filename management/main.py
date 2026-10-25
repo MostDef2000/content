@@ -41,8 +41,27 @@ JOBS_DIR = DATA_ROOT / "runtime" / "jobs"
 #     prod host tree /opt/sea-speed-worker/valery/models/<id>);
 #   * REPO_MODELS_DIR = WORKSPACE/models/<id> — tracked per-model CONFIGS in
 #     the checkout (character.json, prompt_profile.json).
-REPO_MODELS_DIR = WORKSPACE / "models"  # tracked: registry/library + per-model configs
-REGISTRY_PATH = REPO_MODELS_DIR / "registry.json"
+REPO_MODELS_DIR = WORKSPACE / "models"  # tracked: library + per-model configs (registry moved to env path below)
+# Registry is RUNTIME STATE, not tracked config (issue #1): every deploy
+# re-checks-out the tree, so a checkout-resident registry is clobbered by
+# deploys and its tracked-file modification blocks them. VALERY_REGISTRY_PATH
+# (prod: /data/runtime/registry.json — on the data volume) moves the state out
+# of the checkout; default keeps WORKSPACE placement for local single-root runs.
+_VALERY_REGISTRY_PATH = os.environ.get("VALERY_REGISTRY_PATH")
+REGISTRY_PATH = (
+    Path(_VALERY_REGISTRY_PATH).resolve() if _VALERY_REGISTRY_PATH else REPO_MODELS_DIR / "registry.json"
+)
+if _VALERY_REGISTRY_PATH and not REGISTRY_PATH.exists():
+    # One-time migration guard: on the first start with the env set, carry the
+    # checkout-resident registry (whatever state the last manager run left —
+    # typically the committed seed after a deploy checkout) to the data volume.
+    # Without this, _ensure_registry would fire its legacy branch on the empty
+    # new path and silently re-seed valery23 as the active model.
+    _legacy = REPO_MODELS_DIR / "registry.json"
+    if _legacy.exists():
+        REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(_legacy, REGISTRY_PATH)
+        print(f"[registry] migrated { _legacy } -> { REGISTRY_PATH }", flush=True)
 LIBRARY_PATH = REPO_MODELS_DIR / "library.json"
 LORAS_DIR = DATA_ROOT / "runtime" / "models" / "loras"
 TRASH_DIR = DATA_ROOT / "runtime" / "trash"  # soft-delete bin, never auto-cleaned

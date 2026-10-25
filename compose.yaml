@@ -47,6 +47,9 @@ services:
       # lora-output) and the runtime tree (jobs/loras/trash/output/input)
       # resolve under VALERY_DATA_ROOT; WORKSPACE stays the tracked checkout.
       VALERY_DATA_ROOT: /data
+      # Issue #1: registry is runtime state on the data volume — deploys
+      # re-checkout WORKSPACE and must not clobber or be blocked by it.
+      VALERY_REGISTRY_PATH: /data/runtime/registry.json
     volumes:
       - .:/workspace
       # Data volume: /data maps 1:1 onto the prod valery tree

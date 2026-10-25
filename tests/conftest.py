@@ -53,7 +53,10 @@ def two_roots(tmp_path, monkeypatch):
     (workspace / "management" / "static").mkdir(parents=True)  # StaticFiles mount on reload
     data_root.mkdir()
 
-    prev_env = {key: os.environ.get(key) for key in ("WORKSPACE", "VALERY_DATA_ROOT")}
+    prev_env = {
+        key: os.environ.get(key)
+        for key in ("WORKSPACE", "VALERY_DATA_ROOT", "VALERY_REGISTRY_PATH")
+    }
     prev_paths = {name: getattr(main, name) for name in _PATH_CONSTANTS}
     prev_jobs = dict(main.jobs)
 

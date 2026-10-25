@@ -22,6 +22,7 @@ import-time constants match the env — the issue's "env must win" semantics.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -79,6 +80,59 @@ def test_create_model_splits_data_and_config_roots(two_roots):
     assert character["name"] == "Split", character
     stats = main._model_stats(MODEL_ID, None)  # reads the DATA root
     assert stats == {"candidates": 0, "dataset": 0, "posts": 0, "lora_file": False}, stats
+
+
+def test_registry_path_env_moves_state_out_of_checkout(two_roots, monkeypatch):
+    """Issue #1: VALERY_REGISTRY_PATH moves the runtime registry onto the data
+    volume — out of the deploy checkout (deploys re-checkout WORKSPACE and
+    must not clobber or be blocked by the registry). Without the env the
+    tracked checkout path stays the fallback (local single-root runs)."""
+    import importlib
+
+    import management.main as main
+
+    workspace, data_root = two_roots
+    # Fallback (no env): tracked checkout path — covered in detail above.
+    assert main.REGISTRY_PATH == workspace / "models" / "registry.json"
+
+    reg_path = data_root / "runtime" / "registry.json"
+    monkeypatch.setenv("VALERY_REGISTRY_PATH", str(reg_path))
+    importlib.reload(main)
+    assert main.REGISTRY_PATH == reg_path, main.REGISTRY_PATH
+    assert reg_path.parent.is_dir(), "env-путь: parent каталог создаётся при старте"
+
+    reg = {"version": 1, "models": [{"id": MODEL_ID, "name": "Split", "active": True}]}
+    checkout_before = (workspace / "models" / "registry.json").read_text(encoding="utf-8")
+    _run(main._save_registry(reg))
+    assert reg_path.is_file(), reg_path
+    ids = {str(m.get("id")) for m in main._load_registry().get("models", [])}
+    assert MODEL_ID in ids, ids
+    # the checkout copy is untouched by writes to the env path
+    assert (workspace / "models" / "registry.json").read_text(encoding="utf-8") == checkout_before
+
+
+def test_registry_path_env_migrates_checkout_copy(two_roots, monkeypatch, capsys):
+    """Issue #1 migration guard: first start with VALERY_REGISTRY_PATH set and
+    an empty new path copies the checkout-resident registry to the data volume
+    instead of letting _ensure_registry re-seed from the legacy layout."""
+    import importlib
+
+    import management.main as main
+
+    workspace, data_root = two_roots
+    checkout_reg = workspace / "models" / "registry.json"
+    assert checkout_reg.is_file(), "fixture seeding created the checkout registry"
+    seed = checkout_reg.read_text(encoding="utf-8")
+
+    reg_path = data_root / "runtime" / "registry.json"
+    assert not reg_path.exists()
+    monkeypatch.setenv("VALERY_REGISTRY_PATH", str(reg_path))
+    importlib.reload(main)
+    assert main.REGISTRY_PATH == reg_path
+    assert reg_path.is_file(), "migration guard copied the checkout registry"
+    assert reg_path.read_text(encoding="utf-8") == seed
+    # _ensure_registry must NOT have fired its legacy branch (no valery23 seed)
+    assert "valery23" not in json.loads(reg_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

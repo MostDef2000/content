@@ -20,7 +20,8 @@
 #   2. git fetch origin в чекауте $CONTENT_DIR (default /opt/content)
 #   3. проверка, что SHA — предок origin/main (merge-base --is-ancestor)
 #   4. предыдущий SHA -> $CONTENT_DIR/deploy-state/previous-sha
-#   5. git checkout --detach <sha>
+#   5. mirror-checkout <sha> (reset --hard + точечное удаление конфликтных
+#      untracked + clean, кроме models/ и ignored — см. mirror_checkout)
 #   6. docker compose build comfyui manager (сборка из исходников — долгая)
 #      + пер-ША теги образов: valery-comfyui:<sha>, valery-manager:<sha>
 #   7. docker compose up -d
@@ -126,6 +127,38 @@ PREV_SHA=""
 log()  { printf '[content-deploy] %s\n' "$*"; }
 fail() { printf '[content-deploy] ERROR %s\n' "$*" >&2; exit 1; }
 
+# Mirror-checkout (issue #1, инцидент деплоя 3cecdcf): чекаут = точное зеркало
+# SHA. Plain checkout --detach (и reset --hard — та же защита git) abort-ится,
+# если untracked-файл бокса конфликтует с целевым деревом; mirror-семантика:
+#   1) конфликтные untracked (файлы, существующие в целевом SHA) удаляются
+#      точечно ДО reset — только они, остальной untracked не трогается;
+#   2) reset --hard перезаписывает tracked-правки (runtime-правки tracked-
+#      файлов легитимно стираются: tracked = код, а не state);
+#   3) clean -fd убирает остальной untracked-мусор (ignored — .env,
+#      deploy-state/, mountpoint kohya/ — clean без -x не трогает), КРОМЕ
+#      models/ (-e models/): runtime-конфиги моделей создаёт UI в чекауте —
+#      их wipe ломал бы генерацию до следующего коммита конфигов.
+# Runtime-стейт при этом живёт вне чекаута (VALERY_REGISTRY_PATH, DATA_ROOT) —
+# см. management/main.py: registry переносится гуардом при первом старте.
+mirror_checkout() {
+  local sha="$1" label="$2"
+  local conflicted preview
+  conflicted="$(comm -12 \
+    <(git -C "$CONTENT_DIR" ls-tree -r --name-only "$sha" | sort) \
+    <(git -C "$CONTENT_DIR" ls-files --others --exclude-standard | sort) || true)"
+  if [[ -n "$conflicted" ]]; then
+    log "mirror-$label: удаляю $(wc -l <<<"$conflicted") конфликтных untracked-файлов перед reset"
+    while IFS= read -r f; do rm -f -- "$CONTENT_DIR/$f"; done <<<"$conflicted"
+  fi
+  if ! git -C "$CONTENT_DIR" reset --hard --quiet "$sha"; then
+    return 1
+  fi
+  preview="$(git -C "$CONTENT_DIR" clean -ndq -e models/ || true)"
+  [[ -n "$preview" ]] && log "mirror-$label: clean удалит (dry-run): $(printf '%s ' $preview)"
+  git -C "$CONTENT_DIR" clean -fdq -e models/ || true
+  return 0
+}
+
 usage() {
   cat >&2 <<'USAGE'
 usage:
@@ -215,7 +248,8 @@ do_rollback() {
   set +eE
   trap - ERR
   local rc=0
-  if ! git -C "$CONTENT_DIR" -c advice.detachedHead=false checkout --quiet --detach "$prev"; then
+  # Та же mirror-семантика, что и в деплое (fail-closed: ошибка = exit 1).
+  if ! mirror_checkout "$prev" rollback; then
     printf '[content-deploy] ROLLBACK_FAILED reason=checkout_failed sha=%s previous=%s\n' "${DEPLOYED_SHA:-unknown}" "$prev" >&2
     exit 1
   fi
@@ -304,7 +338,7 @@ do_deploy() {
   trap 'do_rollback "$PREV_SHA"' ERR
 
   log "DEPLOY_MUTATION target=$sha previous=$prev"
-  git -C "$CONTENT_DIR" -c advice.detachedHead=false checkout --quiet --detach "$sha"
+  mirror_checkout "$sha" deploy || fail "mirror-checkout $sha не удался (reset abort?)"
 
   comfy_port="$(env_port COMFYUI_PORT 8188)"
   manager_port="$(env_port MANAGER_PORT 8000)"

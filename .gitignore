@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 runtime/
 ai-toolkit/
+kohya/
 dataset/images/
 lora/output/
 reference/candidates/

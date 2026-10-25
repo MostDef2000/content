@@ -68,7 +68,7 @@ Per-model layout (фаза 1 редизайна — specs/002, specs/003):
 
 - `management/` — управляющее приложение (FastAPI + HTML)
 - `comfy/` — workflow JSON (bootstrap, kontext_variation, flux_lora)
-- `models/registry.json` — реестр моделей (id, имя, возраст, теги, активная модель, lora-файл)
+- `models/registry.json` — реестр моделей (id, имя, возраст, теги, активная модель, lora-файл). В проде живёт вне чекаута на data volume (`VALERY_REGISTRY_PATH=/data/runtime/registry.json`, issue #1), локально — этот путь
 - `models/library.json` — библиотека сцен промтов (expand / candidates / post)
 - `models/<id>/` — данные конкретной модели:
   - `character.json`, `prompt_profile.json` — tracked-конфигурация

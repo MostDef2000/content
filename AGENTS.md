@@ -58,7 +58,10 @@ compose up, скачивание моделей) — только через SYS
 
 ## Данные и папки (фаза 1)
 
-- Реестр моделей: `models/registry.json`; данные модели — `models/<id>/`
+- Реестр моделей: `models/registry.json` локально; в проде — на data volume
+  `VALERY_REGISTRY_PATH=/data/runtime/registry.json` (issue #1: деплои
+  перечекачивают WORKSPACE и не должны тереть/блокироваться реестром). Данные
+  модели — `models/<id>/`
   (tracked: `character.json`, `prompt_profile.json`; gitignored генерат:
   `reference/candidates/`, `dataset/images/`, `lora/output/`, `posts/`,
   `posts-private/`). Библиотека сцен: `models/library.json`.
